@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pulsequeue-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pulsequeue}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pulsequeue_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-pulsequeue}
+    ports:
+      # Bind to localhost (127.0.0.1) to prevent public network exposure
+      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-pulsequeue} -d ${POSTGRES_DB:-pulsequeue}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - pulsequeue-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: pulsequeue-redis
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      # Bind to localhost (127.0.0.1) to prevent public network exposure
+      - '127.0.0.1:${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - pulsequeue-network
+
+volumes:
+  postgres_data:
+    name: pulsequeue_postgres_data
+  redis_data:
+    name: pulsequeue_redis_data
+
+networks:
+  pulsequeue-network:
+    name: pulsequeue_network
+    driver: bridge

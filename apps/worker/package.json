@@ -1,0 +1,17 @@
+{
+  "name": "@pulsequeue/worker",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rimraf dist *.tsbuildinfo",
+    "dev": "node --watch ./dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pulsequeue/shared": "*",
+    "dotenv": "^16.4.7"
+  }
+}

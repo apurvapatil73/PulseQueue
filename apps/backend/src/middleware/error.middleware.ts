@@ -1,0 +1,50 @@
+import { Request, Response, NextFunction } from 'express';
+import { AppError } from '../utils/errors.js';
+import { logger } from '../utils/logger.js';
+import { env } from '../config/env.js';
+import { sendError } from '../utils/response.js';
+
+export function errorHandler(err: Error, req: Request, res: Response, _next: NextFunction): void {
+  const isProduction = env.NODE_ENV === 'production';
+
+  // Check if it is a known operational AppError
+  if (err instanceof AppError) {
+    logger.warn(`Operational Error [${err.code}]: ${err.message}`, {
+      code: err.code,
+      statusCode: err.statusCode,
+      method: req.method,
+      url: req.originalUrl,
+      details: err.details,
+    });
+
+    sendError(res, err.message, err.statusCode, err.code, err.details);
+    return;
+  }
+
+  // Handle SyntaxError (e.g. malformed JSON in request body)
+  if (err instanceof SyntaxError && 'body' in err) {
+    logger.warn('Malformed JSON body received', {
+      method: req.method,
+      url: req.originalUrl,
+    });
+    sendError(res, 'Malformed JSON payload in request body', 400, 'INVALID_JSON');
+    return;
+  }
+
+  // Unexpected or unhandled internal errors
+  logger.error(`Unhandled Exception: ${err.message}`, {
+    name: err.name,
+    message: err.message,
+    stack: err.stack,
+    method: req.method,
+    url: req.originalUrl,
+  });
+
+  const responseMessage = isProduction
+    ? 'An internal server error occurred'
+    : err.message || 'An internal server error occurred';
+
+  const details = isProduction ? undefined : { stack: err.stack };
+
+  sendError(res, responseMessage, 500, 'INTERNAL_SERVER_ERROR', details);
+}
