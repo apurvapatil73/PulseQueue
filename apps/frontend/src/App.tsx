@@ -1,6 +1,6 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
-import { Activity, AlertOctagon, CalendarClock, ListChecks, Settings } from 'lucide-react';
+import { Activity, AlertOctagon, CalendarClock, Settings } from 'lucide-react';
 import { queryClient } from './config/queryClient';
 import { AuthProvider } from './contexts/AuthContext';
 import { OrganisationProvider } from './contexts/OrganisationContext';
@@ -10,6 +10,8 @@ import { PublicOnlyRoute } from './components/routing/PublicOnlyRoute';
 import { LoginPage } from './pages/auth/LoginPage';
 import { RegisterPage } from './pages/auth/RegisterPage';
 import { DashboardOverviewPage } from './pages/dashboard/DashboardOverviewPage';
+import { JobDetailPage } from './pages/jobs/JobDetailPage';
+import { JobsPage } from './pages/jobs/JobsPage';
 import { ModulePlaceholderPage } from './pages/modules/ModulePlaceholderPage';
 import { QueueDetailPage } from './pages/queues/QueueDetailPage';
 import { QueuesPage } from './pages/queues/QueuesPage';
@@ -27,22 +29,8 @@ export function AppRoutes() {
           <Route path="/dashboard" element={<DashboardOverviewPage />} />
           <Route path="/queues" element={<QueuesPage />} />
           <Route path="/queues/:queueId" element={<QueueDetailPage />} />
-          <Route
-            path="/jobs"
-            element={
-              <ModulePlaceholderPage
-                title="Jobs"
-                description="Submit, filter, inspect, and cancel organisation jobs across queues."
-                icon={<ListChecks className="h-5 w-5" />}
-                milestoneLabel="Step 6.2 Planned"
-                plannedCapabilities={[
-                  'Submit jobs with validated JSON payloads, priorities, delays, and retry overrides',
-                  'Filter jobs by queue, status, and timestamps with cursor/page navigation',
-                  'Inspect execution results, errors, attempts, and cancel pending/delayed jobs',
-                ]}
-              />
-            }
-          />
+          <Route path="/jobs" element={<JobsPage />} />
+          <Route path="/jobs/:jobId" element={<JobDetailPage />} />
           <Route
             path="/schedules"
             element={

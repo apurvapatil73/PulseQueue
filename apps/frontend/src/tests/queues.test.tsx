@@ -10,6 +10,7 @@ import { AppRoutes } from '../App';
 import { authApi } from '../api/auth.api';
 import { organisationApi } from '../api/organisation.api';
 import { queueApi } from '../api/queue.api';
+import { jobApi } from '../api/job.api';
 import { monitoringApi } from '../api/monitoring.api';
 import { healthApi } from '../api/health.api';
 import { ApiClientError } from '../api/error';
@@ -185,6 +186,17 @@ describe('Queue Management UI — Overview, CRUD, Pause/Resume, Detail & RBAC (S
     vi.spyOn(queueApi, 'list').mockResolvedValue([queue1, queue2]);
     vi.spyOn(queueApi, 'getById').mockResolvedValue(queue1);
     vi.spyOn(queueApi, 'getStats').mockResolvedValue(makeStats(queue1));
+    vi.spyOn(jobApi, 'listByQueue').mockResolvedValue({
+      jobs: [],
+      pagination: {
+        page: 1,
+        limit: 10,
+        total: 0,
+        totalPages: 0,
+        hasNextPage: false,
+        hasPreviousPage: false,
+      },
+    });
   });
 
   it('renders queue list with real configuration, status badges, and job status counts, plus search and status filter', async () => {

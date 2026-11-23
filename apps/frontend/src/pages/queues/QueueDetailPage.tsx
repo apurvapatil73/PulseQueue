@@ -3,17 +3,23 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   AlertOctagon,
   ArrowLeft,
+  Ban,
   CheckCircle2,
   Clock,
+  Eye,
   Layers,
+  ListChecks,
   Pause,
   Pencil,
   Play,
+  Plus,
   RefreshCw,
   Trash2,
 } from 'lucide-react';
 import { ApiClientError } from '../../api/error';
+import { isCancellableJobStatus } from '../../api/job.api';
 import { useOrganisation } from '../../contexts/OrganisationContext';
+import { useCancelJob, useQueueJobs, useSubmitJob } from '../../hooks/useJobs';
 import {
   useDeleteQueue,
   usePauseQueue,
@@ -22,13 +28,18 @@ import {
   useResumeQueue,
   useUpdateQueue,
 } from '../../hooks/useQueues';
+import type { JobView } from '../../types/api';
 import { JobStatusChart } from '../../components/charts/JobStatusChart';
+import { CancelJobModal } from '../../components/jobs/CancelJobModal';
+import { SubmitJobModal } from '../../components/jobs/SubmitJobModal';
 import { PageContainer } from '../../components/layout/PageContainer';
 import { DeleteQueueModal } from '../../components/queues/DeleteQueueModal';
 import { QueueFormModal } from '../../components/queues/QueueFormModal';
 import { Button } from '../../components/ui/Button';
 import { Card, CardContent, CardHeader } from '../../components/ui/Card';
 import { ConfirmDialog } from '../../components/ui/ConfirmDialog';
+import { DataTable } from '../../components/ui/DataTable';
+import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorState } from '../../components/ui/ErrorState';
 import { MetricCard } from '../../components/ui/MetricCard';
 import { Skeleton } from '../../components/ui/Skeleton';
@@ -51,17 +62,26 @@ export function QueueDetailPage() {
   const [editOpen, setEditOpen] = useState(false);
   const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [submitJobOpen, setSubmitJobOpen] = useState(false);
+  const [cancellingJob, setCancellingJob] = useState<JobView | null>(null);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
     null,
   );
 
   const detailQuery = useQueueDetail(activeOrganisationId, queueId ?? null);
   const statsQuery = useQueueStats(activeOrganisationId, queueId ?? null);
+  const queueJobsQuery = useQueueJobs(activeOrganisationId, queueId ?? null, {
+    page: 1,
+    limit: 10,
+    sortOrder: 'desc',
+  });
 
   const updateMutation = useUpdateQueue(activeOrganisationId);
   const pauseMutation = usePauseQueue(activeOrganisationId);
   const resumeMutation = useResumeQueue(activeOrganisationId);
   const deleteMutation = useDeleteQueue(activeOrganisationId);
+  const submitJobMutation = useSubmitJob(activeOrganisationId);
+  const cancelJobMutation = useCancelJob(activeOrganisationId);
 
   const queue = detailQuery.data;
   const stats = statsQuery.data;
@@ -165,10 +185,20 @@ export function QueueDetailPage() {
             onClick={() => {
               void detailQuery.refetch();
               void statsQuery.refetch();
+              void queueJobsQuery.refetch();
             }}
           >
             Refresh
           </Button>
+          {queue && (
+            <Button
+              size="sm"
+              leftIcon={<Plus className="h-3.5 w-3.5" />}
+              onClick={() => setSubmitJobOpen(true)}
+            >
+              Submit Job
+            </Button>
+          )}
           {canManage && queue && (
             <>
               <Button
@@ -369,6 +399,145 @@ export function QueueDetailPage() {
           </CardContent>
         </Card>
       </section>
+
+      {/* Queue Jobs Table Integration */}
+      <section className="mt-6">
+        <Card>
+          <CardHeader
+            title="Jobs in This Queue"
+            description="Latest jobs submitted to this queue"
+            action={
+              queue ? (
+                <Link to={`/jobs?queueId=${queue.id}`}>
+                  <Button variant="secondary" size="sm">
+                    View All in Jobs
+                  </Button>
+                </Link>
+              ) : null
+            }
+          />
+          <DataTable
+            columns={[
+              {
+                key: 'name',
+                header: 'Job ID & Type',
+                render: (j: JobView) => (
+                  <div>
+                    <Link
+                      to={`/jobs/${j.id}`}
+                      className="font-mono text-xs font-semibold text-sky-300 hover:underline"
+                    >
+                      {j.name}
+                    </Link>
+                    <p className="font-mono text-[11px] text-slate-500">
+                      {j.id.slice(0, 8)}…{j.id.slice(-4)}
+                    </p>
+                  </div>
+                ),
+              },
+              {
+                key: 'status',
+                header: 'Status',
+                render: (j: JobView) => <StatusBadge status={j.status} showDot />,
+              },
+              {
+                key: 'priority',
+                header: 'Priority',
+                align: 'right',
+                render: (j: JobView) => (
+                  <span className="font-mono text-xs tabular-nums">p{j.priority}</span>
+                ),
+              },
+              {
+                key: 'attempts',
+                header: 'Attempts',
+                align: 'right',
+                render: (j: JobView) => (
+                  <span className="font-mono text-xs tabular-nums">
+                    {j.attemptsMade} / {j.maxRetries + 1}
+                  </span>
+                ),
+              },
+              {
+                key: 'created',
+                header: 'Created',
+                render: (j: JobView) => (
+                  <span className="font-mono text-xs text-slate-400">
+                    {formatDateTime(j.createdAt)}
+                  </span>
+                ),
+              },
+              {
+                key: 'actions',
+                header: 'Actions',
+                align: 'right',
+                render: (j: JobView) => (
+                  <div className="flex items-center justify-end gap-1">
+                    <Link to={`/jobs/${j.id}`} aria-label={`View job ${j.name}`}>
+                      <Button variant="ghost" size="sm" leftIcon={<Eye className="h-3.5 w-3.5" />}>
+                        View
+                      </Button>
+                    </Link>
+                    {canManage && isCancellableJobStatus(j.status) && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-label={`Cancel job ${j.name}`}
+                        onClick={() => setCancellingJob(j)}
+                        className="text-rose-300 hover:text-rose-200"
+                        leftIcon={<Ban className="h-3.5 w-3.5" />}
+                      >
+                        Cancel
+                      </Button>
+                    )}
+                  </div>
+                ),
+              },
+            ]}
+            data={queueJobsQuery.data?.jobs ?? []}
+            rowKey={(j) => j.id}
+            isLoading={queueJobsQuery.isLoading}
+            skeletonRows={3}
+            emptyState={
+              <EmptyState
+                icon={<ListChecks className="h-5 w-5" />}
+                title="No jobs in this queue"
+                description="Submit a job directly to this queue to begin processing."
+                action={
+                  queue ? (
+                    <Button
+                      size="sm"
+                      leftIcon={<Plus className="h-4 w-4" />}
+                      onClick={() => setSubmitJobOpen(true)}
+                    >
+                      Submit Job
+                    </Button>
+                  ) : undefined
+                }
+              />
+            }
+          />
+        </Card>
+      </section>
+
+      {queue && (
+        <SubmitJobModal
+          isOpen={submitJobOpen}
+          queues={[queue]}
+          defaultQueueId={queue.id}
+          onClose={() => setSubmitJobOpen(false)}
+          onSubmitJob={(qId, payload) => submitJobMutation.mutateAsync({ queueId: qId, payload })}
+          onSuccess={(_res, message) => setFeedback({ type: 'success', message })}
+        />
+      )}
+
+      <CancelJobModal
+        isOpen={Boolean(cancellingJob)}
+        job={cancellingJob}
+        onClose={() => setCancellingJob(null)}
+        onConfirmCancel={(jId) => cancelJobMutation.mutateAsync({ jobId: jId, queueId: queue?.id })}
+        onSuccess={(message) => setFeedback({ type: 'success', message })}
+      />
 
       <QueueFormModal
         isOpen={editOpen}

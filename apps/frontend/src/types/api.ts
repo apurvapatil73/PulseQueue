@@ -121,6 +121,60 @@ export interface QueueStatsView {
   updatedAt: string;
 }
 
+export interface JobView {
+  id: string;
+  queueId: string;
+  queueName: string;
+  organisationId: string;
+  name: string;
+  status: JobStatus;
+  priority: number;
+  payload: Record<string, unknown> | unknown;
+  maxRetries: number;
+  backoffMs: number;
+  delayMs: number;
+  attemptsMade: number;
+  stalledCount: number;
+  durationMs: number | null;
+  lastWorkerId: string | null;
+  replayedFromDlqId: string | null;
+  result: Record<string, unknown> | unknown | null;
+  errorMessage: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  failedAt: string | null;
+  lastRecoveredAt: string | null;
+  createdBy: {
+    id: string;
+    name: string;
+    email: string;
+  } | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EnqueueDispatchInfo {
+  enqueued: boolean;
+  deduplicated: boolean;
+  bullmqJobId: string | null;
+  bullmqQueueName: string;
+  error?: string;
+}
+
+export interface JobSubmissionResult {
+  job: JobView;
+  dispatch: EnqueueDispatchInfo;
+}
+
+export interface CancelJobResult {
+  cancelled: true;
+  jobId: string;
+  queueId: string;
+  organisationId: string;
+  previousStatus: JobStatus;
+  message: string;
+}
+
 export interface OrgSafeWorkerView {
   workerInstanceId: string;
   hostname: string;

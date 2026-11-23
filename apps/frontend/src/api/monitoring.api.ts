@@ -28,7 +28,13 @@ export const monitoringApi = {
 
   async listEvents(
     organisationId: string,
-    params: { page?: number; limit?: number } = { page: 1, limit: 10 },
+    params: {
+      page?: number;
+      limit?: number;
+      queueId?: string;
+      jobId?: string;
+      type?: string;
+    } = { page: 1, limit: 10 },
   ): Promise<{ events: PlatformEventView[]; pagination: PaginationMeta }> {
     const { data } = await apiClient.get<
       ApiEnvelope<{ events: PlatformEventView[]; pagination: PaginationMeta }>
