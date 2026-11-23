@@ -9,6 +9,7 @@ import {
   logger,
   outboxReconciler,
   prisma,
+  realtimeEventBus,
   scheduleDispatcherService,
   stalledJobRecoveryService,
   workerHealthService,
@@ -211,6 +212,7 @@ export class WorkerRuntime {
       });
     }
 
+    await realtimeEventBus.closeAll();
     await bullMQService.closeAll();
     await disconnectDatabase();
     await disconnectRedis();

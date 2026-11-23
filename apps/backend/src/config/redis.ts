@@ -96,6 +96,42 @@ export function buildBullMQRedisOptions(redisUrl: string = env.REDIS_URL): Redis
   };
 }
 
+/**
+ * Builds resilient ioredis options for dedicated Pub/Sub publisher and subscriber connections.
+ * Separate from BullMQ and health-probe connections; uses bounded exponential backoff so
+ * subscribers automatically recover and re-subscribe after transient Redis outages.
+ */
+export function buildPubSubRedisOptions(redisUrl: string = env.REDIS_URL): RedisOptions {
+  const parsed = parseRedisConnectionOptions(redisUrl);
+  return {
+    ...parsed,
+    lazyConnect: true,
+    maxRetriesPerRequest: null,
+    enableReadyCheck: true,
+    autoResubscribe: true,
+    connectTimeout: 3000,
+    retryStrategy: (times) => Math.min(times * 250, 5000),
+  };
+}
+
+/**
+ * Creates a dedicated Redis connection for Pub/Sub publishing (separate from BullMQ/subscriber).
+ */
+export function createPubSubPublisherConnection(redisUrl: string = env.REDIS_URL): Redis {
+  const options = buildPubSubRedisOptions(redisUrl);
+  // Publisher fails fast on offline commands so DB writes never block waiting for Redis
+  options.enableOfflineQueue = false;
+  options.maxRetriesPerRequest = 1;
+  return new Redis(options);
+}
+
+/**
+ * Creates a dedicated Redis connection for Pub/Sub subscribing (separate from BullMQ/publisher).
+ */
+export function createPubSubSubscriberConnection(redisUrl: string = env.REDIS_URL): Redis {
+  return new Redis(buildPubSubRedisOptions(redisUrl));
+}
+
 export function getRedisClient(): Redis {
   if (!redisInstance) {
     redisInstance = new Redis(env.REDIS_URL, {

@@ -2,6 +2,7 @@ import { JobStatus, PlatformEventType, WorkerHealthStatus } from '@prisma/client
 import { prisma as db } from '../config/database.js';
 import { logger } from '../utils/logger.js';
 import { eventService } from './event.service.js';
+import { realtimeEventBus } from './realtime.service.js';
 
 export interface WorkerHeartbeatInput {
   workerInstanceId: string;
@@ -118,7 +119,7 @@ export class WorkerHealthService {
       queueCount: input.registeredQueues.length,
     });
 
-    await eventService.record({
+    const startedEvent = await eventService.record({
       type: PlatformEventType.WORKER_STARTED,
       workerId: input.workerInstanceId,
       message: `Worker ${input.workerInstanceId} started`,
@@ -128,6 +129,25 @@ export class WorkerHealthService {
         queueCount: input.registeredQueues.length,
       },
     });
+
+    if (startedEvent) {
+      const uniqueOrgIds = Array.from(new Set(input.organisationIds));
+      await Promise.all(
+        uniqueOrgIds.map((orgId) =>
+          realtimeEventBus.publish({
+            id: startedEvent.id,
+            type: PlatformEventType.WORKER_STARTED,
+            organisationId: orgId,
+            queueId: null,
+            jobId: null,
+            workerId: input.workerInstanceId,
+            message: startedEvent.message,
+            metadata: { status: WorkerHealthStatus.ONLINE },
+            createdAt: startedEvent.createdAt.toISOString(),
+          }),
+        ),
+      );
+    }
   }
 
   /**
@@ -194,6 +214,11 @@ export class WorkerHealthService {
    */
   async markWorkerStopped(workerInstanceId: string, reason?: string): Promise<void> {
     const now = new Date();
+    const existing = await db.workerHeartbeat.findUnique({
+      where: { workerInstanceId },
+      select: { organisationIds: true },
+    });
+
     await db.workerHeartbeat.updateMany({
       where: { workerInstanceId },
       data: {
@@ -206,12 +231,30 @@ export class WorkerHealthService {
 
     logger.info('Worker marked STOPPED', { workerInstanceId, reason });
 
-    await eventService.record({
+    const stoppedEvent = await eventService.record({
       type: PlatformEventType.WORKER_STOPPED,
       workerId: workerInstanceId,
       message: `Worker ${workerInstanceId} stopped gracefully`,
       metadata: reason ? { reason } : {},
     });
+
+    if (stoppedEvent && existing?.organisationIds.length) {
+      await Promise.all(
+        Array.from(new Set(existing.organisationIds)).map((orgId) =>
+          realtimeEventBus.publish({
+            id: stoppedEvent.id,
+            type: PlatformEventType.WORKER_STOPPED,
+            organisationId: orgId,
+            queueId: null,
+            jobId: null,
+            workerId: workerInstanceId,
+            message: stoppedEvent.message,
+            metadata: { status: WorkerHealthStatus.STOPPED },
+            createdAt: stoppedEvent.createdAt.toISOString(),
+          }),
+        ),
+      );
+    }
   }
 
   /**
@@ -269,7 +312,7 @@ export class WorkerHealthService {
           lastHeartbeatAt: worker.lastHeartbeatAt.toISOString(),
         });
 
-        await eventService.record({
+        const staleEvent = await eventService.record({
           type: PlatformEventType.WORKER_HEARTBEAT_STALE,
           workerId: worker.workerInstanceId,
           message: `Worker ${worker.workerInstanceId} heartbeat became stale`,
@@ -278,6 +321,27 @@ export class WorkerHealthService {
             staleThresholdMs: thresholds.staleThresholdMs,
           },
         });
+
+        if (staleEvent && worker.organisationIds.length > 0) {
+          await Promise.all(
+            Array.from(new Set(worker.organisationIds)).map((orgId) =>
+              realtimeEventBus.publish({
+                id: staleEvent.id,
+                type: PlatformEventType.WORKER_HEARTBEAT_STALE,
+                organisationId: orgId,
+                queueId: null,
+                jobId: null,
+                workerId: worker.workerInstanceId,
+                message: staleEvent.message,
+                metadata: {
+                  status: WorkerHealthStatus.STALE,
+                  lastHeartbeatAt: worker.lastHeartbeatAt.toISOString(),
+                },
+                createdAt: staleEvent.createdAt.toISOString(),
+              }),
+            ),
+          );
+        }
       }
     }
 

@@ -1,6 +1,14 @@
 import { PlatformEventType, Prisma } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { logger } from '../utils/logger.js';
+import { uuidSchema } from '../validators/organisation.validator.js';
+import { DEFAULT_EVENT_RETENTION_DAYS } from './eventRetention.service.js';
+import {
+  DEFAULT_MAX_REPLAY_EVENTS,
+  realtimeEventBus,
+  sanitizeRealtimeMetadata,
+  type RealtimePlatformEvent,
+} from './realtime.service.js';
 
 export interface RecordEventInput {
   type: PlatformEventType;
@@ -41,6 +49,30 @@ export interface PaginatedEventsView {
     totalPages: number;
     hasNextPage: boolean;
     hasPreviousPage: boolean;
+  };
+}
+
+export type ReplayCursorStatus =
+  'ok' | 'invalid_cursor' | 'cursor_not_found' | 'cursor_expired' | 'truncated';
+
+export interface ReplayEventsResult {
+  status: ReplayCursorStatus;
+  events: EventView[];
+  truncated: boolean;
+}
+
+export function toRealtimePlatformEvent(event: EventView): RealtimePlatformEvent | null {
+  if (!event.organisationId) return null;
+  return {
+    id: event.id,
+    type: event.type,
+    organisationId: event.organisationId,
+    queueId: event.queueId,
+    jobId: event.jobId,
+    workerId: event.workerId,
+    message: event.message,
+    metadata: sanitizeRealtimeMetadata(event.metadata),
+    createdAt: event.createdAt.toISOString(),
   };
 }
 
@@ -94,6 +126,12 @@ export class EventService {
         },
       });
 
+      // Best-effort publish to Redis Pub/Sub for real-time SSE fan-out (never throws)
+      const realtimePayload = toRealtimePlatformEvent(created);
+      if (realtimePayload) {
+        await realtimeEventBus.publish(realtimePayload);
+      }
+
       return created;
     } catch (err) {
       logger.warn('Failed to persist platform audit event', {
@@ -141,6 +179,72 @@ export class EventService {
         hasNextPage: query.page < totalPages,
         hasPreviousPage: query.page > 1 && totalPages > 0,
       },
+    };
+  }
+
+  /**
+   * Replays persisted platform events strictly after `lastEventId` for a single organisation
+   * in chronological order (`createdAt ASC, id ASC`), respecting the 30-day retention policy.
+   * Foreign-organisation event UUIDs are indistinguishable from unknown cursors (`cursor_not_found`).
+   */
+  async replayAfterCursor(
+    orgId: string,
+    lastEventId: string,
+    options?: { limit?: number; retentionDays?: number; now?: Date },
+  ): Promise<ReplayEventsResult> {
+    if (!uuidSchema.safeParse(lastEventId).success) {
+      return { status: 'invalid_cursor', events: [], truncated: false };
+    }
+
+    const limit = Math.max(1, Math.min(options?.limit ?? DEFAULT_MAX_REPLAY_EVENTS, 500));
+    const retentionDays = options?.retentionDays ?? DEFAULT_EVENT_RETENTION_DAYS;
+    const now = options?.now ?? new Date();
+    const retentionCutoff = new Date(now.getTime() - retentionDays * 86_400_000);
+
+    const cursor = await db.platformEvent.findFirst({
+      where: {
+        id: lastEventId,
+        organisationId: orgId,
+      },
+      select: {
+        id: true,
+        createdAt: true,
+      },
+    });
+
+    if (!cursor) {
+      return { status: 'cursor_not_found', events: [], truncated: false };
+    }
+
+    if (cursor.createdAt < retentionCutoff) {
+      return { status: 'cursor_expired', events: [], truncated: false };
+    }
+
+    const rows = await db.platformEvent.findMany({
+      where: {
+        organisationId: orgId,
+        createdAt: { gte: retentionCutoff },
+        OR: [
+          { createdAt: { gt: cursor.createdAt } },
+          { createdAt: cursor.createdAt, id: { gt: cursor.id } },
+        ],
+      },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: limit + 1,
+    });
+
+    if (rows.length > limit) {
+      return {
+        status: 'truncated',
+        events: rows.slice(0, limit),
+        truncated: true,
+      };
+    }
+
+    return {
+      status: 'ok',
+      events: rows,
+      truncated: false,
     };
   }
 }

@@ -12,6 +12,8 @@ export * from './services/bullmq.service.js';
 export * from './services/outboxReconciler.service.js';
 export * from './services/event.service.js';
 export * from './services/eventRetention.service.js';
+export * from './services/realtime.service.js';
+export * from './controllers/stream.controller.js';
 export * from './services/dlq.service.js';
 export * from './services/stalledJobRecovery.service.js';
 export * from './services/workerHealth.service.js';

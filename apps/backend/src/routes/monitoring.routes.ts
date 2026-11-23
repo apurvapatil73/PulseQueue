@@ -12,6 +12,7 @@ import {
   listOrganisationEvents,
   triggerStalledRecovery,
 } from '../controllers/monitoring.controller.js';
+import { streamOrganisationEvents } from '../controllers/stream.controller.js';
 
 /**
  * Organisation-scoped Dead-Letter Queue (DLQ) routes:
@@ -43,6 +44,12 @@ monitoringRoutes.get(
   listOrganisationWorkers,
 );
 monitoringRoutes.get('/events', authenticate, requireOrgRole(Role.MEMBER), listOrganisationEvents);
+monitoringRoutes.get(
+  '/stream',
+  authenticate,
+  requireOrgRole(Role.MEMBER),
+  streamOrganisationEvents,
+);
 monitoringRoutes.post(
   '/recover-stalled',
   authenticate,

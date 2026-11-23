@@ -23,6 +23,7 @@ export function authenticate(req: Request, _res: Response, next: NextFunction): 
     req.user = {
       id: payload.sub,
       email: payload.email,
+      ...(typeof payload.exp === 'number' ? { tokenExp: payload.exp } : {}),
     };
 
     next();

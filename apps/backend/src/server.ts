@@ -7,6 +7,7 @@ import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { connectRedis, disconnectRedis } from './config/redis.js';
 import { bullMQService } from './services/bullmq.service.js';
 import { outboxReconciler } from './services/outboxReconciler.service.js';
+import { realtimeEventBus } from './services/realtime.service.js';
 
 let server: http.Server | null = null;
 let isShuttingDown = false;
@@ -57,6 +58,9 @@ export async function shutdown(signal: string = 'SIGTERM'): Promise<void> {
 
   // Stop periodic outbox reconciler
   outboxReconciler.stop();
+
+  // Close active SSE streams & Pub/Sub connections before closing HTTP server so shutdown never hangs
+  await realtimeEventBus.closeAll();
 
   // Set timeout to force exit if cleanup hangs
   const forceExitTimeout = setTimeout(() => {

@@ -52,6 +52,12 @@ export class ConflictError extends AppError {
   }
 }
 
+export class TooManyRequestsError extends AppError {
+  constructor(message: string = 'Too many active connections or requests', details?: unknown) {
+    super(message, 429, 'TOO_MANY_REQUESTS', true, details);
+  }
+}
+
 export class ServiceUnavailableError extends AppError {
   constructor(message: string = 'Service temporarily unavailable', details?: unknown) {
     super(message, 503, 'SERVICE_UNAVAILABLE', true, details);
