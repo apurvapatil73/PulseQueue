@@ -11,12 +11,15 @@ import {
 import { uuidSchema } from '../validators/organisation.validator.js';
 import type { CreateJobInput, ListJobsQuery } from '../validators/job.validator.js';
 import {
+  buildBullMQQueueName,
   bullMQService,
   type EnqueueResult,
   type PersistedQueueDescriptor,
 } from './bullmq.service.js';
 import { deadLetterService } from './dlq.service.js';
 import { eventService } from './event.service.js';
+
+export const DEFAULT_JOB_LEASE_MS = 30_000;
 
 export interface JobView {
   id: string;
@@ -30,6 +33,9 @@ export interface JobView {
   maxRetries: number;
   backoffMs: number;
   delayMs: number;
+  idempotencyKey: string | null;
+  fencingToken: number;
+  leaseExpiresAt: Date | null;
   attemptsMade: number;
   stalledCount: number;
   durationMs: number | null;
@@ -73,10 +79,17 @@ export interface CancelJobResult {
 export interface JobSubmissionResult {
   job: JobView;
   dispatch: EnqueueResult;
+  deduplicated?: boolean;
 }
 
 export type WorkerActivationOutcome =
-  | { outcome: 'activated'; job: JobView; maxDurationMs?: number | null }
+  | {
+      outcome: 'activated';
+      job: JobView;
+      fencingToken: number;
+      leaseExpiresAt: Date;
+      maxDurationMs?: number | null;
+    }
   | { outcome: 'already_terminal'; status: JobStatus }
   | { outcome: 'already_active' }
   | { outcome: 'missing' };
@@ -85,6 +98,7 @@ export type WorkerSyncOutcome =
   | { outcome: 'updated'; job: JobView }
   | { outcome: 'already_terminal'; status: JobStatus }
   | { outcome: 'not_active'; status: JobStatus }
+  | { outcome: 'stale_fencing_token'; currentFencingToken: number }
   | { outcome: 'missing' };
 
 const MAX_ERROR_MESSAGE_LENGTH = 2000;
@@ -129,6 +143,9 @@ function toJobView(j: JobWithMeta): JobView {
     maxRetries: j.maxRetries,
     backoffMs: j.backoffMs,
     delayMs: j.delayMs,
+    idempotencyKey: j.idempotencyKey,
+    fencingToken: j.fencingToken,
+    leaseExpiresAt: j.leaseExpiresAt,
     attemptsMade: j.attemptsMade,
     stalledCount: j.stalledCount,
     durationMs: j.durationMs,
@@ -162,64 +179,143 @@ export class JobService {
       throw new NotFoundError('Queue not found');
     }
 
-    const { persistedQueue, createdJob, outboxId } = await db.$transaction(
-      async (tx) => {
-        const queue = await tx.queue.findFirst({
-          where: {
-            id: queueId,
-            organisationId: orgId,
-          },
-          select: {
-            id: true,
-            name: true,
-            organisationId: true,
-            isPaused: true,
-            concurrency: true,
-            defaultPriority: true,
-            maxRetries: true,
-            backoffMs: true,
-          },
-        });
+    type CreateTxResult =
+      | { deduplicated: true; existingJob: JobWithMeta; queueName: string }
+      | {
+          deduplicated: false;
+          persistedQueue: PersistedQueueDescriptor;
+          createdJob: JobWithMeta;
+          outboxId: string;
+        };
 
-        if (!queue) {
-          throw new NotFoundError('Queue not found');
-        }
+    let txResult: CreateTxResult;
+    try {
+      txResult = await db.$transaction(
+        async (tx) => {
+          const queue = await tx.queue.findFirst({
+            where: {
+              id: queueId,
+              organisationId: orgId,
+            },
+            select: {
+              id: true,
+              name: true,
+              organisationId: true,
+              isPaused: true,
+              concurrency: true,
+              defaultPriority: true,
+              maxRetries: true,
+              backoffMs: true,
+            },
+          });
 
-        const initialStatus = resolveInitialJobStatus({
-          queueIsPaused: queue.isPaused,
-          delayMs: input.delayMs,
-        });
+          if (!queue) {
+            throw new NotFoundError('Queue not found');
+          }
 
-        const job = await tx.job.create({
-          data: {
-            queueId: queue.id,
-            name: input.name,
-            status: initialStatus,
-            priority: input.priority ?? queue.defaultPriority,
-            payload: input.payload as Prisma.InputJsonValue,
-            maxRetries: input.maxRetries ?? queue.maxRetries,
-            backoffMs: input.backoffMs ?? queue.backoffMs,
+          if (input.idempotencyKey) {
+            const existing = await tx.job.findUnique({
+              where: {
+                queueId_idempotencyKey: {
+                  queueId: queue.id,
+                  idempotencyKey: input.idempotencyKey,
+                },
+              },
+              include: JOB_INCLUDE,
+            });
+            if (existing) {
+              return { deduplicated: true as const, existingJob: existing, queueName: queue.name };
+            }
+          }
+
+          const initialStatus = resolveInitialJobStatus({
+            queueIsPaused: queue.isPaused,
             delayMs: input.delayMs,
-            createdById: userId,
+          });
+
+          const job = await tx.job.create({
+            data: {
+              queueId: queue.id,
+              name: input.name,
+              status: initialStatus,
+              priority: input.priority ?? queue.defaultPriority,
+              payload: input.payload as Prisma.InputJsonValue,
+              maxRetries: input.maxRetries ?? queue.maxRetries,
+              backoffMs: input.backoffMs ?? queue.backoffMs,
+              delayMs: input.delayMs,
+              idempotencyKey: input.idempotencyKey ?? null,
+              createdById: userId,
+            },
+            include: JOB_INCLUDE,
+          });
+
+          // Commit durable outbox record in the exact same PostgreSQL transaction
+          const outbox = await tx.jobDispatchOutbox.create({
+            data: {
+              jobId: job.id,
+              queueId: queue.id,
+              organisationId: orgId,
+              status: OutboxStatus.PENDING,
+            },
+            select: { id: true },
+          });
+
+          return {
+            deduplicated: false as const,
+            persistedQueue: queue,
+            createdJob: job,
+            outboxId: outbox.id,
+          };
+        },
+        { maxWait: 10_000, timeout: 10_000 },
+      );
+    } catch (err) {
+      // Handle concurrent identical idempotencyKey racing on unique constraint
+      if (
+        input.idempotencyKey &&
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        const existing = await db.job.findFirst({
+          where: {
+            queueId,
+            idempotencyKey: input.idempotencyKey,
+            queue: { organisationId: orgId },
           },
           include: JOB_INCLUDE,
         });
+        if (existing) {
+          return {
+            job: toJobView(existing),
+            dispatch: {
+              broker: 'bullmq',
+              enqueued: true,
+              deduplicated: true,
+              bullmqQueueName: buildBullMQQueueName(orgId, existing.queue.name),
+              bullmqJobId: existing.id,
+            },
+            deduplicated: true,
+          };
+        }
+      }
+      throw err;
+    }
 
-        // Commit durable outbox record in the exact same PostgreSQL transaction
-        const outbox = await tx.jobDispatchOutbox.create({
-          data: {
-            jobId: job.id,
-            queueId: queue.id,
-            organisationId: orgId,
-            status: OutboxStatus.PENDING,
-          },
-          select: { id: true },
-        });
+    if (txResult.deduplicated) {
+      return {
+        job: toJobView(txResult.existingJob),
+        dispatch: {
+          broker: 'bullmq',
+          enqueued: true,
+          deduplicated: true,
+          bullmqQueueName: buildBullMQQueueName(orgId, txResult.queueName),
+          bullmqJobId: txResult.existingJob.id,
+        },
+        deduplicated: true,
+      };
+    }
 
-        return { persistedQueue: queue, createdJob: job, outboxId: outbox.id };
-      },
-      { maxWait: 10_000, timeout: 10_000 },
-    );
+    const { persistedQueue, createdJob, outboxId } = txResult;
 
     logger.info('Job submitted', {
       jobId: createdJob.id,
@@ -540,10 +636,13 @@ export class JobService {
     jobId: string,
     attemptNumber: number,
     workerId?: string,
+    options?: { leaseDurationMs?: number },
   ): Promise<WorkerActivationOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
       return { outcome: 'missing' };
     }
+
+    const leaseDurationMs = Math.max(1_000, options?.leaseDurationMs ?? DEFAULT_JOB_LEASE_MS);
 
     const activation = await db.$transaction(
       async (tx) => {
@@ -577,6 +676,7 @@ export class JobService {
         }
 
         const now = new Date();
+        const leaseExpiresAt = new Date(now.getTime() + leaseDurationMs);
         const claimed = await tx.job.updateMany({
           where: {
             id: existing.id,
@@ -587,6 +687,8 @@ export class JobService {
             status: JobStatus.ACTIVE,
             ...(existing.firstStartedAt ? {} : { firstStartedAt: now }),
             startedAt: now,
+            leaseExpiresAt,
+            fencingToken: { increment: 1 },
             attemptsMade: Math.max(1, attemptNumber),
             ...(workerId ? { lastWorkerId: workerId } : {}),
           },
@@ -638,6 +740,8 @@ export class JobService {
         return {
           outcome: 'activated' as const,
           job: toJobView(updated),
+          fencingToken: updated.fencingToken,
+          leaseExpiresAt: updated.leaseExpiresAt ?? leaseExpiresAt,
           maxDurationMs: updated.scheduleExecution?.schedule?.maxDurationMs ?? null,
         };
       },
@@ -652,11 +756,48 @@ export class JobService {
         jobId: activation.job.id,
         workerId: workerId ?? null,
         message: `Job "${activation.job.name}" started (attempt ${attemptNumber})`,
-        metadata: { attemptNumber, queueName: activation.job.queueName },
+        metadata: {
+          attemptNumber,
+          fencingToken: activation.fencingToken,
+          leaseExpiresAt: activation.leaseExpiresAt.toISOString(),
+          queueName: activation.job.queueName,
+        },
       });
     }
 
     return activation;
+  }
+
+  /**
+   * Renews an active job's execution lease ONLY if the caller still owns the current
+   * fencing token and worker identity. Prevents stale workers from extending expired leases.
+   */
+  async renewJobLease(
+    orgId: string,
+    jobId: string,
+    workerId: string,
+    fencingToken: number,
+    leaseDurationMs: number = DEFAULT_JOB_LEASE_MS,
+  ): Promise<{ renewed: boolean; leaseExpiresAt: Date }> {
+    const leaseExpiresAt = new Date(Date.now() + Math.max(1_000, leaseDurationMs));
+    if (!uuidSchema.safeParse(jobId).success) {
+      return { renewed: false, leaseExpiresAt };
+    }
+
+    const res = await db.job.updateMany({
+      where: {
+        id: jobId,
+        status: JobStatus.ACTIVE,
+        lastWorkerId: workerId,
+        fencingToken,
+        queue: { organisationId: orgId },
+      },
+      data: {
+        leaseExpiresAt,
+      },
+    });
+
+    return { renewed: res.count === 1, leaseExpiresAt };
   }
 
   /**
@@ -668,7 +809,7 @@ export class JobService {
     jobId: string,
     result: Prisma.InputJsonValue,
     attemptNumber: number,
-    options?: { durationMs?: number; workerId?: string },
+    options?: { durationMs?: number; workerId?: string; fencingToken?: number },
   ): Promise<WorkerSyncOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
       return { outcome: 'missing' };
@@ -681,6 +822,7 @@ export class JobService {
       where: {
         id: jobId,
         status: JobStatus.ACTIVE,
+        ...(options?.fencingToken !== undefined ? { fencingToken: options.fencingToken } : {}),
         queue: { organisationId: orgId },
       },
       data: {
@@ -688,6 +830,7 @@ export class JobService {
         result,
         errorMessage: null,
         completedAt,
+        leaseExpiresAt: null,
         attemptsMade: Math.max(1, attemptNumber),
         ...(options?.durationMs !== undefined
           ? { durationMs: Math.max(0, options.durationMs) }
@@ -706,6 +849,23 @@ export class JobService {
     }
 
     if (updatedCount.count !== 1) {
+      if (options?.fencingToken !== undefined && job.fencingToken !== options.fencingToken) {
+        await eventService.record({
+          type: PlatformEventType.JOB_FENCING_REJECTED,
+          organisationId: orgId,
+          queueId: job.queueId,
+          jobId: job.id,
+          workerId: options?.workerId ?? null,
+          message: `Rejected stale completion for job "${job.name}" (supplied fencing token ${options.fencingToken}, current ${job.fencingToken})`,
+          metadata: {
+            attemptedAction: 'COMPLETED',
+            suppliedFencingToken: options.fencingToken,
+            currentFencingToken: job.fencingToken,
+            currentStatus: job.status,
+          },
+        });
+        return { outcome: 'stale_fencing_token', currentFencingToken: job.fencingToken };
+      }
       if (isTerminalJobStatus(job.status)) {
         return { outcome: 'already_terminal', status: job.status };
       }
@@ -749,7 +909,7 @@ export class JobService {
     jobId: string,
     errorMessage: string,
     attemptNumber: number,
-    options?: { workerId?: string },
+    options?: { workerId?: string; fencingToken?: number },
   ): Promise<WorkerSyncOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
       return { outcome: 'missing' };
@@ -762,11 +922,13 @@ export class JobService {
       where: {
         id: jobId,
         status: JobStatus.ACTIVE,
+        ...(options?.fencingToken !== undefined ? { fencingToken: options.fencingToken } : {}),
         queue: { organisationId: orgId },
       },
       data: {
         status: JobStatus.DELAYED,
         errorMessage: sanitizedError,
+        leaseExpiresAt: null,
         attemptsMade: Math.max(1, attemptNumber),
         ...(options?.workerId ? { lastWorkerId: options.workerId } : {}),
       },
@@ -782,6 +944,23 @@ export class JobService {
     }
 
     if (updatedCount.count !== 1) {
+      if (options?.fencingToken !== undefined && job.fencingToken !== options.fencingToken) {
+        await eventService.record({
+          type: PlatformEventType.JOB_FENCING_REJECTED,
+          organisationId: orgId,
+          queueId: job.queueId,
+          jobId: job.id,
+          workerId: options?.workerId ?? null,
+          message: `Rejected stale retry update for job "${job.name}" (supplied fencing token ${options.fencingToken}, current ${job.fencingToken})`,
+          metadata: {
+            attemptedAction: 'DELAYED',
+            suppliedFencingToken: options.fencingToken,
+            currentFencingToken: job.fencingToken,
+            currentStatus: job.status,
+          },
+        });
+        return { outcome: 'stale_fencing_token', currentFencingToken: job.fencingToken };
+      }
       if (isTerminalJobStatus(job.status)) {
         return { outcome: 'already_terminal', status: job.status };
       }
@@ -822,7 +1001,12 @@ export class JobService {
     jobId: string,
     errorMessage: string,
     attemptNumber: number,
-    options?: { durationMs?: number; workerId?: string; routeToDlq?: boolean },
+    options?: {
+      durationMs?: number;
+      workerId?: string;
+      routeToDlq?: boolean;
+      fencingToken?: number;
+    },
   ): Promise<WorkerSyncOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
       return { outcome: 'missing' };
@@ -836,12 +1020,14 @@ export class JobService {
       where: {
         id: jobId,
         status: JobStatus.ACTIVE,
+        ...(options?.fencingToken !== undefined ? { fencingToken: options.fencingToken } : {}),
         queue: { organisationId: orgId },
       },
       data: {
         status: JobStatus.FAILED,
         errorMessage: sanitizedError,
         failedAt,
+        leaseExpiresAt: null,
         attemptsMade: Math.max(1, attemptNumber),
         ...(options?.durationMs !== undefined
           ? { durationMs: Math.max(0, options.durationMs) }
@@ -860,6 +1046,23 @@ export class JobService {
     }
 
     if (updatedCount.count !== 1) {
+      if (options?.fencingToken !== undefined && job.fencingToken !== options.fencingToken) {
+        await eventService.record({
+          type: PlatformEventType.JOB_FENCING_REJECTED,
+          organisationId: orgId,
+          queueId: job.queueId,
+          jobId: job.id,
+          workerId: options?.workerId ?? null,
+          message: `Rejected stale failure commit for job "${job.name}" (supplied fencing token ${options.fencingToken}, current ${job.fencingToken})`,
+          metadata: {
+            attemptedAction: 'FAILED',
+            suppliedFencingToken: options.fencingToken,
+            currentFencingToken: job.fencingToken,
+            currentStatus: job.status,
+          },
+        });
+        return { outcome: 'stale_fencing_token', currentFencingToken: job.fencingToken };
+      }
       if (isTerminalJobStatus(job.status)) {
         return { outcome: 'already_terminal', status: job.status };
       }

@@ -5,6 +5,7 @@ import { PlatformEventType } from '@prisma/client';
 import {
   buildBullMQQueueName,
   buildBullMQRedisOptions,
+  DEFAULT_JOB_LEASE_MS,
   env,
   eventService,
   jobService,
@@ -37,6 +38,7 @@ export interface WorkerManagerOptions {
   registry?: ProcessorRegistry;
   jobService?: JobService;
   redisUrl?: string;
+  leaseDurationMs?: number;
 }
 
 /**
@@ -50,6 +52,7 @@ export class WorkerManager {
   private readonly registry: ProcessorRegistry;
   private readonly jobs: JobService;
   private readonly redisUrl: string;
+  private readonly leaseDurationMs: number;
   private isClosing = false;
 
   constructor(options: WorkerManagerOptions = {}) {
@@ -61,6 +64,7 @@ export class WorkerManager {
     this.registry = options.registry ?? createDefaultProcessorRegistry();
     this.jobs = options.jobService ?? jobService;
     this.redisUrl = options.redisUrl ?? env.REDIS_URL;
+    this.leaseDurationMs = Math.max(1_000, options.leaseDurationMs ?? DEFAULT_JOB_LEASE_MS);
   }
 
   getWorkerInstanceId(): string {
@@ -242,12 +246,13 @@ export class WorkerManager {
       throw new UnrecoverableError('Cross-tenant job payload rejected');
     }
 
-    // 1. Atomically claim job as ACTIVE in PostgreSQL
+    // 1. Atomically claim job as ACTIVE in PostgreSQL with execution lease & fencing token
     const activation = await this.jobs.markJobActive(
       organisationId,
       jobId,
       attemptNumber,
       this.workerInstanceId,
+      { leaseDurationMs: this.leaseDurationMs },
     );
 
     if (activation.outcome === 'missing') {
@@ -279,6 +284,8 @@ export class WorkerManager {
       return null;
     }
 
+    const fencingToken = activation.fencingToken;
+
     logger.info('Job processing started', {
       workerInstanceId: this.workerInstanceId,
       jobId,
@@ -288,9 +295,32 @@ export class WorkerManager {
       jobName: activation.job.name,
       attemptNumber,
       maxAttempts,
+      fencingToken,
     });
 
     const execStartedAt = Date.now();
+
+    // Start periodic lease renewal so legitimate long-running jobs are never falsely stalled
+    const renewIntervalMs = Math.max(1_000, Math.floor(this.leaseDurationMs / 3));
+    const leaseTimer = setInterval(() => {
+      void this.jobs
+        .renewJobLease(
+          organisationId,
+          jobId,
+          this.workerInstanceId,
+          fencingToken,
+          this.leaseDurationMs,
+        )
+        .catch((renewErr) => {
+          logger.warn('Failed to renew job execution lease', {
+            workerInstanceId: this.workerInstanceId,
+            jobId,
+            fencingToken,
+            error: renewErr instanceof Error ? renewErr.message : String(renewErr),
+          });
+        });
+    }, renewIntervalMs);
+    leaseTimer.unref();
 
     // 2. Execute decoupled processor with optional schedule maxDurationMs timeout guard
     try {
@@ -345,8 +375,22 @@ export class WorkerManager {
         {
           durationMs: procResult.durationMs,
           workerId: this.workerInstanceId,
+          fencingToken,
         },
       );
+
+      if (sync.outcome === 'stale_fencing_token') {
+        logger.warn(
+          'Skipping completion commit: job lease was superseded by a newer fencing token',
+          {
+            workerInstanceId: this.workerInstanceId,
+            jobId,
+            fencingToken,
+            currentFencingToken: sync.currentFencingToken,
+          },
+        );
+        return null;
+      }
 
       await workerHealthService.recordJobOutcome(this.workerInstanceId, 'succeeded');
 
@@ -358,6 +402,7 @@ export class WorkerManager {
         jobName: activation.job.name,
         processor: procResult.processor,
         attemptNumber,
+        fencingToken,
         durationMs: procResult.durationMs,
         syncOutcome: sync.outcome,
       });
@@ -371,9 +416,26 @@ export class WorkerManager {
       const hasRemainingAttempts = !isNonRetryable && attemptNumber < maxAttempts;
 
       if (hasRemainingAttempts) {
-        await this.jobs.markJobRetryScheduled(organisationId, jobId, errorMessage, attemptNumber, {
-          workerId: this.workerInstanceId,
-        });
+        const retrySync = await this.jobs.markJobRetryScheduled(
+          organisationId,
+          jobId,
+          errorMessage,
+          attemptNumber,
+          {
+            workerId: this.workerInstanceId,
+            fencingToken,
+          },
+        );
+
+        if (retrySync.outcome === 'stale_fencing_token') {
+          logger.warn('Skipping retry state transition: superseded fencing token', {
+            workerInstanceId: this.workerInstanceId,
+            jobId,
+            fencingToken,
+            currentFencingToken: retrySync.currentFencingToken,
+          });
+          return null;
+        }
 
         logger.warn('Job attempt failed; BullMQ retry scheduled', {
           workerInstanceId: this.workerInstanceId,
@@ -383,6 +445,7 @@ export class WorkerManager {
           jobName: activation.job.name,
           attemptNumber,
           maxAttempts,
+          fencingToken,
           error: errorMessage,
         });
 
@@ -390,11 +453,28 @@ export class WorkerManager {
       }
 
       // Exhausted retries or non-retryable error -> mark FAILED + idempotently route to DLQ
-      await this.jobs.markJobFailed(organisationId, jobId, errorMessage, attemptNumber, {
-        durationMs,
-        workerId: this.workerInstanceId,
-        routeToDlq: true,
-      });
+      const failSync = await this.jobs.markJobFailed(
+        organisationId,
+        jobId,
+        errorMessage,
+        attemptNumber,
+        {
+          durationMs,
+          workerId: this.workerInstanceId,
+          routeToDlq: true,
+          fencingToken,
+        },
+      );
+
+      if (failSync.outcome === 'stale_fencing_token') {
+        logger.warn('Skipping failure commit: superseded fencing token', {
+          workerInstanceId: this.workerInstanceId,
+          jobId,
+          fencingToken,
+          currentFencingToken: failSync.currentFencingToken,
+        });
+        return null;
+      }
 
       await workerHealthService.recordJobOutcome(this.workerInstanceId, 'failed', errorMessage);
 
@@ -406,6 +486,7 @@ export class WorkerManager {
         jobName: activation.job.name,
         attemptNumber,
         maxAttempts,
+        fencingToken,
         nonRetryable: isNonRetryable,
         error: errorMessage,
       });
@@ -415,6 +496,8 @@ export class WorkerManager {
       }
 
       throw err;
+    } finally {
+      clearInterval(leaseTimer);
     }
   }
 
@@ -446,6 +529,24 @@ export class WorkerManager {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  /**
+   * Unregisters and closes BullMQ workers for queues that no longer exist in PostgreSQL,
+   * preventing leaked Redis blocking connections over time.
+   */
+  async reconcileDeletedQueues(activeQueues: PersistedQueueDescriptor[]): Promise<number> {
+    const activeKeys = new Set(
+      activeQueues.map((q) => buildBullMQQueueName(q.organisationId, q.name)),
+    );
+    let removed = 0;
+    for (const [key, entry] of Array.from(this.workers.entries())) {
+      if (!activeKeys.has(key)) {
+        await this.unregisterWorker(entry.organisationId, entry.logicalName);
+        removed += 1;
+      }
+    }
+    return removed;
   }
 
   async closeAll(): Promise<void> {

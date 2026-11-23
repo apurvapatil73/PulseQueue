@@ -69,6 +69,12 @@ export const createJobSchema = z.object({
     .max(JOB_LIMITS.MAX_DELAY_MS, `delayMs must not exceed ${JOB_LIMITS.MAX_DELAY_MS}`)
     .optional()
     .default(0),
+  idempotencyKey: z
+    .string()
+    .trim()
+    .min(1, 'idempotencyKey must not be empty')
+    .max(128, 'idempotencyKey must not exceed 128 characters')
+    .optional(),
 });
 
 export const listJobsQuerySchema = z.object({

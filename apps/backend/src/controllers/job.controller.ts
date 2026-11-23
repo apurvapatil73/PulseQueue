@@ -30,14 +30,25 @@ function optionalParam(req: Request, key: string): string | undefined {
 export async function createJob(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     if (!req.user || !req.membership) throw new UnauthorizedError();
-    const input = parseInput(createJobSchema, req.body);
-    const { job, dispatch } = await jobService.create(
+    const headerIdempotencyKey = req.header('idempotency-key')?.trim();
+    const rawBody =
+      req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
+    const mergedBody =
+      headerIdempotencyKey && rawBody.idempotencyKey === undefined
+        ? { ...rawBody, idempotencyKey: headerIdempotencyKey }
+        : rawBody;
+    const input = parseInput(createJobSchema, mergedBody);
+    const { job, dispatch, deduplicated } = await jobService.create(
       req.membership.organisationId,
       param(req, 'queueId'),
       req.user.id,
       input,
     );
-    sendSuccess(res, { job, dispatch }, 201);
+    sendSuccess(
+      res,
+      deduplicated ? { job, dispatch, deduplicated: true } : { job, dispatch },
+      deduplicated ? 200 : 201,
+    );
   } catch (err) {
     next(err);
   }

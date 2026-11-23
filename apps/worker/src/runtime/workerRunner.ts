@@ -167,6 +167,8 @@ export class WorkerRuntime {
         this.manager.registerWorker(q);
       }
 
+      await this.manager.reconcileDeletedQueues(queues);
+
       return queues.length;
     } catch (err) {
       logger.error('Failed to synchronize persisted queues for worker runtime', {

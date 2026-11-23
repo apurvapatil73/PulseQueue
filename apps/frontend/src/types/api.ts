@@ -34,6 +34,8 @@ export type PlatformEventType =
   | 'JOB_RETRIED'
   | 'JOB_STALLED'
   | 'JOB_RECOVERED'
+  | 'JOB_LEASE_EXPIRED'
+  | 'JOB_FENCING_REJECTED'
   | 'JOB_MOVED_TO_DLQ'
   | 'JOB_REPLAYED'
   | 'WORKER_STARTED'

@@ -72,18 +72,22 @@ export class StalledJobRecoveryService {
     const maxRecoveries = params?.maxStalledRecoveries ?? this.maxStalledRecoveries;
 
     try {
-      const cutoff = new Date(Date.now() - thresholdMs);
+      const sweepNow = new Date();
+      const cutoff = new Date(sweepNow.getTime() - thresholdMs);
 
       const candidates = await db.job.findMany({
         where: {
           status: JobStatus.ACTIVE,
-          startedAt: { lte: cutoff },
           ...(params?.organisationId ? { queue: { organisationId: params.organisationId } } : {}),
+          OR: [
+            { leaseExpiresAt: { lte: sweepNow } },
+            { leaseExpiresAt: null, startedAt: { lte: cutoff } },
+          ],
         },
         include: {
           queue: true,
         },
-        orderBy: [{ startedAt: 'asc' }],
+        orderBy: [{ leaseExpiresAt: 'asc' }, { startedAt: 'asc' }],
         take: this.batchSize,
       });
 
@@ -102,6 +106,7 @@ export class StalledJobRecoveryService {
         }
 
         const now = new Date();
+        const isLeaseExpired = job.leaseExpiresAt !== null && job.leaseExpiresAt <= now;
 
         // Guard against endless recovery loops: once maxStalledRecoveries is reached,
         // mark permanently FAILED and route to DLQ.
@@ -113,18 +118,37 @@ export class StalledJobRecoveryService {
               id: job.id,
               status: JobStatus.ACTIVE,
               stalledCount: job.stalledCount,
+              fencingToken: job.fencingToken,
               queue: { organisationId: orgId },
             },
             data: {
               status: JobStatus.FAILED,
               errorMessage: failureReason,
               failedAt: now,
+              leaseExpiresAt: null,
+              fencingToken: { increment: 1 },
             },
           });
 
           if (failedClaim.count !== 1) {
             summary.skipped += 1;
             continue;
+          }
+
+          if (isLeaseExpired) {
+            await eventService.record({
+              type: PlatformEventType.JOB_LEASE_EXPIRED,
+              organisationId: orgId,
+              queueId: job.queueId,
+              jobId: job.id,
+              workerId: job.lastWorkerId,
+              message: `Execution lease expired for job "${job.name}" (fencing token ${job.fencingToken})`,
+              metadata: {
+                stalledCount: job.stalledCount,
+                previousFencingToken: job.fencingToken,
+                leaseExpiresAt: job.leaseExpiresAt?.toISOString() ?? null,
+              },
+            });
           }
 
           await eventService.record({
@@ -176,13 +200,18 @@ export class StalledJobRecoveryService {
                 id: job.id,
                 status: JobStatus.ACTIVE,
                 stalledCount: job.stalledCount,
+                fencingToken: job.fencingToken,
                 queue: { organisationId: orgId },
               },
               data: {
                 status: nextStatus,
                 stalledCount: { increment: 1 },
+                fencingToken: { increment: 1 },
+                leaseExpiresAt: null,
                 lastRecoveredAt: now,
-                errorMessage: `Recovered from stalled ACTIVE state (recovery #${job.stalledCount + 1})`,
+                errorMessage: isLeaseExpired
+                  ? `Recovered after execution lease expired (recovery #${job.stalledCount + 1})`
+                  : `Recovered from stalled ACTIVE state (recovery #${job.stalledCount + 1})`,
               },
             });
 
@@ -240,9 +269,29 @@ export class StalledJobRecoveryService {
           organisationId: orgId,
           queueId: job.queueId,
           stalledCount: job.stalledCount + 1,
+          previousFencingToken: job.fencingToken,
+          newFencingToken: job.fencingToken + 1,
+          isLeaseExpired,
           previousBullState: bullState,
           reEnqueued: dispatch.enqueued,
         });
+
+        if (isLeaseExpired) {
+          await eventService.record({
+            type: PlatformEventType.JOB_LEASE_EXPIRED,
+            organisationId: orgId,
+            queueId: job.queueId,
+            jobId: job.id,
+            workerId: job.lastWorkerId,
+            message: `Execution lease expired for job "${job.name}" (fencing token ${job.fencingToken} -> ${job.fencingToken + 1})`,
+            metadata: {
+              stalledCount: job.stalledCount + 1,
+              previousFencingToken: job.fencingToken,
+              newFencingToken: job.fencingToken + 1,
+              leaseExpiresAt: job.leaseExpiresAt?.toISOString() ?? null,
+            },
+          });
+        }
 
         await eventService.record({
           type: PlatformEventType.JOB_STALLED,
