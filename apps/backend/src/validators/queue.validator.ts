@@ -1,3 +1,4 @@
+import { SchedulingPolicy } from '@prisma/client';
 import { z } from 'zod';
 
 /**
@@ -75,6 +76,10 @@ export const createQueueSchema = z.object({
   retryBudgetMaxRetries: z.number().int().min(0).max(100_000).nullable().optional(),
   retryBudgetWindowSeconds: z.number().int().min(10).max(86_400).optional(),
   poisonFailureThreshold: z.number().int().min(2).max(20).optional(),
+  schedulingPolicy: z.nativeEnum(SchedulingPolicy).optional(),
+  agingRatePerSec: z.number().min(0.001).max(10.0).optional(),
+  maxEffectivePriority: z.number().min(QUEUE_LIMITS.MAX_PRIORITY).max(100.0).optional(),
+  starvationThresholdSec: z.number().int().min(10).max(86_400).nullable().optional(),
 });
 
 export const updateQueueSchema = z
@@ -90,6 +95,10 @@ export const updateQueueSchema = z
     retryBudgetMaxRetries: z.number().int().min(0).max(100_000).nullable().optional(),
     retryBudgetWindowSeconds: z.number().int().min(10).max(86_400).optional(),
     poisonFailureThreshold: z.number().int().min(2).max(20).optional(),
+    schedulingPolicy: z.nativeEnum(SchedulingPolicy).optional(),
+    agingRatePerSec: z.number().min(0.001).max(10.0).optional(),
+    maxEffectivePriority: z.number().min(QUEUE_LIMITS.MAX_PRIORITY).max(100.0).optional(),
+    starvationThresholdSec: z.number().int().min(10).max(86_400).nullable().optional(),
   })
   .refine(
     (data) =>
@@ -103,7 +112,11 @@ export const updateQueueSchema = z
       data.backpressureMaxAgeMs !== undefined ||
       data.retryBudgetMaxRetries !== undefined ||
       data.retryBudgetWindowSeconds !== undefined ||
-      data.poisonFailureThreshold !== undefined,
+      data.poisonFailureThreshold !== undefined ||
+      data.schedulingPolicy !== undefined ||
+      data.agingRatePerSec !== undefined ||
+      data.maxEffectivePriority !== undefined ||
+      data.starvationThresholdSec !== undefined,
     { message: 'At least one updatable field must be provided' },
   );
 

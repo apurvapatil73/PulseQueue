@@ -24,6 +24,7 @@ export * from './services/alert.service.js';
 export * from './services/alertEvaluator.service.js';
 export * from './services/notification.service.js';
 export * from './services/governance.service.js';
+export * from './services/priorityScheduler.service.js';
 export * from './utils/scheduleTime.js';
 export * from './utils/scheduleLifecycle.js';
 export * from './validators/schedule.validator.js';

@@ -1,4 +1,4 @@
-import { JobStatus, Prisma } from '@prisma/client';
+import { JobStatus, Prisma, SchedulingPolicy } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { ConflictError, NotFoundError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
@@ -22,6 +22,10 @@ export interface QueueView {
   retryBudgetMaxRetries: number | null;
   retryBudgetWindowSeconds: number;
   poisonFailureThreshold: number;
+  schedulingPolicy: SchedulingPolicy;
+  agingRatePerSec: number;
+  maxEffectivePriority: number;
+  starvationThresholdSec: number | null;
   jobCount: number;
   createdBy: {
     id: string;
@@ -76,6 +80,10 @@ function toQueueView(q: QueueWithMeta): QueueView {
     retryBudgetMaxRetries: q.retryBudgetMaxRetries,
     retryBudgetWindowSeconds: q.retryBudgetWindowSeconds,
     poisonFailureThreshold: q.poisonFailureThreshold,
+    schedulingPolicy: q.schedulingPolicy,
+    agingRatePerSec: q.agingRatePerSec,
+    maxEffectivePriority: q.maxEffectivePriority,
+    starvationThresholdSec: q.starvationThresholdSec,
     jobCount: q._count.jobs,
     createdBy: q.createdBy,
     createdAt: q.createdAt,
@@ -125,6 +133,18 @@ export class QueueService {
             : {}),
           ...(input.poisonFailureThreshold !== undefined
             ? { poisonFailureThreshold: input.poisonFailureThreshold }
+            : {}),
+          ...(input.schedulingPolicy !== undefined
+            ? { schedulingPolicy: input.schedulingPolicy }
+            : {}),
+          ...(input.agingRatePerSec !== undefined
+            ? { agingRatePerSec: input.agingRatePerSec }
+            : {}),
+          ...(input.maxEffectivePriority !== undefined
+            ? { maxEffectivePriority: input.maxEffectivePriority }
+            : {}),
+          ...(input.starvationThresholdSec !== undefined
+            ? { starvationThresholdSec: input.starvationThresholdSec }
             : {}),
           createdById: userId,
         },
@@ -246,9 +266,35 @@ export class QueueService {
           ...(input.poisonFailureThreshold !== undefined
             ? { poisonFailureThreshold: input.poisonFailureThreshold }
             : {}),
+          ...(input.schedulingPolicy !== undefined
+            ? { schedulingPolicy: input.schedulingPolicy }
+            : {}),
+          ...(input.agingRatePerSec !== undefined
+            ? { agingRatePerSec: input.agingRatePerSec }
+            : {}),
+          ...(input.maxEffectivePriority !== undefined
+            ? { maxEffectivePriority: input.maxEffectivePriority }
+            : {}),
+          ...(input.starvationThresholdSec !== undefined
+            ? { starvationThresholdSec: input.starvationThresholdSec }
+            : {}),
         },
         include: QUEUE_INCLUDE,
       });
+
+      // Recompute virtual_rank_at for queued jobs if agingRatePerSec changed
+      if (
+        input.agingRatePerSec !== undefined &&
+        input.agingRatePerSec !== existing.agingRatePerSec
+      ) {
+        await db.$executeRaw`
+          UPDATE jobs
+          SET virtual_rank_at = ready_at - ((priority::double precision / ${updated.agingRatePerSec}::double precision) * INTERVAL '1 second')
+          WHERE queue_id = ${updated.id}::uuid
+            AND status IN ('PENDING'::"JobStatus", 'DELAYED'::"JobStatus", 'PAUSED'::"JobStatus")
+            AND dispatch_state = 'QUEUED'::"JobDispatchState"
+        `;
+      }
 
       logger.info('Queue updated', {
         queueId: updated.id,
@@ -399,6 +445,7 @@ export class QueueService {
       return toQueueView(existing);
     }
 
+    const resumedAt = new Date();
     const updated = await db.$transaction(
       async (tx) => {
         const resumedQueue = await tx.queue.update({
@@ -409,6 +456,19 @@ export class QueueService {
           },
           include: QUEUE_INCLUDE,
         });
+
+        // Shift ready_at & virtual_rank_at forward by pause overlap so paused time never
+        // accrues toward priority aging or starvation promotion thresholds
+        if (existing.pausedAt) {
+          await tx.$executeRaw`
+            UPDATE jobs
+            SET
+              ready_at = ready_at + GREATEST(INTERVAL '0 seconds', ${resumedAt}::timestamp - GREATEST(${existing.pausedAt}::timestamp, ready_at)),
+              virtual_rank_at = virtual_rank_at + GREATEST(INTERVAL '0 seconds', ${resumedAt}::timestamp - GREATEST(${existing.pausedAt}::timestamp, ready_at))
+            WHERE queue_id = ${existing.id}::uuid
+              AND status = 'PAUSED'::"JobStatus"
+          `;
+        }
 
         // Promote PAUSED jobs in PostgreSQL along valid lifecycle paths (PAUSED -> PENDING / DELAYED)
         await tx.job.updateMany({
