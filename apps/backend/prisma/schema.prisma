@@ -41,6 +41,7 @@ model User {
   refreshTokens    RefreshToken[]
   sentInvitations  Invitation[]    @relation("SentInvitations")
   createdQueues    Queue[]         @relation("CreatedQueues")
+  createdJobs      Job[]           @relation("CreatedJobs")
 
   @@map("users")
 }
@@ -138,18 +139,24 @@ model Queue {
 }
 
 model Job {
-  id        String    @id @default(uuid()) @db.Uuid
-  queueId   String    @map("queue_id") @db.Uuid
-  name      String
-  status    JobStatus @default(PENDING)
-  priority  Int       @default(5)
-  payload   Json      @default("{}") @db.JsonB
-  createdAt DateTime  @default(now()) @map("created_at")
-  updatedAt DateTime  @updatedAt @map("updated_at")
+  id          String    @id @default(uuid()) @db.Uuid
+  queueId     String    @map("queue_id") @db.Uuid
+  name        String
+  status      JobStatus @default(PENDING)
+  priority    Int       @default(5)
+  payload     Json      @default("{}") @db.JsonB
+  maxRetries  Int       @default(3) @map("max_retries")
+  backoffMs   Int       @default(1000) @map("backoff_ms")
+  delayMs     Int       @default(0) @map("delay_ms")
+  createdById String?   @map("created_by_id") @db.Uuid
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
 
-  queue     Queue     @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  queue     Queue @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  createdBy User? @relation("CreatedJobs", fields: [createdById], references: [id], onDelete: SetNull)
 
   @@index([queueId])
+  @@index([queueId, status, createdAt])
   @@index([status])
   @@index([priority])
   @@index([createdAt])
