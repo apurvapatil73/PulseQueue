@@ -27,6 +27,8 @@ export function inferStatusTone(status: string): BadgeTone {
       'ACTIVE',
       'OK',
       'CONNECTED',
+      'DISPATCHED',
+      'ACCEPTED',
       'JOB_COMPLETED',
       'JOB_RECOVERED',
       'WORKER_STARTED',
@@ -35,7 +37,20 @@ export function inferStatusTone(status: string): BadgeTone {
     return 'emerald';
   }
   if (
-    ['PENDING', 'DELAYED', 'PAUSED', 'DEGRADED', 'JOB_RETRIED', 'JOB_STALLED'].includes(normalized)
+    [
+      'PENDING',
+      'DELAYED',
+      'PAUSED',
+      'DEGRADED',
+      'SCHEDULED',
+      'MISSED',
+      'SKIPPED_OVERLAP',
+      'SKIPPED_CONCURRENCY',
+      'SKIPPED_MIN_INTERVAL',
+      'SKIPPED_MAX_RUNS',
+      'JOB_RETRIED',
+      'JOB_STALLED',
+    ].includes(normalized)
   ) {
     return 'amber';
   }
@@ -46,6 +61,9 @@ export function inferStatusTone(status: string): BadgeTone {
       'ERROR',
       'DISCONNECTED',
       'OPEN',
+      'CANCELLED',
+      'REVOKED',
+      'EXPIRED',
       'JOB_FAILED',
       'JOB_MOVED_TO_DLQ',
       'WORKER_HEARTBEAT_STALE',
@@ -53,7 +71,18 @@ export function inferStatusTone(status: string): BadgeTone {
   ) {
     return 'rose';
   }
-  if (['OWNER', 'JOB_SUBMITTED', 'JOB_STARTED', 'JOB_REPLAYED', 'RECURRING'].includes(normalized)) {
+  if (
+    [
+      'OWNER',
+      'REPLAYED',
+      'CATCH_UP',
+      'FIRE_ONCE',
+      'JOB_SUBMITTED',
+      'JOB_STARTED',
+      'JOB_REPLAYED',
+      'RECURRING',
+    ].includes(normalized)
+  ) {
     return 'sky';
   }
   if (['ADMIN', 'ONE_TIME'].includes(normalized)) {

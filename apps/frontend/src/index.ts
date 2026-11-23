@@ -5,6 +5,7 @@ export { authApi } from './api/auth.api';
 export { organisationApi } from './api/organisation.api';
 export { queueApi } from './api/queue.api';
 export { jobApi } from './api/job.api';
+export { dlqApi } from './api/dlq.api';
 export { monitoringApi } from './api/monitoring.api';
 export { scheduleApi } from './api/schedule.api';
 export { healthApi } from './api/health.api';
