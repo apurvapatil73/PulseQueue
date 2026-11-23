@@ -31,13 +31,13 @@ export async function createJob(req: Request, res: Response, next: NextFunction)
   try {
     if (!req.user || !req.membership) throw new UnauthorizedError();
     const input = parseInput(createJobSchema, req.body);
-    const job = await jobService.create(
+    const { job, dispatch } = await jobService.create(
       req.membership.organisationId,
       param(req, 'queueId'),
       req.user.id,
       input,
     );
-    sendSuccess(res, { job }, 201);
+    sendSuccess(res, { job, dispatch }, 201);
   } catch (err) {
     next(err);
   }

@@ -9,6 +9,11 @@ import {
 } from '../utils/jobLifecycle.js';
 import { uuidSchema } from '../validators/organisation.validator.js';
 import type { CreateJobInput, ListJobsQuery } from '../validators/job.validator.js';
+import {
+  bullMQService,
+  type EnqueueResult,
+  type PersistedQueueDescriptor,
+} from './bullmq.service.js';
 
 export interface JobView {
   id: string;
@@ -49,6 +54,11 @@ export interface CancelJobResult {
   queueId: string;
   organisationId: string;
   previousStatus: JobStatus;
+}
+
+export interface JobSubmissionResult {
+  job: JobView;
+  dispatch: EnqueueResult;
 }
 
 const JOB_INCLUDE = {
@@ -99,12 +109,12 @@ export class JobService {
     queueId: string,
     userId: string,
     input: CreateJobInput,
-  ): Promise<JobView> {
+  ): Promise<JobSubmissionResult> {
     if (!uuidSchema.safeParse(queueId).success) {
       throw new NotFoundError('Queue not found');
     }
 
-    const job = await db.$transaction(
+    const { persistedQueue, createdJob } = await db.$transaction(
       async (tx) => {
         const queue = await tx.queue.findFirst({
           where: {
@@ -116,6 +126,7 @@ export class JobService {
             name: true,
             organisationId: true,
             isPaused: true,
+            concurrency: true,
             defaultPriority: true,
             maxRetries: true,
             backoffMs: true,
@@ -131,7 +142,7 @@ export class JobService {
           delayMs: input.delayMs,
         });
 
-        return tx.job.create({
+        const job = await tx.job.create({
           data: {
             queueId: queue.id,
             name: input.name,
@@ -145,20 +156,29 @@ export class JobService {
           },
           include: JOB_INCLUDE,
         });
+
+        return { persistedQueue: queue, createdJob: job };
       },
       { maxWait: 10_000, timeout: 10_000 },
     );
 
     logger.info('Job submitted', {
-      jobId: job.id,
-      queueId: job.queueId,
+      jobId: createdJob.id,
+      queueId: createdJob.queueId,
       organisationId: orgId,
-      status: job.status,
-      priority: job.priority,
+      status: createdJob.status,
+      priority: createdJob.priority,
       createdById: userId,
     });
 
-    return toJobView(job);
+    // Dispatch to BullMQ after durable PostgreSQL commit.
+    // Partial failure is caught safely; PostgreSQL job stays durable for reconciliation.
+    const dispatch = await bullMQService.enqueueJob(persistedQueue, createdJob);
+
+    return {
+      job: toJobView(createdJob),
+      dispatch,
+    };
   }
 
   /**
@@ -280,7 +300,7 @@ export class JobService {
       throw new NotFoundError('Job not found');
     }
 
-    const result = await db.$transaction(
+    const { result, queueDescriptor } = await db.$transaction(
       async (tx) => {
         const job = await tx.job.findFirst({
           where: {
@@ -292,6 +312,18 @@ export class JobService {
             id: true,
             queueId: true,
             status: true,
+            queue: {
+              select: {
+                id: true,
+                organisationId: true,
+                name: true,
+                isPaused: true,
+                concurrency: true,
+                defaultPriority: true,
+                maxRetries: true,
+                backoffMs: true,
+              },
+            },
           },
         });
 
@@ -319,16 +351,24 @@ export class JobService {
           throw new ConflictError('Job status changed concurrently and could not be cancelled');
         }
 
-        return {
-          cancelled: true as const,
+        const cancelResult: CancelJobResult = {
+          cancelled: true,
           jobId: job.id,
           queueId: job.queueId,
           organisationId: orgId,
           previousStatus: job.status,
         };
+
+        return {
+          result: cancelResult,
+          queueDescriptor: job.queue as PersistedQueueDescriptor,
+        };
       },
       { maxWait: 10_000, timeout: 10_000 },
     );
+
+    // Best-effort removal from BullMQ so a cancelled job does not linger in Redis
+    await bullMQService.removeJobFromBullMQ(queueDescriptor, result.jobId);
 
     logger.info('Job cancelled', {
       jobId: result.jobId,

@@ -4,6 +4,7 @@ import { env } from './config/env.js';
 import { logger } from './utils/logger.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { connectRedis, disconnectRedis } from './config/redis.js';
+import { bullMQService } from './services/bullmq.service.js';
 
 let server: http.Server | null = null;
 let isShuttingDown = false;
@@ -69,6 +70,9 @@ export async function shutdown(signal: string = 'SIGTERM'): Promise<void> {
       });
     });
   }
+
+  // Gracefully close BullMQ queues and shared BullMQ Redis connection
+  await bullMQService.closeAll();
 
   // Gracefully close database connection
   await disconnectDatabase();

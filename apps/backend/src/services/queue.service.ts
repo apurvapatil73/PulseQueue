@@ -4,6 +4,7 @@ import { ConflictError, NotFoundError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import { uuidSchema } from '../validators/organisation.validator.js';
 import type { CreateQueueInput, UpdateQueueInput } from '../validators/queue.validator.js';
+import { bullMQService } from './bullmq.service.js';
 
 export interface QueueView {
   id: string;
@@ -219,6 +220,13 @@ export class QueueService {
         updatedBy: actorUserId,
       });
 
+      // Keep BullMQ registry aligned if the queue was renamed or already registered
+      if (input.name !== undefined && input.name !== existing.name) {
+        await bullMQService.unregisterQueue(orgId, existing.name);
+      } else if (bullMQService.getRegisteredQueue(orgId, updated.name)) {
+        bullMQService.getOrRegisterQueue(updated);
+      }
+
       return toQueueView(updated);
     } catch (err) {
       if (isUniqueConstraintError(err)) {
@@ -241,7 +249,7 @@ export class QueueService {
         id: queueId,
         organisationId: orgId,
       },
-      select: { id: true },
+      select: { id: true, name: true },
     });
 
     if (!existing) {
@@ -283,6 +291,8 @@ export class QueueService {
       { maxWait: 10_000, timeout: 10_000 },
     );
 
+    await bullMQService.unregisterQueue(orgId, existing.name);
+
     logger.info('Queue deleted', {
       queueId,
       organisationId: orgId,
@@ -319,6 +329,9 @@ export class QueueService {
       },
       include: QUEUE_INCLUDE,
     });
+
+    // Best-effort sync with BullMQ; PostgreSQL remains authoritative on Redis outage
+    await bullMQService.syncQueuePauseState(updated);
 
     logger.info('Queue paused', {
       queueId: updated.id,
@@ -358,6 +371,9 @@ export class QueueService {
       },
       include: QUEUE_INCLUDE,
     });
+
+    // Best-effort sync with BullMQ; PostgreSQL remains authoritative on Redis outage
+    await bullMQService.syncQueuePauseState(updated);
 
     logger.info('Queue resumed', {
       queueId: updated.id,
