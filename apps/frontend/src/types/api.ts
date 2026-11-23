@@ -133,14 +133,31 @@ export interface HealthReport {
   timestamp: string;
 }
 
+export interface LatencyDistribution {
+  sampleCount: number;
+  avgMs: number | null;
+  p50Ms: number | null;
+  p95Ms: number | null;
+  p99Ms: number | null;
+}
+
 export interface QueueMetricsItem {
   queueId: string;
   name: string;
   isPaused: boolean;
   concurrency: number;
   totalJobs: number;
+  queueDepth?: number;
   byStatus: Record<JobStatus, number>;
+  successRate?: number | null;
+  failureRate?: number | null;
   averageDurationMs: number | null;
+  p95DurationMs?: number | null;
+  retriedJobs?: number;
+  stalledRecoveries?: number;
+  processedInWindow?: number;
+  jobsPerMinute?: number;
+  oldestPendingAgeMs?: number | null;
   openDeadLetters: number;
 }
 
@@ -248,6 +265,7 @@ export interface OrgSafeWorkerView {
   jobsProcessed: number;
   jobsSucceeded: number;
   jobsFailed: number;
+  activeJobs?: number;
   lastError: string | null;
   lastHeartbeatAt: string;
   startedAt: string;
@@ -266,12 +284,18 @@ export interface OrganisationMetricsView {
     pending: number;
     delayed: number;
     paused: number;
+    queueDepth?: number;
+    successRate?: number | null;
+    failureRate?: number | null;
+    windowSuccessRate?: number | null;
+    windowFailureRate?: number | null;
     retriedJobs: number;
     totalRetryEvents: number;
     stalledRecoveries: number;
     deadLetterOpen: number;
     deadLetterReplayed: number;
     averageDurationMs: number | null;
+    windowAverageDurationMs?: number | null;
   };
   throughput: {
     windowMinutes: number;
@@ -280,9 +304,76 @@ export interface OrganisationMetricsView {
     processedInWindow: number;
     jobsPerMinute: number;
   };
+  latency?: {
+    windowMinutes: number;
+    minPercentileSamples: number;
+    executionDuration: LatencyDistribution;
+    queueWait: LatencyDistribution;
+    retryOverhead: LatencyDistribution;
+    endToEnd: LatencyDistribution;
+  };
+  reliability?: {
+    windowMinutes: number;
+    retriesInWindow: number;
+    stalledEventsInWindow: number;
+    recoveredEventsInWindow: number;
+    dlqCreatedInWindow: number;
+    dlqReplayedInWindow: number;
+    dlqNetGrowthInWindow: number;
+    scheduleMisfiresInWindow: number;
+    scheduleSkipsInWindow: number;
+    scheduleMisfiresTotal: number;
+    outboxPending: number;
+  };
+  workerSummary?: {
+    total: number;
+    online: number;
+    degraded: number;
+    stale: number;
+    stopped: number;
+    activeJobs: number;
+  };
   queues: QueueMetricsItem[];
   workers: OrgSafeWorkerView[];
+  windowStart?: string;
+  windowEnd?: string;
   generatedAt: string;
+}
+
+export interface TimeseriesBucketItem {
+  bucketStart: string;
+  bucketEnd: string;
+  submitted: number;
+  completed: number;
+  failed: number;
+  processed: number;
+  successRate: number | null;
+  failureRate: number | null;
+  avgDurationMs: number | null;
+  p95DurationMs: number | null;
+  retries: number;
+  stalled: number;
+  dlqAdded: number;
+  scheduleMisfires: number;
+}
+
+export interface OrganisationTimeseriesView {
+  organisationId: string;
+  queueId: string | null;
+  windowMinutes: number;
+  bucketMinutes: number;
+  minPercentileSamples: number;
+  windowStart: string;
+  windowEnd: string;
+  buckets: TimeseriesBucketItem[];
+  generatedAt: string;
+}
+
+export interface StalledRecoverySummary {
+  scanned: number;
+  recovered: number;
+  movedToDlq: number;
+  skipped: number;
 }
 
 export interface PlatformEventView {

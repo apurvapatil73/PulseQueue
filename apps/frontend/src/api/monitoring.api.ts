@@ -1,9 +1,11 @@
 import type {
   ApiEnvelope,
   OrganisationMetricsView,
+  OrganisationTimeseriesView,
   OrgSafeWorkerView,
   PaginationMeta,
   PlatformEventView,
+  StalledRecoverySummary,
 } from '../types/api';
 import { apiClient, unwrapApiData } from './apiClient';
 
@@ -17,6 +19,21 @@ export const monitoringApi = {
       { params: { windowMinutes } },
     );
     return unwrapApiData(data).metrics;
+  },
+
+  async getTimeseries(
+    organisationId: string,
+    params: {
+      windowMinutes?: number;
+      bucketMinutes?: number;
+      queueId?: string;
+    } = {},
+  ): Promise<OrganisationTimeseriesView> {
+    const { data } = await apiClient.get<ApiEnvelope<{ timeseries: OrganisationTimeseriesView }>>(
+      `/api/v1/organisations/${organisationId}/monitoring/metrics/timeseries`,
+      { params },
+    );
+    return unwrapApiData(data).timeseries;
   },
 
   async listWorkers(organisationId: string): Promise<OrgSafeWorkerView[]> {
@@ -40,5 +57,19 @@ export const monitoringApi = {
       ApiEnvelope<{ events: PlatformEventView[]; pagination: PaginationMeta }>
     >(`/api/v1/organisations/${organisationId}/monitoring/events`, { params });
     return unwrapApiData(data);
+  },
+
+  async recoverStalled(
+    organisationId: string,
+    options?: {
+      staleActiveThresholdMs?: number;
+      maxStalledRecoveries?: number;
+    },
+  ): Promise<StalledRecoverySummary> {
+    const { data } = await apiClient.post<ApiEnvelope<{ summary: StalledRecoverySummary }>>(
+      `/api/v1/organisations/${organisationId}/monitoring/recover-stalled`,
+      options ?? {},
+    );
+    return unwrapApiData(data).summary;
   },
 };
