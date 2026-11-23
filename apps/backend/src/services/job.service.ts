@@ -1,6 +1,6 @@
 import { JobStatus, OutboxStatus, PlatformEventType, Prisma } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
-import { ConflictError, NotFoundError } from '../utils/errors.js';
+import { ConflictError, NotFoundError, TooManyRequestsError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import {
   assertValidJobTransition,
@@ -18,6 +18,11 @@ import {
 } from './bullmq.service.js';
 import { deadLetterService } from './dlq.service.js';
 import { eventService } from './event.service.js';
+import {
+  governanceService,
+  type AdmissionRejectionDetails,
+  type RetryBudgetCheckResult,
+} from './governance.service.js';
 
 export const DEFAULT_JOB_LEASE_MS = 30_000;
 
@@ -43,6 +48,11 @@ export interface JobView {
   replayedFromDlqId: string | null;
   result: Prisma.JsonValue | null;
   errorMessage: string | null;
+  failureSignature: string | null;
+  consecutiveSameFailures: number;
+  isQuarantined: boolean;
+  quarantinedAt: Date | null;
+  quarantineReason: string | null;
   startedAt: Date | null;
   completedAt: Date | null;
   failedAt: Date | null;
@@ -99,6 +109,7 @@ export type WorkerSyncOutcome =
   | { outcome: 'already_terminal'; status: JobStatus }
   | { outcome: 'not_active'; status: JobStatus }
   | { outcome: 'stale_fencing_token'; currentFencingToken: number }
+  | { outcome: 'retry_budget_exhausted'; budget: RetryBudgetCheckResult }
   | { outcome: 'missing' };
 
 const MAX_ERROR_MESSAGE_LENGTH = 2000;
@@ -153,6 +164,11 @@ function toJobView(j: JobWithMeta): JobView {
     replayedFromDlqId: j.replayedFromDlqId,
     result: j.result,
     errorMessage: j.errorMessage,
+    failureSignature: j.failureSignature,
+    consecutiveSameFailures: j.consecutiveSameFailures,
+    isQuarantined: j.isQuarantined,
+    quarantinedAt: j.quarantinedAt,
+    quarantineReason: j.quarantineReason,
     startedAt: j.startedAt,
     completedAt: j.completedAt,
     failedAt: j.failedAt,
@@ -206,6 +222,8 @@ export class JobService {
               defaultPriority: true,
               maxRetries: true,
               backoffMs: true,
+              maxQueueDepth: true,
+              backpressureMaxAgeMs: true,
             },
           });
 
@@ -231,6 +249,14 @@ export class JobService {
           const initialStatus = resolveInitialJobStatus({
             queueIsPaused: queue.isPaused,
             delayMs: input.delayMs,
+          });
+
+          // Enforce organisation quotas and queue-level backpressure atomically inside transaction
+          await governanceService.enforceAdmissionInTransaction(tx, {
+            orgId,
+            queue,
+            payload: input.payload,
+            initialStatus,
           });
 
           const job = await tx.job.create({
@@ -270,6 +296,24 @@ export class JobService {
         { maxWait: 10_000, timeout: 10_000 },
       );
     } catch (err) {
+      if (err instanceof TooManyRequestsError) {
+        const details = (err.details ?? {}) as Partial<AdmissionRejectionDetails>;
+        await eventService.record({
+          type: PlatformEventType.JOB_ADMISSION_REJECTED,
+          organisationId: orgId,
+          queueId,
+          message: err.message,
+          metadata: {
+            reason: details.reason ?? 'QUOTA_EXCEEDED',
+            scope: details.scope ?? 'organisation',
+            limit: details.limit ?? null,
+            current: details.current ?? null,
+            jobName: input.name,
+          },
+        });
+        throw err;
+      }
+
       // Handle concurrent identical idempotencyKey racing on unique constraint
       if (
         input.idempotencyKey &&
@@ -903,13 +947,24 @@ export class JobService {
   /**
    * Atomically transitions an ACTIVE job to DELAYED when an attempt failed but BullMQ
    * still has remaining retry attempts. Does NOT mark the job permanently FAILED.
+   *
+   * When `options.enforceRetryBudget` is true, retry-budget evaluation, the ACTIVE -> DELAYED
+   * transition, and the JOB_RETRIED event insertion all execute atomically inside a single
+   * advisory-locked transaction so concurrent retries cannot race past the rolling-window cap
+   * and rolled-back transactions never leak budget.
    */
   async markJobRetryScheduled(
     orgId: string,
     jobId: string,
     errorMessage: string,
     attemptNumber: number,
-    options?: { workerId?: string; fencingToken?: number },
+    options?: {
+      workerId?: string;
+      fencingToken?: number;
+      failureSignature?: string;
+      consecutiveSameFailures?: number;
+      enforceRetryBudget?: boolean;
+    },
   ): Promise<WorkerSyncOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
       return { outcome: 'missing' };
@@ -918,78 +973,148 @@ export class JobService {
     assertValidJobTransition(JobStatus.ACTIVE, JobStatus.DELAYED);
     const sanitizedError = sanitizeErrorMessage(errorMessage);
 
-    const updatedCount = await db.job.updateMany({
-      where: {
-        id: jobId,
-        status: JobStatus.ACTIVE,
-        ...(options?.fencingToken !== undefined ? { fencingToken: options.fencingToken } : {}),
-        queue: { organisationId: orgId },
-      },
-      data: {
-        status: JobStatus.DELAYED,
-        errorMessage: sanitizedError,
-        leaseExpiresAt: null,
-        attemptsMade: Math.max(1, attemptNumber),
-        ...(options?.workerId ? { lastWorkerId: options.workerId } : {}),
-      },
-    });
+    const txResult = await db.$transaction(
+      async (tx) => {
+        const existing = await tx.job.findFirst({
+          where: { id: jobId, queue: { organisationId: orgId } },
+          select: {
+            id: true,
+            queueId: true,
+            name: true,
+            status: true,
+            fencingToken: true,
+            queue: { select: { name: true } },
+          },
+        });
 
-    const job = await db.job.findFirst({
-      where: { id: jobId, queue: { organisationId: orgId } },
-      include: JOB_INCLUDE,
-    });
+        if (!existing) {
+          return { outcome: 'missing' as const };
+        }
 
-    if (!job) {
-      return { outcome: 'missing' };
-    }
+        if (options?.fencingToken !== undefined && existing.fencingToken !== options.fencingToken) {
+          return {
+            outcome: 'stale_fencing_token' as const,
+            currentFencingToken: existing.fencingToken,
+            job: existing,
+          };
+        }
 
-    if (updatedCount.count !== 1) {
-      if (options?.fencingToken !== undefined && job.fencingToken !== options.fencingToken) {
-        await eventService.record({
-          type: PlatformEventType.JOB_FENCING_REJECTED,
+        if (existing.status !== JobStatus.ACTIVE) {
+          if (isTerminalJobStatus(existing.status)) {
+            return { outcome: 'already_terminal' as const, status: existing.status };
+          }
+          return { outcome: 'not_active' as const, status: existing.status };
+        }
+
+        if (options?.enforceRetryBudget) {
+          const budget = await governanceService.evaluateRetryBudgetInTransaction(
+            tx,
+            orgId,
+            existing.queueId,
+          );
+          if (!budget.allowed) {
+            return { outcome: 'retry_budget_exhausted' as const, budget };
+          }
+        }
+
+        const updatedCount = await tx.job.updateMany({
+          where: {
+            id: jobId,
+            status: JobStatus.ACTIVE,
+            ...(options?.fencingToken !== undefined ? { fencingToken: options.fencingToken } : {}),
+            queue: { organisationId: orgId },
+          },
+          data: {
+            status: JobStatus.DELAYED,
+            errorMessage: sanitizedError,
+            leaseExpiresAt: null,
+            attemptsMade: Math.max(1, attemptNumber),
+            ...(options?.workerId ? { lastWorkerId: options.workerId } : {}),
+            ...(options?.failureSignature !== undefined
+              ? { failureSignature: options.failureSignature }
+              : {}),
+            ...(options?.consecutiveSameFailures !== undefined
+              ? { consecutiveSameFailures: options.consecutiveSameFailures }
+              : {}),
+          },
+        });
+
+        const job = await tx.job.findFirst({
+          where: { id: jobId, queue: { organisationId: orgId } },
+          include: JOB_INCLUDE,
+        });
+
+        if (!job) {
+          return { outcome: 'missing' as const };
+        }
+
+        if (updatedCount.count !== 1) {
+          if (options?.fencingToken !== undefined && job.fencingToken !== options.fencingToken) {
+            return {
+              outcome: 'stale_fencing_token' as const,
+              currentFencingToken: job.fencingToken,
+              job,
+            };
+          }
+          if (isTerminalJobStatus(job.status)) {
+            return { outcome: 'already_terminal' as const, status: job.status };
+          }
+          return { outcome: 'not_active' as const, status: job.status };
+        }
+
+        await tx.scheduleExecution.updateMany({
+          where: { jobId: job.id },
+          data: {
+            finalJobStatus: JobStatus.DELAYED,
+            retryCount: Math.max(1, attemptNumber),
+          },
+        });
+
+        // Persist JOB_RETRIED inside the same transaction so concurrent retry-budget checks
+        // serialized on the advisory lock immediately observe this consumed retry.
+        const retryEvent = await eventService.createInTransaction(tx, {
+          type: PlatformEventType.JOB_RETRIED,
           organisationId: orgId,
           queueId: job.queueId,
           jobId: job.id,
           workerId: options?.workerId ?? null,
-          message: `Rejected stale retry update for job "${job.name}" (supplied fencing token ${options.fencingToken}, current ${job.fencingToken})`,
+          message: `Job "${job.name}" failed attempt ${attemptNumber}; retry scheduled`,
           metadata: {
-            attemptedAction: 'DELAYED',
-            suppliedFencingToken: options.fencingToken,
-            currentFencingToken: job.fencingToken,
-            currentStatus: job.status,
+            attemptNumber,
+            error: sanitizedError,
+            queueName: job.queue.name,
           },
         });
-        return { outcome: 'stale_fencing_token', currentFencingToken: job.fencingToken };
-      }
-      if (isTerminalJobStatus(job.status)) {
-        return { outcome: 'already_terminal', status: job.status };
-      }
-      return { outcome: 'not_active', status: job.status };
+
+        return { outcome: 'updated' as const, job, retryEvent };
+      },
+      { maxWait: 10_000, timeout: 10_000 },
+    );
+
+    if (txResult.outcome === 'stale_fencing_token') {
+      await eventService.record({
+        type: PlatformEventType.JOB_FENCING_REJECTED,
+        organisationId: orgId,
+        queueId: txResult.job.queueId,
+        jobId: txResult.job.id,
+        workerId: options?.workerId ?? null,
+        message: `Rejected stale retry update for job "${txResult.job.name}" (supplied fencing token ${options?.fencingToken}, current ${txResult.currentFencingToken})`,
+        metadata: {
+          attemptedAction: 'DELAYED',
+          suppliedFencingToken: options?.fencingToken ?? null,
+          currentFencingToken: txResult.currentFencingToken,
+          currentStatus: txResult.job.status,
+        },
+      });
+      return { outcome: 'stale_fencing_token', currentFencingToken: txResult.currentFencingToken };
     }
 
-    await db.scheduleExecution.updateMany({
-      where: { jobId: job.id },
-      data: {
-        finalJobStatus: JobStatus.DELAYED,
-        retryCount: Math.max(1, attemptNumber),
-      },
-    });
+    if (txResult.outcome === 'updated') {
+      await eventService.publishPersistedEvent(txResult.retryEvent);
+      return { outcome: 'updated', job: toJobView(txResult.job) };
+    }
 
-    await eventService.record({
-      type: PlatformEventType.JOB_RETRIED,
-      organisationId: orgId,
-      queueId: job.queueId,
-      jobId: job.id,
-      workerId: options?.workerId ?? null,
-      message: `Job "${job.name}" failed attempt ${attemptNumber}; retry scheduled`,
-      metadata: {
-        attemptNumber,
-        error: sanitizedError,
-        queueName: job.queue.name,
-      },
-    });
-
-    return { outcome: 'updated', job: toJobView(job) };
+    return txResult;
   }
 
   /**
@@ -1006,6 +1131,12 @@ export class JobService {
       workerId?: string;
       routeToDlq?: boolean;
       fencingToken?: number;
+      quarantine?: {
+        isQuarantined: boolean;
+        quarantineReason: string | null;
+        failureSignature: string | null;
+        consecutiveSameFailures?: number;
+      };
     },
   ): Promise<WorkerSyncOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
@@ -1015,31 +1146,64 @@ export class JobService {
     assertValidJobTransition(JobStatus.ACTIVE, JobStatus.FAILED);
     const sanitizedError = sanitizeErrorMessage(errorMessage);
     const failedAt = new Date();
+    const isQuarantined = options?.quarantine?.isQuarantined === true;
+    const quarantineReason = options?.quarantine?.quarantineReason ?? null;
+    const failureSignature = options?.quarantine?.failureSignature ?? null;
 
-    const updatedCount = await db.job.updateMany({
-      where: {
-        id: jobId,
-        status: JobStatus.ACTIVE,
-        ...(options?.fencingToken !== undefined ? { fencingToken: options.fencingToken } : {}),
-        queue: { organisationId: orgId },
-      },
-      data: {
-        status: JobStatus.FAILED,
-        errorMessage: sanitizedError,
-        failedAt,
-        leaseExpiresAt: null,
-        attemptsMade: Math.max(1, attemptNumber),
-        ...(options?.durationMs !== undefined
-          ? { durationMs: Math.max(0, options.durationMs) }
-          : {}),
-        ...(options?.workerId ? { lastWorkerId: options.workerId } : {}),
-      },
-    });
+    const { updatedCount, job } = await db.$transaction(
+      async (tx) => {
+        const res = await tx.job.updateMany({
+          where: {
+            id: jobId,
+            status: JobStatus.ACTIVE,
+            ...(options?.fencingToken !== undefined ? { fencingToken: options.fencingToken } : {}),
+            queue: { organisationId: orgId },
+          },
+          data: {
+            status: JobStatus.FAILED,
+            errorMessage: sanitizedError,
+            failedAt,
+            leaseExpiresAt: null,
+            attemptsMade: Math.max(1, attemptNumber),
+            ...(options?.durationMs !== undefined
+              ? { durationMs: Math.max(0, options.durationMs) }
+              : {}),
+            ...(options?.workerId ? { lastWorkerId: options.workerId } : {}),
+            ...(failureSignature !== null ? { failureSignature } : {}),
+            ...(options?.quarantine?.consecutiveSameFailures !== undefined
+              ? { consecutiveSameFailures: options.quarantine.consecutiveSameFailures }
+              : {}),
+            ...(isQuarantined
+              ? {
+                  isQuarantined: true,
+                  quarantinedAt: failedAt,
+                  quarantineReason,
+                }
+              : {}),
+          },
+        });
 
-    const job = await db.job.findFirst({
-      where: { id: jobId, queue: { organisationId: orgId } },
-      include: JOB_INCLUDE,
-    });
+        const row = await tx.job.findFirst({
+          where: { id: jobId, queue: { organisationId: orgId } },
+          include: JOB_INCLUDE,
+        });
+
+        if (row && res.count === 1) {
+          await tx.scheduleExecution.updateMany({
+            where: { jobId: row.id },
+            data: {
+              finalJobStatus: JobStatus.FAILED,
+              completedAt: row.failedAt ?? failedAt,
+              ...(row.durationMs !== null ? { durationMs: row.durationMs } : {}),
+              retryCount: Math.max(0, attemptNumber - 1),
+            },
+          });
+        }
+
+        return { updatedCount: res, job: row };
+      },
+      { maxWait: 10_000, timeout: 10_000 },
+    );
 
     if (!job) {
       return { outcome: 'missing' };
@@ -1069,16 +1233,6 @@ export class JobService {
       return { outcome: 'not_active', status: job.status };
     }
 
-    await db.scheduleExecution.updateMany({
-      where: { jobId: job.id },
-      data: {
-        finalJobStatus: JobStatus.FAILED,
-        completedAt: job.failedAt ?? failedAt,
-        ...(job.durationMs !== null ? { durationMs: job.durationMs } : {}),
-        retryCount: Math.max(0, attemptNumber - 1),
-      },
-    });
-
     await eventService.record({
       type: PlatformEventType.JOB_FAILED,
       organisationId: orgId,
@@ -1094,6 +1248,23 @@ export class JobService {
       },
     });
 
+    if (isQuarantined) {
+      await eventService.record({
+        type: PlatformEventType.JOB_QUARANTINED,
+        organisationId: orgId,
+        queueId: job.queueId,
+        jobId: job.id,
+        workerId: options?.workerId ?? null,
+        message: `Job "${job.name}" quarantined as poison job: ${quarantineReason ?? sanitizedError}`,
+        metadata: {
+          quarantineReason,
+          failureSignature,
+          attemptsMade: job.attemptsMade,
+          queueName: job.queue.name,
+        },
+      });
+    }
+
     // Route permanently failed job into DLQ idempotently (unless explicitly disabled)
     if (options?.routeToDlq !== false) {
       await deadLetterService.recordDeadLetter({
@@ -1104,6 +1275,9 @@ export class JobService {
         jobName: job.name,
         payload: job.payload,
         failureReason: sanitizedError,
+        isQuarantined,
+        quarantineReason,
+        failureSignature,
         attemptsMade: job.attemptsMade,
         maxRetries: job.maxRetries,
         failedAt: job.failedAt ?? failedAt,

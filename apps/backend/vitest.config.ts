@@ -4,6 +4,13 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    pool: 'forks',
+    poolOptions: {
+      forks: {
+        minForks: 1,
+        maxForks: 4,
+      },
+    },
     include: ['apps/backend/tests/**/*.test.ts', 'tests/**/*.test.ts'],
     exclude: ['dist/**', 'node_modules/**'],
   },

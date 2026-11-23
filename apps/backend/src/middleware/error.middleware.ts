@@ -29,6 +29,18 @@ export function errorHandler(err: Error, req: Request, res: Response, _next: Nex
       details: err.details,
     });
 
+    if (
+      err.statusCode === 429 &&
+      err.details &&
+      typeof err.details === 'object' &&
+      'retryAfterSeconds' in err.details
+    ) {
+      const retryAfter = Number((err.details as { retryAfterSeconds?: unknown }).retryAfterSeconds);
+      if (Number.isFinite(retryAfter) && retryAfter > 0) {
+        res.setHeader('Retry-After', String(Math.ceil(retryAfter)));
+      }
+    }
+
     sendError(res, err.message, err.statusCode, err.code, err.details);
     return;
   }

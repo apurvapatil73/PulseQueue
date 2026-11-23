@@ -70,6 +70,11 @@ export const createQueueSchema = z.object({
   defaultPriority: defaultPrioritySchema.optional().default(QUEUE_LIMITS.DEFAULT_PRIORITY),
   maxRetries: maxRetriesSchema.optional().default(QUEUE_LIMITS.DEFAULT_MAX_RETRIES),
   backoffMs: backoffMsSchema.optional().default(QUEUE_LIMITS.DEFAULT_BACKOFF_MS),
+  maxQueueDepth: z.number().int().min(1).max(1_000_000).nullable().optional(),
+  backpressureMaxAgeMs: z.number().int().min(100).max(86_400_000).nullable().optional(),
+  retryBudgetMaxRetries: z.number().int().min(0).max(100_000).nullable().optional(),
+  retryBudgetWindowSeconds: z.number().int().min(10).max(86_400).optional(),
+  poisonFailureThreshold: z.number().int().min(2).max(20).optional(),
 });
 
 export const updateQueueSchema = z
@@ -80,6 +85,11 @@ export const updateQueueSchema = z
     defaultPriority: defaultPrioritySchema.optional(),
     maxRetries: maxRetriesSchema.optional(),
     backoffMs: backoffMsSchema.optional(),
+    maxQueueDepth: z.number().int().min(1).max(1_000_000).nullable().optional(),
+    backpressureMaxAgeMs: z.number().int().min(100).max(86_400_000).nullable().optional(),
+    retryBudgetMaxRetries: z.number().int().min(0).max(100_000).nullable().optional(),
+    retryBudgetWindowSeconds: z.number().int().min(10).max(86_400).optional(),
+    poisonFailureThreshold: z.number().int().min(2).max(20).optional(),
   })
   .refine(
     (data) =>
@@ -88,7 +98,12 @@ export const updateQueueSchema = z
       data.concurrency !== undefined ||
       data.defaultPriority !== undefined ||
       data.maxRetries !== undefined ||
-      data.backoffMs !== undefined,
+      data.backoffMs !== undefined ||
+      data.maxQueueDepth !== undefined ||
+      data.backpressureMaxAgeMs !== undefined ||
+      data.retryBudgetMaxRetries !== undefined ||
+      data.retryBudgetWindowSeconds !== undefined ||
+      data.poisonFailureThreshold !== undefined,
     { message: 'At least one updatable field must be provided' },
   );
 

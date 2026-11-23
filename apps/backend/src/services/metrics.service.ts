@@ -129,6 +129,9 @@ export interface OrganisationMetricsView {
     scheduleSkipsInWindow: number;
     scheduleMisfiresTotal: number;
     outboxPending: number;
+    admissionRejectionsInWindow: number;
+    retryBudgetExhaustedInWindow: number;
+    quarantinedOpen: number;
   };
   /** Aggregated counts of workers serving this organisation. */
   workerSummary: {
@@ -245,6 +248,9 @@ interface OrgReliabilitySqlRow {
   schedule_misfires_in_window: number | bigint | string;
   schedule_skips_in_window: number | bigint | string;
   outbox_pending: number | bigint | string;
+  admission_rejections_in_window: number | bigint | string;
+  retry_budget_exhausted_in_window: number | bigint | string;
+  quarantined_open: number | bigint | string;
   dlq_open_by_queue: Record<string, number> | null;
 }
 
@@ -552,6 +558,9 @@ export class MetricsService {
           (SELECT COUNT(*)::int FROM schedule_executions se INNER JOIN schedules s ON s.id = se.schedule_id WHERE s.organisation_id = ${orgId}::uuid AND se.status = 'MISSED' AND se.created_at >= ${windowStart}) AS schedule_misfires_in_window,
           (SELECT COUNT(*)::int FROM schedule_executions se INNER JOIN schedules s ON s.id = se.schedule_id WHERE s.organisation_id = ${orgId}::uuid AND se.status IN ('SKIPPED_OVERLAP', 'SKIPPED_CONCURRENCY', 'SKIPPED_MIN_INTERVAL', 'SKIPPED_MAX_RUNS') AND se.created_at >= ${windowStart}) AS schedule_skips_in_window,
           (SELECT COUNT(*)::int FROM job_dispatch_outbox WHERE organisation_id = ${orgId}::uuid AND status = 'PENDING') AS outbox_pending,
+          (SELECT COUNT(*)::int FROM platform_events WHERE organisation_id = ${orgId}::uuid AND type = 'JOB_ADMISSION_REJECTED' AND created_at >= ${windowStart}) AS admission_rejections_in_window,
+          (SELECT COUNT(*)::int FROM platform_events WHERE organisation_id = ${orgId}::uuid AND type = 'JOB_RETRY_BUDGET_EXHAUSTED' AND created_at >= ${windowStart}) AS retry_budget_exhausted_in_window,
+          (SELECT COUNT(*)::int FROM dead_letter_jobs WHERE organisation_id = ${orgId}::uuid AND status = 'OPEN' AND is_quarantined = true) AS quarantined_open,
           (
             SELECT json_object_agg(queue_id::text, cnt)
             FROM (
@@ -746,6 +755,9 @@ export class MetricsService {
         scheduleSkipsInWindow: toInt(rel?.schedule_skips_in_window),
         scheduleMisfiresTotal: toInt(rel?.schedule_misfires_total),
         outboxPending: toInt(rel?.outbox_pending),
+        admissionRejectionsInWindow: toInt(rel?.admission_rejections_in_window),
+        retryBudgetExhaustedInWindow: toInt(rel?.retry_budget_exhausted_in_window),
+        quarantinedOpen: toInt(rel?.quarantined_open),
       },
       workerSummary,
       queues: queueMetrics,

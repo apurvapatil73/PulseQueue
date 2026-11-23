@@ -9,7 +9,12 @@ import {
   ScheduleType,
 } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
-import { BadRequestError, ConflictError, NotFoundError } from '../utils/errors.js';
+import {
+  BadRequestError,
+  ConflictError,
+  NotFoundError,
+  TooManyRequestsError,
+} from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import { isCancellableJobStatus } from '../utils/jobLifecycle.js';
 import {
@@ -33,6 +38,7 @@ import {
 } from '../validators/schedule.validator.js';
 import { bullMQService, type EnqueueResult } from './bullmq.service.js';
 import { eventService } from './event.service.js';
+import { governanceService, type AdmissionRejectionDetails } from './governance.service.js';
 import {
   scheduleDispatcherService,
   type ScheduleBullMQReconcileSummary,
@@ -357,6 +363,18 @@ export class ScheduleService {
 
         const { schedule, createdJob, executionId, outboxId } = await db.$transaction(
           async (tx) => {
+            await governanceService.enforceAdmissionInTransaction(tx, {
+              orgId,
+              queue: {
+                id: queue.id,
+                name: queue.name,
+                maxQueueDepth: queue.maxQueueDepth,
+                backpressureMaxAgeMs: queue.backpressureMaxAgeMs,
+              },
+              payload,
+              initialStatus: initialJobStatus,
+            });
+
             const sched = await tx.schedule.create({
               data: {
                 organisationId: orgId,
@@ -521,6 +539,26 @@ export class ScheduleService {
 
       return { schedule: toScheduleView(schedule) };
     } catch (err) {
+      if (err instanceof TooManyRequestsError) {
+        const details = err.details as AdmissionRejectionDetails | undefined;
+        await eventService.record({
+          type: PlatformEventType.JOB_ADMISSION_REJECTED,
+          organisationId: orgId,
+          queueId: queue.id,
+          message: err.message,
+          metadata: {
+            source: 'schedule_create',
+            scheduleName: input.name,
+            jobName: input.jobName,
+            reason: details?.reason ?? 'QUOTA_EXCEEDED',
+            scope: details?.scope ?? 'organisation',
+            limit: details?.limit ?? null,
+            current: details?.current ?? null,
+            retryAfterSeconds: details?.retryAfterSeconds ?? 5,
+          },
+        });
+        throw err;
+      }
       if (isUniqueConstraintError(err)) {
         throw new ConflictError(
           `A schedule named "${input.name}" already exists in this organisation`,

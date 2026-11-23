@@ -8,6 +8,7 @@ import { queueJobRoutes, orgJobRoutes } from './job.routes.js';
 import { dlqRoutes, monitoringRoutes } from './monitoring.routes.js';
 import scheduleRoutes from './schedule.routes.js';
 import { alertRuleRoutes, alertRoutes, notificationRoutes } from './alert.routes.js';
+import { governanceRoutes } from './governance.routes.js';
 
 const router = Router();
 
@@ -39,6 +40,9 @@ router.use('/api/v1/organisations/:organisationId/schedules', scheduleRoutes);
 router.use('/api/v1/organisations/:organisationId/alert-rules', alertRuleRoutes);
 router.use('/api/v1/organisations/:organisationId/alerts', alertRoutes);
 router.use('/api/v1/organisations/:organisationId/notifications', notificationRoutes);
+
+// Organisation-scoped Governance (Quotas, Backpressure, Retry Budgets & Quarantine) endpoints
+router.use('/api/v1/organisations/:organisationId/governance', governanceRoutes);
 
 // Organisation management endpoints
 router.use('/api/v1/organisations', orgRoutes);

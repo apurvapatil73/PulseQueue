@@ -18,6 +18,7 @@ export interface PersistedQueueDescriptor {
   defaultPriority: number;
   maxRetries: number;
   backoffMs: number;
+  poisonFailureThreshold?: number;
 }
 
 export interface PersistedJobDescriptor {

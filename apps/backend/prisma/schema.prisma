@@ -57,6 +57,10 @@ enum PlatformEventType {
   JOB_RECOVERED
   JOB_LEASE_EXPIRED
   JOB_FENCING_REJECTED
+  JOB_ADMISSION_REJECTED
+  JOB_RETRY_BUDGET_EXHAUSTED
+  JOB_QUARANTINED
+  JOB_QUARANTINE_RELEASED
   JOB_MOVED_TO_DLQ
   JOB_REPLAYED
   WORKER_STARTED
@@ -162,10 +166,17 @@ model RefreshToken {
 }
 
 model Organisation {
-  id          String       @id @default(uuid()) @db.Uuid
-  name        String
-  createdAt   DateTime     @default(now()) @map("created_at")
-  updatedAt   DateTime     @updatedAt @map("updated_at")
+  id                       String   @id @default(uuid()) @db.Uuid
+  name                     String
+  maxOutstandingJobs       Int?     @map("max_outstanding_jobs")
+  maxActiveJobs            Int?     @map("max_active_jobs")
+  maxQueuedJobs            Int?     @map("max_queued_jobs")
+  maxDelayedJobs           Int?     @map("max_delayed_jobs")
+  maxPayloadBytes          Int?     @map("max_payload_bytes")
+  retryBudgetMaxRetries    Int?     @map("retry_budget_max_retries")
+  retryBudgetWindowSeconds Int      @default(300) @map("retry_budget_window_seconds")
+  createdAt                DateTime @default(now()) @map("created_at")
+  updatedAt                DateTime @updatedAt @map("updated_at")
 
   memberships    Membership[]
   invitations    Invitation[]
@@ -226,9 +237,14 @@ model Queue {
   pausedAt        DateTime? @map("paused_at")
   concurrency     Int       @default(5)
   defaultPriority Int       @default(5) @map("default_priority")
-  maxRetries      Int       @default(3) @map("max_retries")
-  backoffMs       Int       @default(1000) @map("backoff_ms")
-  createdById     String?   @map("created_by_id") @db.Uuid
+  maxRetries               Int       @default(3) @map("max_retries")
+  backoffMs                Int       @default(1000) @map("backoff_ms")
+  maxQueueDepth            Int?      @map("max_queue_depth")
+  backpressureMaxAgeMs     Int?      @map("backpressure_max_age_ms")
+  retryBudgetMaxRetries    Int?      @map("retry_budget_max_retries")
+  retryBudgetWindowSeconds Int       @default(300) @map("retry_budget_window_seconds")
+  poisonFailureThreshold   Int       @default(3) @map("poison_failure_threshold")
+  createdById              String?   @map("created_by_id") @db.Uuid
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
 
@@ -264,9 +280,14 @@ model Job {
   durationMs        Int?      @map("duration_ms")
   lastWorkerId      String?   @map("last_worker_id")
   replayedFromDlqId String?   @map("replayed_from_dlq_id") @db.Uuid
-  result            Json?     @db.JsonB
-  errorMessage      String?   @map("error_message")
-  firstStartedAt    DateTime? @map("first_started_at")
+  result                  Json?     @db.JsonB
+  errorMessage            String?   @map("error_message")
+  failureSignature        String?   @map("failure_signature")
+  consecutiveSameFailures Int       @default(0) @map("consecutive_same_failures")
+  isQuarantined           Boolean   @default(false) @map("is_quarantined")
+  quarantinedAt           DateTime? @map("quarantined_at")
+  quarantineReason        String?   @map("quarantine_reason")
+  firstStartedAt          DateTime? @map("first_started_at")
   startedAt         DateTime? @map("started_at")
   completedAt       DateTime? @map("completed_at")
   failedAt          DateTime? @map("failed_at")
@@ -290,6 +311,7 @@ model Job {
   @@index([status])
   @@index([status, startedAt])
   @@index([status, leaseExpiresAt])
+  @@index([queueId, isQuarantined])
   @@index([priority])
   @@index([createdAt])
   @@map("jobs")
@@ -303,8 +325,11 @@ model DeadLetterJob {
   queueName      String           @map("queue_name")
   jobName        String           @map("job_name")
   payloadSummary Json             @default("{}") @map("payload_summary") @db.JsonB
-  failureReason  String           @map("failure_reason")
-  attemptsMade   Int              @map("attempts_made")
+  failureReason    String           @map("failure_reason")
+  isQuarantined    Boolean          @default(false) @map("is_quarantined")
+  quarantineReason String?          @map("quarantine_reason")
+  failureSignature String?          @map("failure_signature")
+  attemptsMade     Int              @map("attempts_made")
   maxRetries     Int              @map("max_retries")
   status         DeadLetterStatus @default(OPEN)
   failedAt       DateTime         @map("failed_at")

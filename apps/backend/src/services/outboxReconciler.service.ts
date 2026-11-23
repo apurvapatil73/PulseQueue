@@ -93,7 +93,11 @@ export class OutboxReconciler {
           continue;
         }
 
-        if (record.job.status === 'COMPLETED' || record.job.status === 'FAILED') {
+        if (
+          record.job.status === 'COMPLETED' ||
+          record.job.status === 'FAILED' ||
+          record.job.isQuarantined
+        ) {
           await db.jobDispatchOutbox.updateMany({
             where: { id: record.id, status: OutboxStatus.PENDING },
             data: { status: OutboxStatus.CANCELLED },

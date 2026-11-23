@@ -1,11 +1,12 @@
 import { DeadLetterStatus, OutboxStatus, PlatformEventType, Prisma } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
-import { ConflictError, NotFoundError } from '../utils/errors.js';
+import { ConflictError, NotFoundError, TooManyRequestsError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import { resolveInitialJobStatus } from '../utils/jobLifecycle.js';
 import { uuidSchema } from '../validators/organisation.validator.js';
 import { bullMQService, type EnqueueResult } from './bullmq.service.js';
 import { eventService } from './event.service.js';
+import { governanceService, type AdmissionRejectionDetails } from './governance.service.js';
 
 export interface DeadLetterJobView {
   id: string;
@@ -16,6 +17,9 @@ export interface DeadLetterJobView {
   jobName: string;
   payloadSummary: Prisma.JsonValue;
   failureReason: string;
+  isQuarantined: boolean;
+  quarantineReason: string | null;
+  failureSignature: string | null;
   attemptsMade: number;
   maxRetries: number;
   status: DeadLetterStatus;
@@ -111,6 +115,9 @@ export class DeadLetterService {
     jobName: string;
     payload: Prisma.JsonValue;
     failureReason: string;
+    isQuarantined?: boolean;
+    quarantineReason?: string | null;
+    failureSignature?: string | null;
     attemptsMade: number;
     maxRetries: number;
     failedAt: Date;
@@ -137,6 +144,9 @@ export class DeadLetterService {
           jobName: input.jobName,
           payloadSummary,
           failureReason: truncatedReason,
+          isQuarantined: input.isQuarantined ?? false,
+          quarantineReason: input.quarantineReason ?? null,
+          failureSignature: input.failureSignature ?? null,
           attemptsMade: input.attemptsMade,
           maxRetries: input.maxRetries,
           status: DeadLetterStatus.OPEN,
@@ -273,91 +283,125 @@ export class DeadLetterService {
       throw new NotFoundError('Dead-letter job not found');
     }
 
-    const { updatedDlq, newJob, persistedQueue, outboxId } = await db.$transaction(
-      async (tx) => {
-        const dlq = await tx.deadLetterJob.findFirst({
-          where: { id: dlqId, organisationId: orgId },
-          include: {
-            originalJob: true,
-            queue: true,
-          },
-        });
-
-        if (!dlq) {
-          throw new NotFoundError('Dead-letter job not found');
-        }
-
-        if (dlq.status !== DeadLetterStatus.OPEN) {
-          throw new ConflictError('Dead-letter job has already been replayed', {
-            dlqId: dlq.id,
-            replayedJobId: dlq.replayedJobId,
-            replayedAt: dlq.replayedAt,
+    let txRes;
+    try {
+      txRes = await db.$transaction(
+        async (tx) => {
+          const dlq = await tx.deadLetterJob.findFirst({
+            where: { id: dlqId, organisationId: orgId },
+            include: {
+              originalJob: true,
+              queue: true,
+            },
           });
-        }
 
-        const initialStatus = resolveInitialJobStatus({
-          queueIsPaused: dlq.queue.isPaused,
-          delayMs: 0,
-        });
+          if (!dlq) {
+            throw new NotFoundError('Dead-letter job not found');
+          }
 
-        // Create a fresh Job preserving link to the DLQ record and original failure history
-        const createdJob = await tx.job.create({
-          data: {
-            queueId: dlq.queue.id,
-            name: dlq.originalJob.name,
-            status: initialStatus,
-            priority: overrides?.priority ?? dlq.originalJob.priority,
-            payload: (overrides?.payload ?? dlq.originalJob.payload) as Prisma.InputJsonValue,
-            maxRetries: overrides?.maxRetries ?? dlq.originalJob.maxRetries,
-            backoffMs: overrides?.backoffMs ?? dlq.originalJob.backoffMs,
+          if (dlq.status !== DeadLetterStatus.OPEN) {
+            throw new ConflictError('Dead-letter job has already been replayed', {
+              dlqId: dlq.id,
+              replayedJobId: dlq.replayedJobId,
+              replayedAt: dlq.replayedAt,
+            });
+          }
+
+          const initialStatus = resolveInitialJobStatus({
+            queueIsPaused: dlq.queue.isPaused,
             delayMs: 0,
-            replayedFromDlqId: dlq.id,
-            createdById: actorUserId,
+          });
+          const replayPayload = (overrides?.payload ??
+            dlq.originalJob.payload) as Prisma.InputJsonValue;
+
+          // Enforce tenant quotas and queue backpressure so DLQ replay cannot bypass limits
+          await governanceService.enforceAdmissionInTransaction(tx, {
+            orgId,
+            queue: dlq.queue,
+            payload: replayPayload,
+            initialStatus,
+          });
+
+          // Create a fresh Job preserving link to the DLQ record and original failure history
+          const createdJob = await tx.job.create({
+            data: {
+              queueId: dlq.queue.id,
+              name: dlq.originalJob.name,
+              status: initialStatus,
+              priority: overrides?.priority ?? dlq.originalJob.priority,
+              payload: replayPayload,
+              maxRetries: overrides?.maxRetries ?? dlq.originalJob.maxRetries,
+              backoffMs: overrides?.backoffMs ?? dlq.originalJob.backoffMs,
+              delayMs: 0,
+              replayedFromDlqId: dlq.id,
+              createdById: actorUserId,
+            },
+          });
+
+          // Atomic optimistic claim prevents concurrent duplicate replays
+          const claimed = await tx.deadLetterJob.updateMany({
+            where: {
+              id: dlq.id,
+              organisationId: orgId,
+              status: DeadLetterStatus.OPEN,
+            },
+            data: {
+              status: DeadLetterStatus.REPLAYED,
+              replayedAt: new Date(),
+              replayedById: actorUserId,
+              replayedJobId: createdJob.id,
+            },
+          });
+
+          if (claimed.count !== 1) {
+            throw new ConflictError('Dead-letter job was already replayed concurrently');
+          }
+
+          const outbox = await tx.jobDispatchOutbox.create({
+            data: {
+              jobId: createdJob.id,
+              queueId: dlq.queue.id,
+              organisationId: orgId,
+              status: OutboxStatus.PENDING,
+            },
+            select: { id: true },
+          });
+
+          const refreshedDlq = await tx.deadLetterJob.findUniqueOrThrow({
+            where: { id: dlq.id },
+          });
+
+          return {
+            updatedDlq: refreshedDlq,
+            newJob: createdJob,
+            persistedQueue: dlq.queue,
+            outboxId: outbox.id,
+          };
+        },
+        { maxWait: 10_000, timeout: 10_000 },
+      );
+    } catch (err) {
+      if (err instanceof TooManyRequestsError) {
+        const details = (err.details ?? {}) as Partial<AdmissionRejectionDetails>;
+        await eventService.record({
+          type: PlatformEventType.JOB_ADMISSION_REJECTED,
+          organisationId: orgId,
+          queueId: details.queueId ?? null,
+          message: err.message,
+          metadata: {
+            reason: details.reason ?? 'QUOTA_EXCEEDED',
+            scope: details.scope ?? 'organisation',
+            limit: details.limit ?? null,
+            current: details.current ?? null,
+            source: 'dlq_replay',
+            dlqId,
           },
         });
+      }
+      throw err;
+    }
 
-        // Atomic optimistic claim prevents concurrent duplicate replays
-        const claimed = await tx.deadLetterJob.updateMany({
-          where: {
-            id: dlq.id,
-            organisationId: orgId,
-            status: DeadLetterStatus.OPEN,
-          },
-          data: {
-            status: DeadLetterStatus.REPLAYED,
-            replayedAt: new Date(),
-            replayedById: actorUserId,
-            replayedJobId: createdJob.id,
-          },
-        });
-
-        if (claimed.count !== 1) {
-          throw new ConflictError('Dead-letter job was already replayed concurrently');
-        }
-
-        const outbox = await tx.jobDispatchOutbox.create({
-          data: {
-            jobId: createdJob.id,
-            queueId: dlq.queue.id,
-            organisationId: orgId,
-            status: OutboxStatus.PENDING,
-          },
-          select: { id: true },
-        });
-
-        const refreshedDlq = await tx.deadLetterJob.findUniqueOrThrow({
-          where: { id: dlq.id },
-        });
-
-        return {
-          updatedDlq: refreshedDlq,
-          newJob: createdJob,
-          persistedQueue: dlq.queue,
-          outboxId: outbox.id,
-        };
-      },
-      { maxWait: 10_000, timeout: 10_000 },
-    );
+    const { updatedDlq, newJob, persistedQueue, outboxId } = txRes;
 
     // Dispatch replayed job to BullMQ with stable jobId = newJob.id
     const dispatch = await bullMQService.enqueueJob(persistedQueue, newJob);
@@ -413,6 +457,23 @@ export class DeadLetterService {
         enqueued: dispatch.enqueued,
       },
     });
+
+    if (updatedDlq.isQuarantined) {
+      await eventService.record({
+        type: PlatformEventType.JOB_QUARANTINE_RELEASED,
+        organisationId: orgId,
+        queueId: persistedQueue.id,
+        jobId: newJob.id,
+        message: `Quarantined job "${newJob.name}" manually released and replayed by authorized user`,
+        metadata: {
+          dlqId: updatedDlq.id,
+          originalJobId: updatedDlq.originalJobId,
+          replayedJobId: newJob.id,
+          releasedById: actorUserId,
+          previousQuarantineReason: updatedDlq.quarantineReason,
+        },
+      });
+    }
 
     return {
       deadLetterJob: updatedDlq,

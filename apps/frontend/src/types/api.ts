@@ -36,6 +36,10 @@ export type PlatformEventType =
   | 'JOB_RECOVERED'
   | 'JOB_LEASE_EXPIRED'
   | 'JOB_FENCING_REJECTED'
+  | 'JOB_ADMISSION_REJECTED'
+  | 'JOB_RETRY_BUDGET_EXHAUSTED'
+  | 'JOB_QUARANTINED'
+  | 'JOB_QUARANTINE_RELEASED'
   | 'JOB_MOVED_TO_DLQ'
   | 'JOB_REPLAYED'
   | 'WORKER_STARTED'
@@ -355,6 +359,9 @@ export interface OrganisationMetricsView {
     scheduleSkipsInWindow: number;
     scheduleMisfiresTotal: number;
     outboxPending: number;
+    admissionRejectionsInWindow?: number;
+    retryBudgetExhaustedInWindow?: number;
+    quarantinedOpen?: number;
   };
   workerSummary?: {
     total: number;

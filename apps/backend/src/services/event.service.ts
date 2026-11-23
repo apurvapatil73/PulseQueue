@@ -110,6 +110,52 @@ function sanitizeMetadata(input?: Record<string, unknown>): Prisma.InputJsonValu
  */
 export class EventService {
   /**
+   * Persists an audit event inside an existing Prisma transaction so callers that require
+   * atomic visibility (e.g. rolling-window retry budgets) can commit the event alongside
+   * state mutations, then call `publishPersistedEvent` after the transaction commits.
+   */
+  async createInTransaction(
+    tx: Prisma.TransactionClient,
+    input: RecordEventInput,
+  ): Promise<EventView> {
+    const metadata = sanitizeMetadata(input.metadata);
+    return tx.platformEvent.create({
+      data: {
+        type: input.type,
+        organisationId: input.organisationId ?? null,
+        queueId: input.queueId ?? null,
+        jobId: input.jobId ?? null,
+        workerId: input.workerId ?? null,
+        message: input.message.slice(0, 500),
+        metadata,
+      },
+    });
+  }
+
+  /**
+   * Best-effort post-commit cache invalidation and Redis Pub/Sub fan-out for an event
+   * persisted via `createInTransaction`. Never throws.
+   */
+  async publishPersistedEvent(created: EventView): Promise<void> {
+    try {
+      if (created.organisationId) {
+        metricsService.invalidateOrganisation(created.organisationId);
+      }
+      const realtimePayload = toRealtimePlatformEvent(created);
+      if (realtimePayload) {
+        await realtimeEventBus.publish(realtimePayload);
+      }
+    } catch (err) {
+      logger.warn('Failed to publish persisted platform audit event', {
+        eventId: created.id,
+        type: created.type,
+        organisationId: created.organisationId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
    * Persists an audit event safely (never throws to break primary execution paths).
    */
   async record(input: RecordEventInput): Promise<EventView | null> {

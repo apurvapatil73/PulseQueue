@@ -5,6 +5,7 @@ import { PlatformEventType } from '@prisma/client';
 import {
   buildBullMQQueueName,
   buildBullMQRedisOptions,
+  classifyPoisonJob,
   DEFAULT_JOB_LEASE_MS,
   env,
   eventService,
@@ -30,6 +31,7 @@ export interface RegisteredWorkerEntry {
   queueId: string;
   logicalName: string;
   concurrency: number;
+  poisonFailureThreshold: number;
   worker: Worker<BullMQJobPayload, ProcessorResult | null>;
 }
 
@@ -134,6 +136,12 @@ export class WorkerManager {
           concurrency: persistedQueue.concurrency,
         });
       }
+      if (
+        persistedQueue.poisonFailureThreshold !== undefined &&
+        existing.poisonFailureThreshold !== persistedQueue.poisonFailureThreshold
+      ) {
+        existing.poisonFailureThreshold = persistedQueue.poisonFailureThreshold;
+      }
       return existing;
     }
 
@@ -197,6 +205,7 @@ export class WorkerManager {
       queueId: persistedQueue.id,
       logicalName: persistedQueue.name,
       concurrency: persistedQueue.concurrency,
+      poisonFailureThreshold: persistedQueue.poisonFailureThreshold ?? 3,
       worker,
     };
 
@@ -415,7 +424,25 @@ export class WorkerManager {
         err instanceof InvalidJobPayloadError || err instanceof UnregisteredProcessorError;
       const hasRemainingAttempts = !isNonRetryable && attemptNumber < maxAttempts;
 
-      if (hasRemainingAttempts) {
+      const currentThreshold =
+        this.workers.get(buildBullMQQueueName(persistedQueue.organisationId, persistedQueue.name))
+          ?.poisonFailureThreshold ??
+        persistedQueue.poisonFailureThreshold ??
+        3;
+
+      // Deterministic poison-job classification (never quarantines on a single transient error)
+      const poison = classifyPoisonJob({
+        jobName: activation.job.name,
+        errorMessage,
+        isNonRetryable,
+        previousSignature: activation.job.failureSignature,
+        previousConsecutiveSameFailures: activation.job.consecutiveSameFailures,
+        poisonFailureThreshold: currentThreshold,
+        stalledCount: activation.job.stalledCount,
+      });
+
+      if (hasRemainingAttempts && !poison.isPoison) {
+        // Atomic rolling-window retry-budget evaluation + ACTIVE -> DELAYED + JOB_RETRIED commit
         const retrySync = await this.jobs.markJobRetryScheduled(
           organisationId,
           jobId,
@@ -424,6 +451,9 @@ export class WorkerManager {
           {
             workerId: this.workerInstanceId,
             fencingToken,
+            failureSignature: poison.failureSignature,
+            consecutiveSameFailures: poison.consecutiveSameFailures,
+            enforceRetryBudget: true,
           },
         );
 
@@ -435,6 +465,47 @@ export class WorkerManager {
             currentFencingToken: retrySync.currentFencingToken,
           });
           return null;
+        }
+
+        if (retrySync.outcome === 'retry_budget_exhausted') {
+          const { budget } = retrySync;
+          // Retry budget exhausted -> record audit event, route cleanly to FAILED + DLQ, stop BullMQ retries
+          await eventService.record({
+            type: PlatformEventType.JOB_RETRY_BUDGET_EXHAUSTED,
+            organisationId,
+            queueId: persistedQueue.id,
+            jobId,
+            workerId: this.workerInstanceId,
+            message: budget.reason ?? 'Retry budget exhausted; retry denied',
+            metadata: {
+              scope: budget.scope ?? 'organisation',
+              used: budget.used ?? null,
+              limit: budget.limit ?? null,
+              windowSeconds: budget.windowSeconds ?? null,
+              attemptNumber,
+            },
+          });
+
+          const budgetFailMessage = `${errorMessage} [${budget.reason ?? 'Retry budget exhausted'}]`;
+          await this.jobs.markJobFailed(organisationId, jobId, budgetFailMessage, attemptNumber, {
+            durationMs,
+            workerId: this.workerInstanceId,
+            routeToDlq: true,
+            fencingToken,
+            quarantine: {
+              isQuarantined: false,
+              quarantineReason: null,
+              failureSignature: poison.failureSignature,
+              consecutiveSameFailures: poison.consecutiveSameFailures,
+            },
+          });
+
+          await workerHealthService.recordJobOutcome(
+            this.workerInstanceId,
+            'failed',
+            budgetFailMessage,
+          );
+          throw new UnrecoverableError(budgetFailMessage);
         }
 
         logger.warn('Job attempt failed; BullMQ retry scheduled', {
@@ -452,7 +523,7 @@ export class WorkerManager {
         throw err;
       }
 
-      // Exhausted retries or non-retryable error -> mark FAILED + idempotently route to DLQ
+      // Exhausted retries, non-retryable error, or poison-job quarantine -> mark FAILED + DLQ
       const failSync = await this.jobs.markJobFailed(
         organisationId,
         jobId,
@@ -463,6 +534,12 @@ export class WorkerManager {
           workerId: this.workerInstanceId,
           routeToDlq: true,
           fencingToken,
+          quarantine: {
+            isQuarantined: poison.isPoison,
+            quarantineReason: poison.quarantineReason,
+            failureSignature: poison.failureSignature,
+            consecutiveSameFailures: poison.consecutiveSameFailures,
+          },
         },
       );
 
@@ -478,7 +555,7 @@ export class WorkerManager {
 
       await workerHealthService.recordJobOutcome(this.workerInstanceId, 'failed', errorMessage);
 
-      logger.error('Job permanently failed', {
+      logger.error(poison.isPoison ? 'Job quarantined as poison job' : 'Job permanently failed', {
         workerInstanceId: this.workerInstanceId,
         jobId,
         organisationId,
@@ -488,11 +565,13 @@ export class WorkerManager {
         maxAttempts,
         fencingToken,
         nonRetryable: isNonRetryable,
+        isQuarantined: poison.isPoison,
+        quarantineReason: poison.quarantineReason,
         error: errorMessage,
       });
 
-      if (isNonRetryable) {
-        throw new UnrecoverableError(errorMessage);
+      if (isNonRetryable || poison.isPoison) {
+        throw new UnrecoverableError(poison.quarantineReason ?? errorMessage);
       }
 
       throw err;

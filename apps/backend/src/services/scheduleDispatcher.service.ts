@@ -9,6 +9,7 @@ import {
   ScheduleType,
 } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
+import { TooManyRequestsError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import {
   collectDueCronRuns,
@@ -18,6 +19,7 @@ import {
 } from '../utils/scheduleTime.js';
 import { bullMQService, type BullMQService } from './bullmq.service.js';
 import { eventService } from './event.service.js';
+import { governanceService, type AdmissionRejectionDetails } from './governance.service.js';
 
 const MAX_SKIP_AUDIT_RECORDS = 10;
 
@@ -259,6 +261,18 @@ export class ScheduleDispatcherService {
                     ? JobStatus.DELAYED
                     : JobStatus.PENDING;
 
+                await governanceService.enforceAdmissionInTransaction(tx, {
+                  orgId: sched.organisationId,
+                  queue: {
+                    id: sched.queue.id,
+                    name: sched.queue.name,
+                    maxQueueDepth: sched.queue.maxQueueDepth,
+                    backpressureMaxAgeMs: sched.queue.backpressureMaxAgeMs,
+                  },
+                  payload: sched.payload,
+                  initialStatus,
+                });
+
                 const job = await tx.job.create({
                   data: {
                     queueId: sched.queue.id,
@@ -334,6 +348,35 @@ export class ScheduleDispatcherService {
               { maxWait: 10_000, timeout: 10_000 },
             );
           } catch (err) {
+            if (err instanceof TooManyRequestsError) {
+              const details = err.details as AdmissionRejectionDetails | undefined;
+              summary.skippedConcurrency += 1;
+              await eventService.record({
+                type: PlatformEventType.JOB_ADMISSION_REJECTED,
+                organisationId: sched.organisationId,
+                queueId: sched.queue.id,
+                message: err.message,
+                metadata: {
+                  source: 'schedule_dispatcher_one_time',
+                  scheduleId: sched.id,
+                  scheduleName: sched.name,
+                  jobName: sched.jobName,
+                  reason: details?.reason ?? 'QUOTA_EXCEEDED',
+                  scope: details?.scope ?? 'organisation',
+                  limit: details?.limit ?? null,
+                  current: details?.current ?? null,
+                },
+              });
+              logger.warn(
+                'Deferred one-time schedule materialization rejected by quota/backpressure',
+                {
+                  scheduleId: sched.id,
+                  organisationId: sched.organisationId,
+                  reason: details?.reason,
+                },
+              );
+              continue;
+            }
             if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
               summary.skippedContention += 1;
               continue;
@@ -510,6 +553,10 @@ export class ScheduleDispatcherService {
       skippedMaxRuns: number;
       skippedContention: number;
       completedMaxRuns: boolean;
+      admissionRejections: Array<{
+        message: string;
+        details?: AdmissionRejectionDetails;
+      }>;
     };
 
     try {
@@ -538,6 +585,10 @@ export class ScheduleDispatcherService {
               skippedMaxRuns: 0,
               skippedContention: 0,
               completedMaxRuns: false,
+              admissionRejections: [] as Array<{
+                message: string;
+                details?: AdmissionRejectionDetails;
+              }>,
             };
           }
 
@@ -548,6 +599,10 @@ export class ScheduleDispatcherService {
           let skippedMaxRuns = 0;
           let skippedContention = 0;
           const created: DispatchedJobRecord[] = [];
+          const admissionRejections: Array<{
+            message: string;
+            details?: AdmissionRejectionDetails;
+          }> = [];
 
           // Record MISSED audit rows idempotently
           for (const missed of missedAudit) {
@@ -668,8 +723,40 @@ export class ScheduleDispatcherService {
               }
             }
 
-            // 4. Commit Job + ScheduleExecution + Outbox atomically
+            // 4. Enforce tenant quotas & queue backpressure before materializing scheduled job
             const initialJobStatus = schedule.queue.isPaused ? JobStatus.PAUSED : JobStatus.PENDING;
+            try {
+              await governanceService.enforceAdmissionInTransaction(tx, {
+                orgId: fresh.organisationId,
+                queue: {
+                  id: schedule.queue.id,
+                  name: schedule.queue.name,
+                  maxQueueDepth: schedule.queue.maxQueueDepth,
+                  backpressureMaxAgeMs: schedule.queue.backpressureMaxAgeMs,
+                },
+                payload: fresh.payload,
+                initialStatus: initialJobStatus,
+              });
+            } catch (admissionErr) {
+              if (admissionErr instanceof TooManyRequestsError) {
+                const details = admissionErr.details as AdmissionRejectionDetails | undefined;
+                await tx.scheduleExecution.create({
+                  data: {
+                    scheduleId: fresh.id,
+                    scheduledFor: target.scheduledFor,
+                    status: ScheduleExecutionStatus.SKIPPED_CONCURRENCY,
+                    isCatchUp: target.isCatchUp,
+                    reason: `Admission rejected: ${admissionErr.message}`,
+                  },
+                });
+                skippedConcurrency += 1;
+                admissionRejections.push({ message: admissionErr.message, details });
+                continue;
+              }
+              throw admissionErr;
+            }
+
+            // 5. Commit Job + ScheduleExecution + Outbox atomically
             const job = await tx.job.create({
               data: {
                 queueId: schedule.queue.id,
@@ -754,6 +841,7 @@ export class ScheduleDispatcherService {
             skippedMaxRuns,
             skippedContention,
             completedMaxRuns: shouldComplete,
+            admissionRejections,
           };
         },
         { maxWait: 10_000, timeout: 10_000 },
@@ -779,6 +867,25 @@ export class ScheduleDispatcherService {
     summary.skippedContention += txOutcome.skippedContention;
     if (txOutcome.completedMaxRuns) {
       summary.completedMaxRuns += 1;
+    }
+
+    for (const rejection of txOutcome.admissionRejections) {
+      await eventService.record({
+        type: PlatformEventType.JOB_ADMISSION_REJECTED,
+        organisationId: schedule.organisationId,
+        queueId: schedule.queue.id,
+        message: rejection.message,
+        metadata: {
+          source: 'schedule_dispatcher_recurring',
+          scheduleId: schedule.id,
+          scheduleName: schedule.name,
+          jobName: schedule.jobName,
+          reason: rejection.details?.reason ?? 'QUOTA_EXCEEDED',
+          scope: rejection.details?.scope ?? 'organisation',
+          limit: rejection.details?.limit ?? null,
+          current: rejection.details?.current ?? null,
+        },
+      });
     }
 
     if (txOutcome.skippedOverlap > 0) {

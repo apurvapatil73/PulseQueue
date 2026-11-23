@@ -17,6 +17,11 @@ export interface QueueView {
   defaultPriority: number;
   maxRetries: number;
   backoffMs: number;
+  maxQueueDepth: number | null;
+  backpressureMaxAgeMs: number | null;
+  retryBudgetMaxRetries: number | null;
+  retryBudgetWindowSeconds: number;
+  poisonFailureThreshold: number;
   jobCount: number;
   createdBy: {
     id: string;
@@ -66,6 +71,11 @@ function toQueueView(q: QueueWithMeta): QueueView {
     defaultPriority: q.defaultPriority,
     maxRetries: q.maxRetries,
     backoffMs: q.backoffMs,
+    maxQueueDepth: q.maxQueueDepth,
+    backpressureMaxAgeMs: q.backpressureMaxAgeMs,
+    retryBudgetMaxRetries: q.retryBudgetMaxRetries,
+    retryBudgetWindowSeconds: q.retryBudgetWindowSeconds,
+    poisonFailureThreshold: q.poisonFailureThreshold,
     jobCount: q._count.jobs,
     createdBy: q.createdBy,
     createdAt: q.createdAt,
@@ -103,6 +113,19 @@ export class QueueService {
           defaultPriority: input.defaultPriority,
           maxRetries: input.maxRetries,
           backoffMs: input.backoffMs,
+          ...(input.maxQueueDepth !== undefined ? { maxQueueDepth: input.maxQueueDepth } : {}),
+          ...(input.backpressureMaxAgeMs !== undefined
+            ? { backpressureMaxAgeMs: input.backpressureMaxAgeMs }
+            : {}),
+          ...(input.retryBudgetMaxRetries !== undefined
+            ? { retryBudgetMaxRetries: input.retryBudgetMaxRetries }
+            : {}),
+          ...(input.retryBudgetWindowSeconds !== undefined
+            ? { retryBudgetWindowSeconds: input.retryBudgetWindowSeconds }
+            : {}),
+          ...(input.poisonFailureThreshold !== undefined
+            ? { poisonFailureThreshold: input.poisonFailureThreshold }
+            : {}),
           createdById: userId,
         },
         include: QUEUE_INCLUDE,
@@ -210,6 +233,19 @@ export class QueueService {
             : {}),
           ...(input.maxRetries !== undefined ? { maxRetries: input.maxRetries } : {}),
           ...(input.backoffMs !== undefined ? { backoffMs: input.backoffMs } : {}),
+          ...(input.maxQueueDepth !== undefined ? { maxQueueDepth: input.maxQueueDepth } : {}),
+          ...(input.backpressureMaxAgeMs !== undefined
+            ? { backpressureMaxAgeMs: input.backpressureMaxAgeMs }
+            : {}),
+          ...(input.retryBudgetMaxRetries !== undefined
+            ? { retryBudgetMaxRetries: input.retryBudgetMaxRetries }
+            : {}),
+          ...(input.retryBudgetWindowSeconds !== undefined
+            ? { retryBudgetWindowSeconds: input.retryBudgetWindowSeconds }
+            : {}),
+          ...(input.poisonFailureThreshold !== undefined
+            ? { poisonFailureThreshold: input.poisonFailureThreshold }
+            : {}),
         },
         include: QUEUE_INCLUDE,
       });

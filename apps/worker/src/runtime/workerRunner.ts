@@ -160,6 +160,7 @@ export class WorkerRuntime {
           defaultPriority: true,
           maxRetries: true,
           backoffMs: true,
+          poisonFailureThreshold: true,
         },
       });
 
