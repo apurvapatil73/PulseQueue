@@ -38,7 +38,26 @@ export type PlatformEventType =
   | 'JOB_REPLAYED'
   | 'WORKER_STARTED'
   | 'WORKER_STOPPED'
-  | 'WORKER_HEARTBEAT_STALE';
+  | 'WORKER_HEARTBEAT_STALE'
+  | 'ALERT_FIRED'
+  | 'ALERT_ACKNOWLEDGED'
+  | 'ALERT_RESOLVED';
+
+export type AlertType =
+  | 'QUEUE_BACKLOG'
+  | 'QUEUE_WAIT_TIME'
+  | 'JOB_FAILURE_RATE'
+  | 'JOB_RETRY_RATE'
+  | 'DLQ_COUNT'
+  | 'WORKER_STALE'
+  | 'JOB_LATENCY_P95'
+  | 'SCHEDULE_MISFIRES';
+
+export type AlertComparisonOperator = 'GT' | 'GTE' | 'LT' | 'LTE';
+
+export type AlertSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
+
+export type AlertStatus = 'FIRING' | 'ACKNOWLEDGED' | 'RESOLVED';
 
 export interface ApiEnvelope<T> {
   success: boolean;
@@ -662,4 +681,116 @@ export interface ReplayDlqResult {
   deadLetterJob: DeadLetterJobView;
   replayedJob: ReplayedJobSummaryView;
   dispatch: EnqueueDispatchInfo;
+}
+
+export interface AlertRuleView {
+  id: string;
+  organisationId: string;
+  queueId: string | null;
+  queueName: string | null;
+  name: string;
+  description: string | null;
+  type: AlertType;
+  operator: AlertComparisonOperator;
+  threshold: number;
+  windowMinutes: number;
+  cooldownSeconds: number;
+  severity: AlertSeverity;
+  isEnabled: boolean;
+  createdById: string | null;
+  updatedById: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateAlertRulePayload {
+  name: string;
+  description?: string | null;
+  type: AlertType;
+  operator?: AlertComparisonOperator;
+  threshold: number;
+  windowMinutes?: number;
+  cooldownSeconds?: number;
+  queueId?: string | null;
+  severity?: AlertSeverity;
+  isEnabled?: boolean;
+}
+
+export interface UpdateAlertRulePayload {
+  name?: string;
+  description?: string | null;
+  operator?: AlertComparisonOperator;
+  threshold?: number;
+  windowMinutes?: number;
+  cooldownSeconds?: number;
+  queueId?: string | null;
+  severity?: AlertSeverity;
+  isEnabled?: boolean;
+}
+
+export interface AlertView {
+  id: string;
+  organisationId: string;
+  ruleId: string | null;
+  queueId: string | null;
+  queueName: string | null;
+  dedupKey: string;
+  ruleName: string;
+  type: AlertType;
+  severity: AlertSeverity;
+  status: AlertStatus;
+  message: string;
+  metricValue: number;
+  threshold: number;
+  occurrenceCount: number;
+  firstTriggeredAt: string;
+  lastTriggeredAt: string;
+  lastEvaluatedAt: string;
+  acknowledgedAt: string | null;
+  acknowledgedById: string | null;
+  resolvedAt: string | null;
+  resolvedById: string | null;
+  resolutionReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PaginatedAlertsView {
+  alerts: AlertView[];
+  pagination: PaginationMeta;
+}
+
+export interface AlertStatsView {
+  total: number;
+  firing: number;
+  acknowledged: number;
+  resolved: number;
+  activeBySeverity: {
+    info: number;
+    warning: number;
+    critical: number;
+  };
+  enabledRules: number;
+  totalRules: number;
+}
+
+export interface NotificationView {
+  id: string;
+  organisationId: string;
+  userId: string;
+  alertId: string | null;
+  eventKey: string;
+  type: string;
+  severity: AlertSeverity;
+  title: string;
+  message: string;
+  isRead: boolean;
+  readAt: string | null;
+  createdAt: string;
+}
+
+export interface PaginatedNotificationsView {
+  notifications: NotificationView[];
+  unreadCount: number;
+  pagination: PaginationMeta;
 }

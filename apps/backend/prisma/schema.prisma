@@ -60,6 +60,39 @@ enum PlatformEventType {
   WORKER_STARTED
   WORKER_STOPPED
   WORKER_HEARTBEAT_STALE
+  ALERT_FIRED
+  ALERT_ACKNOWLEDGED
+  ALERT_RESOLVED
+}
+
+enum AlertType {
+  QUEUE_BACKLOG
+  QUEUE_WAIT_TIME
+  JOB_FAILURE_RATE
+  JOB_RETRY_RATE
+  DLQ_COUNT
+  WORKER_STALE
+  JOB_LATENCY_P95
+  SCHEDULE_MISFIRES
+}
+
+enum AlertComparisonOperator {
+  GT
+  GTE
+  LT
+  LTE
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum AlertStatus {
+  FIRING
+  ACKNOWLEDGED
+  RESOLVED
 }
 
 enum ScheduleType {
@@ -105,6 +138,7 @@ model User {
   createdQueues    Queue[]         @relation("CreatedQueues")
   createdJobs      Job[]           @relation("CreatedJobs")
   createdSchedules Schedule[]      @relation("CreatedSchedules")
+  notifications    Notification[]
 
   @@map("users")
 }
@@ -136,6 +170,9 @@ model Organisation {
   queues         Queue[]
   deadLetterJobs DeadLetterJob[]
   schedules      Schedule[]
+  alertRules     AlertRule[]
+  alerts         Alert[]
+  notifications  Notification[]
 
   @@map("organisations")
 }
@@ -198,6 +235,8 @@ model Queue {
   jobs           Job[]
   deadLetterJobs DeadLetterJob[]
   schedules      Schedule[]
+  alertRules     AlertRule[]
+  alerts         Alert[]
 
   @@unique([organisationId, name])
   @@index([organisationId])
@@ -410,4 +449,93 @@ model JobDispatchOutbox {
   @@index([status, nextAttemptAt])
   @@index([organisationId])
   @@map("job_dispatch_outbox")
+}
+
+model AlertRule {
+  id              String                  @id @default(uuid()) @db.Uuid
+  organisationId  String                  @map("organisation_id") @db.Uuid
+  queueId         String?                 @map("queue_id") @db.Uuid
+  name            String
+  description     String?
+  type            AlertType
+  operator        AlertComparisonOperator @default(GT)
+  threshold       Float
+  windowMinutes   Int                     @default(60) @map("window_minutes")
+  cooldownSeconds Int                     @default(300) @map("cooldown_seconds")
+  severity        AlertSeverity           @default(WARNING)
+  isEnabled       Boolean                 @default(true) @map("is_enabled")
+  createdById     String?                 @map("created_by_id") @db.Uuid
+  updatedById     String?                 @map("updated_by_id") @db.Uuid
+  createdAt       DateTime                @default(now()) @map("created_at")
+  updatedAt       DateTime                @updatedAt @map("updated_at")
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  queue        Queue?       @relation(fields: [queueId], references: [id], onDelete: SetNull)
+  alerts       Alert[]
+
+  @@unique([organisationId, name])
+  @@index([organisationId, isEnabled])
+  @@index([organisationId, queueId])
+  @@map("alert_rules")
+}
+
+model Alert {
+  id               String        @id @default(uuid()) @db.Uuid
+  organisationId   String        @map("organisation_id") @db.Uuid
+  ruleId           String?       @map("rule_id") @db.Uuid
+  queueId          String?       @map("queue_id") @db.Uuid
+  dedupKey         String        @map("dedup_key")
+  ruleName         String        @map("rule_name")
+  type             AlertType
+  severity         AlertSeverity
+  status           AlertStatus   @default(FIRING)
+  message          String
+  metricValue      Float         @map("metric_value")
+  threshold        Float
+  occurrenceCount  Int           @default(1) @map("occurrence_count")
+  firstTriggeredAt DateTime      @default(now()) @map("first_triggered_at")
+  lastTriggeredAt  DateTime      @default(now()) @map("last_triggered_at")
+  lastEvaluatedAt  DateTime      @default(now()) @map("last_evaluated_at")
+  acknowledgedAt   DateTime?     @map("acknowledged_at")
+  acknowledgedById String?       @map("acknowledged_by_id") @db.Uuid
+  resolvedAt       DateTime?     @map("resolved_at")
+  resolvedById     String?       @map("resolved_by_id") @db.Uuid
+  resolutionReason String?       @map("resolution_reason")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  organisation  Organisation   @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  rule          AlertRule?     @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+  queue         Queue?         @relation(fields: [queueId], references: [id], onDelete: SetNull)
+  notifications Notification[]
+
+  @@index([organisationId, status, createdAt])
+  @@index([organisationId, severity, status])
+  @@index([organisationId, dedupKey, status])
+  @@index([ruleId, status])
+  @@map("alerts")
+}
+
+model Notification {
+  id             String        @id @default(uuid()) @db.Uuid
+  organisationId String        @map("organisation_id") @db.Uuid
+  userId         String        @map("user_id") @db.Uuid
+  alertId        String?       @map("alert_id") @db.Uuid
+  eventKey       String        @map("event_key")
+  type           String
+  severity       AlertSeverity
+  title          String
+  message        String
+  isRead         Boolean       @default(false) @map("is_read")
+  readAt         DateTime?     @map("read_at")
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  alert        Alert?       @relation(fields: [alertId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, eventKey])
+  @@index([organisationId, userId, isRead, createdAt])
+  @@index([organisationId, userId, createdAt])
+  @@map("notifications")
 }

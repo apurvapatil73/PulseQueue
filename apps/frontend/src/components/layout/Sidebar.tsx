@@ -3,6 +3,7 @@ import { NavLink } from 'react-router-dom';
 import {
   Activity,
   AlertOctagon,
+  Bell,
   CalendarClock,
   Layers,
   LayoutDashboard,
@@ -26,6 +27,7 @@ export const PRIMARY_NAV_ITEMS: NavItem[] = [
   { label: 'Jobs', to: '/jobs', icon: ListChecks },
   { label: 'Schedules', to: '/schedules', icon: CalendarClock },
   { label: 'Workers & Monitoring', to: '/monitoring', icon: Activity },
+  { label: 'Alerts', to: '/alerts', icon: Bell },
   { label: 'Dead Letter Queue', to: '/dlq', icon: AlertOctagon },
 ];
 

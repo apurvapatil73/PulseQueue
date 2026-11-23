@@ -7,6 +7,7 @@ import queueRoutes from './queue.routes.js';
 import { queueJobRoutes, orgJobRoutes } from './job.routes.js';
 import { dlqRoutes, monitoringRoutes } from './monitoring.routes.js';
 import scheduleRoutes from './schedule.routes.js';
+import { alertRuleRoutes, alertRoutes, notificationRoutes } from './alert.routes.js';
 
 const router = Router();
 
@@ -33,6 +34,11 @@ router.use('/api/v1/organisations/:organisationId/monitoring', monitoringRoutes)
 
 // Organisation-scoped Job Scheduling endpoints
 router.use('/api/v1/organisations/:organisationId/schedules', scheduleRoutes);
+
+// Organisation-scoped Alert Rules, Alerts & In-App Notifications endpoints
+router.use('/api/v1/organisations/:organisationId/alert-rules', alertRuleRoutes);
+router.use('/api/v1/organisations/:organisationId/alerts', alertRoutes);
+router.use('/api/v1/organisations/:organisationId/notifications', notificationRoutes);
 
 // Organisation management endpoints
 router.use('/api/v1/organisations', orgRoutes);

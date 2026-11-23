@@ -1,5 +1,6 @@
 import path from 'node:path';
 import {
+  alertEvaluatorService,
   bullMQService,
   connectDatabase,
   disconnectDatabase,
@@ -22,6 +23,7 @@ export interface WorkerRuntimeOptions {
   outboxIntervalMs?: number;
   heartbeatIntervalMs?: number;
   stalledRecoveryIntervalMs?: number;
+  alertEvalIntervalMs?: number;
   workerManager?: WorkerManager;
 }
 
@@ -37,6 +39,7 @@ export class WorkerRuntime {
   private readonly outboxIntervalMs: number;
   private readonly heartbeatIntervalMs: number;
   private readonly stalledRecoveryIntervalMs: number;
+  private readonly alertEvalIntervalMs: number;
   private syncTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private syncInFlight = false;
@@ -51,6 +54,7 @@ export class WorkerRuntime {
     this.outboxIntervalMs = options.outboxIntervalMs ?? 5_000;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5_000;
     this.stalledRecoveryIntervalMs = options.stalledRecoveryIntervalMs ?? 15_000;
+    this.alertEvalIntervalMs = options.alertEvalIntervalMs ?? 30_000;
   }
 
   getWorkerManager(): WorkerManager {
@@ -210,6 +214,7 @@ export class WorkerRuntime {
     scheduleDispatcherService.start(1000, 30_000);
     workerHealthService.startStaleSweep(15_000);
     eventRetentionService.start();
+    alertEvaluatorService.start(this.alertEvalIntervalMs);
 
     this.heartbeatTimer = setInterval(() => {
       void this.publishHeartbeat();
@@ -257,6 +262,7 @@ export class WorkerRuntime {
     scheduleDispatcherService.stop();
     workerHealthService.stopStaleSweep();
     eventRetentionService.stop();
+    alertEvaluatorService.stop();
     await this.manager.closeAll();
 
     // Record graceful STOPPED state before closing PostgreSQL

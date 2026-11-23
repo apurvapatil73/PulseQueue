@@ -13,6 +13,7 @@ import { queueApi } from '../api/queue.api';
 import { jobApi } from '../api/job.api';
 import { monitoringApi } from '../api/monitoring.api';
 import { healthApi } from '../api/health.api';
+import { alertApi } from '../api/alert.api';
 import { ApiClientError } from '../api/error';
 import type { JobView, OrgRole, QueueView } from '../types/api';
 
@@ -144,6 +145,7 @@ describe('Job Management UI — List, Filters, Submission, Detail, Cancellation 
       services: { database: 'connected', redis: 'connected' },
       timestamp: new Date().toISOString(),
     });
+    vi.spyOn(alertApi, 'getUnreadCount').mockResolvedValue(0);
 
     vi.spyOn(organisationApi, 'list').mockResolvedValue([
       {

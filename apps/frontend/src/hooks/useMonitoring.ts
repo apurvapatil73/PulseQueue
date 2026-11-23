@@ -164,23 +164,33 @@ export function useMonitoringStream(
   const clientRef = useRef<MonitoringStreamClient | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingWorkerInvalidationRef = useRef(false);
+  const pendingAlertInvalidationRef = useRef(false);
 
   const flushInvalidations = useCallback(
-    (orgId: string, includeWorkers: boolean) => {
+    (orgId: string, includeWorkers: boolean, includeAlerts: boolean) => {
       void queryClient.invalidateQueries({ queryKey: ['org-metrics', orgId] });
       void queryClient.invalidateQueries({ queryKey: ['org-metrics-timeseries', orgId] });
       void queryClient.invalidateQueries({ queryKey: ['org-events', orgId] });
       if (includeWorkers) {
         void queryClient.invalidateQueries({ queryKey: ['org-workers', orgId] });
       }
+      if (includeAlerts) {
+        void queryClient.invalidateQueries({ queryKey: ['alerts', orgId] });
+        void queryClient.invalidateQueries({ queryKey: ['alert-stats', orgId] });
+        void queryClient.invalidateQueries({ queryKey: ['notifications', orgId] });
+        void queryClient.invalidateQueries({ queryKey: ['notifications-unread', orgId] });
+      }
     },
     [queryClient],
   );
 
   const scheduleBatchedInvalidation = useCallback(
-    (orgId: string, isWorkerEvent: boolean) => {
+    (orgId: string, isWorkerEvent: boolean, isAlertEvent: boolean) => {
       if (isWorkerEvent) {
         pendingWorkerInvalidationRef.current = true;
+      }
+      if (isAlertEvent) {
+        pendingAlertInvalidationRef.current = true;
       }
       if (debounceTimerRef.current !== null) {
         return;
@@ -188,8 +198,10 @@ export function useMonitoringStream(
       debounceTimerRef.current = setTimeout(() => {
         debounceTimerRef.current = null;
         const includeWorkers = pendingWorkerInvalidationRef.current;
+        const includeAlerts = pendingAlertInvalidationRef.current;
         pendingWorkerInvalidationRef.current = false;
-        flushInvalidations(orgId, includeWorkers);
+        pendingAlertInvalidationRef.current = false;
+        flushInvalidations(orgId, includeWorkers, includeAlerts);
       }, invalidationDebounceMs);
     },
     [flushInvalidations, invalidationDebounceMs],
@@ -203,6 +215,7 @@ export function useMonitoringStream(
     setResyncNotice(null);
     setStreamError(null);
     pendingWorkerInvalidationRef.current = false;
+    pendingAlertInvalidationRef.current = false;
 
     if (debounceTimerRef.current !== null) {
       clearTimeout(debounceTimerRef.current);
@@ -233,7 +246,7 @@ export function useMonitoringStream(
       },
       onResync: (payload) => {
         setResyncNotice(payload);
-        flushInvalidations(activeOrgId, true);
+        flushInvalidations(activeOrgId, true, true);
       },
       onError: (err) => {
         setStreamError(err.message);
@@ -256,7 +269,8 @@ export function useMonitoringStream(
         });
 
         const isWorkerEvent = event.type.startsWith('WORKER_');
-        scheduleBatchedInvalidation(activeOrgId, isWorkerEvent);
+        const isAlertEvent = event.type.startsWith('ALERT_');
+        scheduleBatchedInvalidation(activeOrgId, isWorkerEvent, isAlertEvent);
       },
     });
 

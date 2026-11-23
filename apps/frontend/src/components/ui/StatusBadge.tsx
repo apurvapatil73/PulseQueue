@@ -32,6 +32,8 @@ export function inferStatusTone(status: string): BadgeTone {
       'JOB_COMPLETED',
       'JOB_RECOVERED',
       'WORKER_STARTED',
+      'RESOLVED',
+      'ALERT_RESOLVED',
     ].includes(normalized)
   ) {
     return 'emerald';
@@ -50,6 +52,9 @@ export function inferStatusTone(status: string): BadgeTone {
       'SKIPPED_MAX_RUNS',
       'JOB_RETRIED',
       'JOB_STALLED',
+      'ACKNOWLEDGED',
+      'WARNING',
+      'ALERT_ACKNOWLEDGED',
     ].includes(normalized)
   ) {
     return 'amber';
@@ -67,6 +72,9 @@ export function inferStatusTone(status: string): BadgeTone {
       'JOB_FAILED',
       'JOB_MOVED_TO_DLQ',
       'WORKER_HEARTBEAT_STALE',
+      'FIRING',
+      'CRITICAL',
+      'ALERT_FIRED',
     ].includes(normalized)
   ) {
     return 'rose';
@@ -81,6 +89,7 @@ export function inferStatusTone(status: string): BadgeTone {
       'JOB_STARTED',
       'JOB_REPLAYED',
       'RECURRING',
+      'INFO',
     ].includes(normalized)
   ) {
     return 'sky';

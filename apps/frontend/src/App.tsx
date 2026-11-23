@@ -8,6 +8,7 @@ import { ProtectedRoute } from './components/routing/ProtectedRoute';
 import { PublicOnlyRoute } from './components/routing/PublicOnlyRoute';
 import { LoginPage } from './pages/auth/LoginPage';
 import { RegisterPage } from './pages/auth/RegisterPage';
+import { AlertsPage } from './pages/alerts/AlertsPage';
 import { DashboardOverviewPage } from './pages/dashboard/DashboardOverviewPage';
 import { DlqPage } from './pages/dlq/DlqPage';
 import { JobDetailPage } from './pages/jobs/JobDetailPage';
@@ -37,6 +38,7 @@ export function AppRoutes() {
           <Route path="/schedules" element={<SchedulesPage />} />
           <Route path="/schedules/:scheduleId" element={<ScheduleDetailPage />} />
           <Route path="/monitoring" element={<MonitoringPage />} />
+          <Route path="/alerts" element={<AlertsPage />} />
           <Route path="/dlq" element={<DlqPage />} />
           <Route path="/settings" element={<OrganisationSettingsPage />} />
         </Route>

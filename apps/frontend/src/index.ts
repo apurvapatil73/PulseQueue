@@ -7,6 +7,7 @@ export { queueApi } from './api/queue.api';
 export { jobApi } from './api/job.api';
 export { dlqApi } from './api/dlq.api';
 export { monitoringApi } from './api/monitoring.api';
+export { alertApi } from './api/alert.api';
 export {
   MonitoringStreamClient,
   SseLineParser,
