@@ -1,6 +1,6 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
-import { Activity, AlertOctagon, CalendarClock, Settings } from 'lucide-react';
+import { Activity, AlertOctagon, Settings } from 'lucide-react';
 import { queryClient } from './config/queryClient';
 import { AuthProvider } from './contexts/AuthContext';
 import { OrganisationProvider } from './contexts/OrganisationContext';
@@ -15,6 +15,8 @@ import { JobsPage } from './pages/jobs/JobsPage';
 import { ModulePlaceholderPage } from './pages/modules/ModulePlaceholderPage';
 import { QueueDetailPage } from './pages/queues/QueueDetailPage';
 import { QueuesPage } from './pages/queues/QueuesPage';
+import { ScheduleDetailPage } from './pages/schedules/ScheduleDetailPage';
+import { SchedulesPage } from './pages/schedules/SchedulesPage';
 
 export function AppRoutes() {
   return (
@@ -31,22 +33,8 @@ export function AppRoutes() {
           <Route path="/queues/:queueId" element={<QueueDetailPage />} />
           <Route path="/jobs" element={<JobsPage />} />
           <Route path="/jobs/:jobId" element={<JobDetailPage />} />
-          <Route
-            path="/schedules"
-            element={
-              <ModulePlaceholderPage
-                title="Schedules"
-                description="Orchestrate one-time and recurring cron schedules with timezone, DST, and misfire controls."
-                icon={<CalendarClock className="h-5 w-5" />}
-                milestoneLabel="Step 6.3 Planned"
-                plannedCapabilities={[
-                  'Create one-time and IANA timezone-aware cron schedules with next-run previews',
-                  'Configure SKIP_MISSED, FIRE_ONCE, and CATCH_UP misfire policies and concurrency caps',
-                  'Inspect immutable ScheduleExecution history, stats, and pause/resume/cancel controls',
-                ]}
-              />
-            }
-          />
+          <Route path="/schedules" element={<SchedulesPage />} />
+          <Route path="/schedules/:scheduleId" element={<ScheduleDetailPage />} />
           <Route
             path="/monitoring"
             element={

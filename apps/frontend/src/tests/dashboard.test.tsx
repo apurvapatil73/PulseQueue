@@ -10,6 +10,7 @@ import { AppRoutes } from '../App';
 import { authApi } from '../api/auth.api';
 import { organisationApi } from '../api/organisation.api';
 import { monitoringApi } from '../api/monitoring.api';
+import { queueApi } from '../api/queue.api';
 import { scheduleApi } from '../api/schedule.api';
 import { healthApi } from '../api/health.api';
 import { ApiClientError } from '../api/error';
@@ -166,6 +167,8 @@ describe('SaaS Dashboard Shell, Organisation Switching, Navigation & Error Handl
       },
     });
 
+    vi.spyOn(queueApi, 'list').mockResolvedValue([]);
+
     vi.spyOn(scheduleApi, 'list').mockResolvedValue({
       schedules: [],
       pagination: {
@@ -203,7 +206,7 @@ describe('SaaS Dashboard Shell, Organisation Switching, Navigation & Error Handl
     await screen.findByText('invoices-prod');
 
     await user.click(screen.getByRole('link', { name: 'Schedules' }));
-    expect(await screen.findByText('Schedules Module Scaffold')).toBeInTheDocument();
+    expect(await screen.findByText('No schedules created yet')).toBeInTheDocument();
 
     await user.click(screen.getByRole('link', { name: 'Dead Letter Queue' }));
     expect(await screen.findByText('Dead Letter Queue Module Scaffold')).toBeInTheDocument();
