@@ -102,7 +102,16 @@ export class OutboxReconciler {
           continue;
         }
 
-        const dispatchRes = await this.bullMQ.enqueueJob(record.job.queue, record.job);
+        // Preserve accurate target execution time for delayed/scheduled jobs across outages
+        const remainingDelayMs =
+          record.job.delayMs > 0
+            ? Math.max(0, record.job.createdAt.getTime() + record.job.delayMs - Date.now())
+            : 0;
+
+        const dispatchRes = await this.bullMQ.enqueueJob(record.job.queue, {
+          ...record.job,
+          delayMs: remainingDelayMs,
+        });
 
         if (dispatchRes.enqueued) {
           await db.jobDispatchOutbox.updateMany({

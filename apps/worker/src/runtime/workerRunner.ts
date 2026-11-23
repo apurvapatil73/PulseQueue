@@ -8,6 +8,7 @@ import {
   logger,
   outboxReconciler,
   prisma,
+  scheduleDispatcherService,
   stalledJobRecoveryService,
   workerHealthService,
   type PersistedQueueDescriptor,
@@ -141,10 +142,12 @@ export class WorkerRuntime {
       organisationIds: this.manager.listRegisteredOrganisationIds(),
     });
 
-    // Run one immediate outbox reconciliation pass and start controlled intervals
+    // Run one immediate outbox + schedule tick and start controlled intervals
     await outboxReconciler.reconcileOnce();
+    await scheduleDispatcherService.tick();
     outboxReconciler.start(this.outboxIntervalMs);
     stalledJobRecoveryService.start(this.stalledRecoveryIntervalMs);
+    scheduleDispatcherService.start(1000);
 
     this.heartbeatTimer = setInterval(() => {
       void this.publishHeartbeat();
@@ -189,6 +192,7 @@ export class WorkerRuntime {
 
     outboxReconciler.stop();
     stalledJobRecoveryService.stop();
+    scheduleDispatcherService.stop();
     await this.manager.closeAll();
 
     // Record graceful STOPPED state before closing PostgreSQL

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import crypto from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { JobStatus } from '@prisma/client';
+import { JobStatus, ScheduleStatus, ScheduleType } from '@prisma/client';
 import {
   bullMQService,
   deadLetterService,
@@ -9,6 +9,8 @@ import {
   organisationService,
   prisma,
   queueService,
+  scheduleDispatcherService,
+  scheduleService,
   workerHealthService,
   type PersistedQueueDescriptor,
 } from '@pulsequeue/backend';
@@ -430,6 +432,71 @@ describe('Distributed Worker Runtime, Processors & Lifecycle Sync (Step 4.2)', (
       await prisma.workerHeartbeat.deleteMany({
         where: { workerInstanceId: identity.workerInstanceId },
       });
+    }, 20_000);
+
+    it('executes a one-time scheduled job at its future timestamp and runs multiple recurring cron occurrences without duplicates', async () => {
+      // 1. One-time scheduled job ~800ms in the future
+      const runAtIso = new Date(Date.now() + 800).toISOString();
+      const oneTime = await scheduleService.create(orgAId, userId, {
+        queueId: queueA.id,
+        name: `one-time-worker-${Date.now()}`,
+        type: ScheduleType.ONE_TIME,
+        jobName: 'echo',
+        payload: { message: 'scheduled-once' },
+        timezone: 'UTC',
+        runAt: runAtIso,
+        preventOverlap: true,
+      });
+
+      expect(oneTime.initialJobId).toBeDefined();
+      const oneTimeDone = await waitForJobStatus(oneTime.initialJobId!, [JobStatus.COMPLETED]);
+      expect(oneTimeDone.status).toBe(JobStatus.COMPLETED);
+      expect(oneTimeDone.result).toMatchObject({
+        processor: 'echo',
+        output: { echoed: 'scheduled-once' },
+      });
+
+      // Dispatcher reconciles one-time schedule to COMPLETED
+      await scheduleDispatcherService.tick();
+      const completedSched = await prisma.schedule.findUnique({
+        where: { id: oneTime.schedule.id },
+      });
+      expect(completedSched?.status).toBe(ScheduleStatus.COMPLETED);
+
+      // 2. Recurring schedule (every 1 second) producing 2 distinct completed executions
+      const recurring = await scheduleService.create(orgAId, userId, {
+        queueId: queueA.id,
+        name: `recurring-worker-${Date.now()}`,
+        type: ScheduleType.RECURRING,
+        jobName: 'echo',
+        payload: { message: 'recurring-tick' },
+        cronExpression: '*/1 * * * * *',
+        timezone: 'UTC',
+        preventOverlap: true,
+      });
+
+      // Wait and trigger ticks across 2 seconds to produce 2 distinct occurrences
+      await delay(1150);
+      await scheduleDispatcherService.tick();
+      await delay(1150);
+      await scheduleDispatcherService.tick();
+
+      const execs = await prisma.scheduleExecution.findMany({
+        where: { scheduleId: recurring.schedule.id, jobId: { not: null } },
+        orderBy: { scheduledFor: 'asc' },
+      });
+      expect(execs.length).toBeGreaterThanOrEqual(2);
+
+      const distinctJobIds = new Set(execs.map((e) => e.jobId));
+      expect(distinctJobIds.size).toBe(execs.length);
+
+      for (const exec of execs) {
+        const done = await waitForJobStatus(exec.jobId!, [JobStatus.COMPLETED]);
+        expect(done.status).toBe(JobStatus.COMPLETED);
+      }
+
+      // Cancel recurring schedule cleanly
+      await scheduleService.cancel(orgAId, recurring.schedule.id, userId);
     }, 20_000);
   });
 });

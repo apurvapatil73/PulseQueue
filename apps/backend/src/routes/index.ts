@@ -6,6 +6,7 @@ import invitationRoutes from './invitation.routes.js';
 import queueRoutes from './queue.routes.js';
 import { queueJobRoutes, orgJobRoutes } from './job.routes.js';
 import { dlqRoutes, monitoringRoutes } from './monitoring.routes.js';
+import scheduleRoutes from './schedule.routes.js';
 
 const router = Router();
 
@@ -29,6 +30,9 @@ router.use('/api/v1/organisations/:organisationId/dlq', dlqRoutes);
 
 // Organisation-scoped Monitoring, Metrics, Worker Health & Events endpoints
 router.use('/api/v1/organisations/:organisationId/monitoring', monitoringRoutes);
+
+// Organisation-scoped Job Scheduling endpoints
+router.use('/api/v1/organisations/:organisationId/schedules', scheduleRoutes);
 
 // Organisation management endpoints
 router.use('/api/v1/organisations', orgRoutes);
