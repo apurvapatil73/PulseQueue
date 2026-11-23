@@ -1,21 +1,8 @@
-/**
- * PulseQueue Frontend Application
- * Entry point placeholder prepared for Step 2+ implementation.
- */
-import { PlatformHealthStatus } from '@pulsequeue/shared';
-
-export const FRONTEND_APP_NAME = 'PulseQueue Web Dashboard';
-
-export function initializeFrontend(): { appName: string; initialStatus: PlatformHealthStatus } {
-  return {
-    appName: FRONTEND_APP_NAME,
-    initialStatus: {
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      services: {
-        postgres: false,
-        redis: false,
-      },
-    },
-  };
-}
+export { App, AppRoutes } from './App';
+export { frontendEnv } from './config/env';
+export { apiClient } from './api/apiClient';
+export { authApi } from './api/auth.api';
+export { organisationApi } from './api/organisation.api';
+export { monitoringApi } from './api/monitoring.api';
+export { scheduleApi } from './api/schedule.api';
+export { healthApi } from './api/health.api';

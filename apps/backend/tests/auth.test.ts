@@ -223,6 +223,46 @@ describe('User Authentication & Security', () => {
 
         expect(refreshAfterLogout.status).toBe(401);
       });
+
+      it('supports HttpOnly refresh cookie rotation and logout clearing without exposing tokens to localStorage', async () => {
+        const loginRes = await request(app).post('/api/v1/auth/login').send({
+          email: validUser.email,
+          password: validUser.password,
+        });
+        expect(loginRes.status).toBe(200);
+
+        const setCookies = loginRes.headers['set-cookie'] as unknown as string[] | undefined;
+        expect(setCookies).toBeDefined();
+        const refreshCookie = setCookies!.find((c) => c.startsWith('pq_refresh_token='));
+        expect(refreshCookie).toBeDefined();
+        expect(refreshCookie).toContain('HttpOnly');
+        expect(refreshCookie).toContain('SameSite=Lax');
+
+        // Refresh using ONLY the HttpOnly cookie (empty JSON body)
+        const refreshRes = await request(app)
+          .post('/api/v1/auth/refresh')
+          .set('Cookie', [refreshCookie!.split(';')[0]])
+          .send({});
+        expect(refreshRes.status).toBe(200);
+        expect(refreshRes.body.data.accessToken).toBeDefined();
+
+        const rotatedCookies = refreshRes.headers['set-cookie'] as unknown as string[];
+        const rotatedCookie = rotatedCookies.find((c) => c.startsWith('pq_refresh_token='));
+        expect(rotatedCookie).toBeDefined();
+
+        // Logout using ONLY the HttpOnly cookie clears the cookie and revokes token
+        const logoutRes = await request(app)
+          .post('/api/v1/auth/logout')
+          .set('Cookie', [rotatedCookie!.split(';')[0]])
+          .send({});
+        expect(logoutRes.status).toBe(200);
+
+        const afterLogout = await request(app)
+          .post('/api/v1/auth/refresh')
+          .set('Cookie', [rotatedCookie!.split(';')[0]])
+          .send({});
+        expect(afterLogout.status).toBe(401);
+      });
     });
   });
 });

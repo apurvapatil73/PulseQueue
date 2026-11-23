@@ -12,8 +12,13 @@ export function createApp(): Express {
   // Security headers
   app.use(helmet());
 
-  // Cross-Origin Resource Sharing
-  app.use(cors());
+  // Cross-Origin Resource Sharing (reflect origin + allow credentials for HttpOnly refresh cookie)
+  app.use(
+    cors({
+      origin: true,
+      credentials: true,
+    }),
+  );
 
   // Request Body Parsers
   app.use(express.json({ limit: '1mb' }));
