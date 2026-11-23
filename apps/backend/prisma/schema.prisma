@@ -40,6 +40,7 @@ model User {
   memberships      Membership[]
   refreshTokens    RefreshToken[]
   sentInvitations  Invitation[]    @relation("SentInvitations")
+  createdQueues    Queue[]         @relation("CreatedQueues")
 
   @@map("users")
 }
@@ -68,6 +69,7 @@ model Organisation {
 
   memberships Membership[]
   invitations Invitation[]
+  queues      Queue[]
 
   @@map("organisations")
 }
@@ -111,15 +113,27 @@ model Invitation {
 }
 
 model Queue {
-  id          String   @id @default(uuid()) @db.Uuid
-  name        String   @unique
-  description String?
-  isPaused    Boolean  @default(false) @map("is_paused")
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  id              String    @id @default(uuid()) @db.Uuid
+  organisationId  String    @map("organisation_id") @db.Uuid
+  name            String
+  description     String?
+  isPaused        Boolean   @default(false) @map("is_paused")
+  pausedAt        DateTime? @map("paused_at")
+  concurrency     Int       @default(5)
+  defaultPriority Int       @default(5) @map("default_priority")
+  maxRetries      Int       @default(3) @map("max_retries")
+  backoffMs       Int       @default(1000) @map("backoff_ms")
+  createdById     String?   @map("created_by_id") @db.Uuid
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
 
-  jobs        Job[]
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  createdBy    User?        @relation("CreatedQueues", fields: [createdById], references: [id], onDelete: SetNull)
+  jobs         Job[]
 
+  @@unique([organisationId, name])
+  @@index([organisationId])
+  @@index([organisationId, isPaused])
   @@map("queues")
 }
 
