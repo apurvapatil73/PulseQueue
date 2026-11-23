@@ -8,12 +8,20 @@ import { ConflictError } from './errors.js';
  */
 export const ALLOWED_JOB_TRANSITIONS: Readonly<Record<JobStatus, readonly JobStatus[]>> = {
   [JobStatus.PENDING]: [JobStatus.ACTIVE, JobStatus.PAUSED, JobStatus.DELAYED, JobStatus.FAILED],
-  [JobStatus.DELAYED]: [JobStatus.PENDING, JobStatus.PAUSED, JobStatus.FAILED],
+  [JobStatus.DELAYED]: [JobStatus.PENDING, JobStatus.ACTIVE, JobStatus.PAUSED, JobStatus.FAILED],
   [JobStatus.PAUSED]: [JobStatus.PENDING, JobStatus.DELAYED],
   [JobStatus.ACTIVE]: [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.DELAYED],
   [JobStatus.FAILED]: [JobStatus.PENDING, JobStatus.DELAYED],
   [JobStatus.COMPLETED]: [], // Terminal state — no outgoing transitions
 };
+
+/**
+ * Terminal states that must never be overwritten by stale or duplicated workers.
+ */
+export const TERMINAL_JOB_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
+  JobStatus.COMPLETED,
+  JobStatus.FAILED,
+]);
 
 /**
  * Pre-execution job states that can be safely cancelled before a worker picks them up.
@@ -26,6 +34,10 @@ export const CANCELLABLE_JOB_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatu
 
 export function canTransitionJobStatus(from: JobStatus, to: JobStatus): boolean {
   return ALLOWED_JOB_TRANSITIONS[from].includes(to);
+}
+
+export function isTerminalJobStatus(status: JobStatus): boolean {
+  return TERMINAL_JOB_STATUSES.has(status);
 }
 
 export function assertValidJobTransition(from: JobStatus, to: JobStatus): void {

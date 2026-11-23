@@ -1,10 +1,12 @@
 import http from 'http';
+import path from 'path';
 import { app } from './app.js';
 import { env } from './config/env.js';
 import { logger } from './utils/logger.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { connectRedis, disconnectRedis } from './config/redis.js';
 import { bullMQService } from './services/bullmq.service.js';
+import { outboxReconciler } from './services/outboxReconciler.service.js';
 
 let server: http.Server | null = null;
 let isShuttingDown = false;
@@ -41,6 +43,9 @@ async function startServer(): Promise<http.Server> {
     });
   });
 
+  // Start controlled outbox reconciliation for resilient Redis dispatch recovery
+  outboxReconciler.start(5000);
+
   return server;
 }
 
@@ -49,6 +54,9 @@ export async function shutdown(signal: string = 'SIGTERM'): Promise<void> {
   isShuttingDown = true;
 
   logger.info(`Received ${signal}. Initiating graceful shutdown...`);
+
+  // Stop periodic outbox reconciler
+  outboxReconciler.stop();
 
   // Set timeout to force exit if cleanup hangs
   const forceExitTimeout = setTimeout(() => {
@@ -84,23 +92,27 @@ export async function shutdown(signal: string = 'SIGTERM'): Promise<void> {
   process.exit(0);
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+// Start the server and attach process signal handlers ONLY when executed directly
+const entryArg = process.argv[1] ? path.resolve(process.argv[1]) : '';
+const isDirectServerRun =
+  entryArg.endsWith(`${path.sep}server.js`) || entryArg.endsWith(`${path.sep}server.ts`);
 
-process.on('uncaughtException', (err: Error) => {
-  logger.error(`Uncaught Exception: ${err.message}`, { stack: err.stack });
-  shutdown('UNCAUGHT_EXCEPTION').catch(() => process.exit(1));
-});
+if (process.env.NODE_ENV !== 'test' && isDirectServerRun) {
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-process.on('unhandledRejection', (reason: unknown) => {
-  logger.error('Unhandled Promise Rejection', {
-    reason: reason instanceof Error ? reason.message : String(reason),
-    stack: reason instanceof Error ? reason.stack : undefined,
+  process.on('uncaughtException', (err: Error) => {
+    logger.error(`Uncaught Exception: ${err.message}`, { stack: err.stack });
+    shutdown('UNCAUGHT_EXCEPTION').catch(() => process.exit(1));
   });
-});
 
-// Start the server if this file is executed directly
-if (process.env.NODE_ENV !== 'test') {
+  process.on('unhandledRejection', (reason: unknown) => {
+    logger.error('Unhandled Promise Rejection', {
+      reason: reason instanceof Error ? reason.message : String(reason),
+      stack: reason instanceof Error ? reason.stack : undefined,
+    });
+  });
+
   startServer().catch((err) => {
     logger.error(`Fatal startup error: ${err.message}`);
     process.exit(1);

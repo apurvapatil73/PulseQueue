@@ -363,14 +363,40 @@ export class QueueService {
       return toQueueView(existing);
     }
 
-    const updated = await db.queue.update({
-      where: { id: existing.id },
-      data: {
-        isPaused: false,
-        pausedAt: null,
+    const updated = await db.$transaction(
+      async (tx) => {
+        const resumedQueue = await tx.queue.update({
+          where: { id: existing.id },
+          data: {
+            isPaused: false,
+            pausedAt: null,
+          },
+          include: QUEUE_INCLUDE,
+        });
+
+        // Promote PAUSED jobs in PostgreSQL along valid lifecycle paths (PAUSED -> PENDING / DELAYED)
+        await tx.job.updateMany({
+          where: {
+            queueId: existing.id,
+            status: JobStatus.PAUSED,
+            delayMs: 0,
+          },
+          data: { status: JobStatus.PENDING },
+        });
+
+        await tx.job.updateMany({
+          where: {
+            queueId: existing.id,
+            status: JobStatus.PAUSED,
+            delayMs: { gt: 0 },
+          },
+          data: { status: JobStatus.DELAYED },
+        });
+
+        return resumedQueue;
       },
-      include: QUEUE_INCLUDE,
-    });
+      { maxWait: 10_000, timeout: 10_000 },
+    );
 
     // Best-effort sync with BullMQ; PostgreSQL remains authoritative on Redis outage
     await bullMQService.syncQueuePauseState(updated);

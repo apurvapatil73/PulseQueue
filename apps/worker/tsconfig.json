@@ -7,6 +7,6 @@
     "outDir": "./dist",
     "composite": true
   },
-  "references": [{ "path": "../../packages/shared" }],
+  "references": [{ "path": "../../packages/shared" }, { "path": "../backend" }],
   "include": ["src/**/*"]
 }

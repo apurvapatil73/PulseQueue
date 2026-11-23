@@ -1,10 +1,11 @@
-import { JobStatus, Prisma } from '@prisma/client';
+import { JobStatus, OutboxStatus, Prisma } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { ConflictError, NotFoundError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import {
   assertValidJobTransition,
   isCancellableJobStatus,
+  isTerminalJobStatus,
   resolveInitialJobStatus,
 } from '../utils/jobLifecycle.js';
 import { uuidSchema } from '../validators/organisation.validator.js';
@@ -27,6 +28,12 @@ export interface JobView {
   maxRetries: number;
   backoffMs: number;
   delayMs: number;
+  attemptsMade: number;
+  result: Prisma.JsonValue | null;
+  errorMessage: string | null;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  failedAt: Date | null;
   createdBy: {
     id: string;
     name: string;
@@ -61,6 +68,20 @@ export interface JobSubmissionResult {
   dispatch: EnqueueResult;
 }
 
+export type WorkerActivationOutcome =
+  | { outcome: 'activated'; job: JobView }
+  | { outcome: 'already_terminal'; status: JobStatus }
+  | { outcome: 'already_active' }
+  | { outcome: 'missing' };
+
+export type WorkerSyncOutcome =
+  | { outcome: 'updated'; job: JobView }
+  | { outcome: 'already_terminal'; status: JobStatus }
+  | { outcome: 'not_active'; status: JobStatus }
+  | { outcome: 'missing' };
+
+const MAX_ERROR_MESSAGE_LENGTH = 2000;
+
 const JOB_INCLUDE = {
   queue: {
     select: {
@@ -80,6 +101,14 @@ const JOB_INCLUDE = {
 
 type JobWithMeta = Prisma.JobGetPayload<{ include: typeof JOB_INCLUDE }>;
 
+function sanitizeErrorMessage(message: string): string {
+  const cleaned = message.replace(/\s+/g, ' ').trim();
+  if (cleaned.length <= MAX_ERROR_MESSAGE_LENGTH) {
+    return cleaned;
+  }
+  return `${cleaned.slice(0, MAX_ERROR_MESSAGE_LENGTH - 3)}...`;
+}
+
 function toJobView(j: JobWithMeta): JobView {
   return {
     id: j.id,
@@ -93,6 +122,12 @@ function toJobView(j: JobWithMeta): JobView {
     maxRetries: j.maxRetries,
     backoffMs: j.backoffMs,
     delayMs: j.delayMs,
+    attemptsMade: j.attemptsMade,
+    result: j.result,
+    errorMessage: j.errorMessage,
+    startedAt: j.startedAt,
+    completedAt: j.completedAt,
+    failedAt: j.failedAt,
     createdBy: j.createdBy,
     createdAt: j.createdAt,
     updatedAt: j.updatedAt,
@@ -101,7 +136,8 @@ function toJobView(j: JobWithMeta): JobView {
 
 export class JobService {
   /**
-   * Submits and persists a new job into an organisation-scoped queue.
+   * Submits and persists a new job + transactional outbox record atomically in PostgreSQL,
+   * then dispatches the job to BullMQ and updates the outbox state accordingly.
    * Respects queue default priority, retry/backoff defaults, and pause state.
    */
   async create(
@@ -114,7 +150,7 @@ export class JobService {
       throw new NotFoundError('Queue not found');
     }
 
-    const { persistedQueue, createdJob } = await db.$transaction(
+    const { persistedQueue, createdJob, outboxId } = await db.$transaction(
       async (tx) => {
         const queue = await tx.queue.findFirst({
           where: {
@@ -157,7 +193,18 @@ export class JobService {
           include: JOB_INCLUDE,
         });
 
-        return { persistedQueue: queue, createdJob: job };
+        // Commit durable outbox record in the exact same PostgreSQL transaction
+        const outbox = await tx.jobDispatchOutbox.create({
+          data: {
+            jobId: job.id,
+            queueId: queue.id,
+            organisationId: orgId,
+            status: OutboxStatus.PENDING,
+          },
+          select: { id: true },
+        });
+
+        return { persistedQueue: queue, createdJob: job, outboxId: outbox.id };
       },
       { maxWait: 10_000, timeout: 10_000 },
     );
@@ -172,8 +219,38 @@ export class JobService {
     });
 
     // Dispatch to BullMQ after durable PostgreSQL commit.
-    // Partial failure is caught safely; PostgreSQL job stays durable for reconciliation.
+    // Partial failure leaves the outbox PENDING so OutboxReconciler redispatches idempotently.
     const dispatch = await bullMQService.enqueueJob(persistedQueue, createdJob);
+
+    try {
+      if (dispatch.enqueued) {
+        await db.jobDispatchOutbox.updateMany({
+          where: { id: outboxId, status: OutboxStatus.PENDING },
+          data: {
+            status: OutboxStatus.DISPATCHED,
+            dispatchedAt: new Date(),
+            attempts: { increment: 1 },
+            lastError: null,
+          },
+        });
+      } else {
+        await db.jobDispatchOutbox.updateMany({
+          where: { id: outboxId, status: OutboxStatus.PENDING },
+          data: {
+            attempts: { increment: 1 },
+            lastError: sanitizeErrorMessage(dispatch.error ?? 'Redis unavailable'),
+            nextAttemptAt: new Date(Date.now() + 2000),
+          },
+        });
+      }
+    } catch (err) {
+      // Non-fatal: outbox remains PENDING and BullMQ deduplicates on stable jobId if retried
+      logger.warn('Failed to update outbox status after BullMQ dispatch', {
+        outboxId,
+        jobId: createdJob.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     return {
       job: toJobView(createdJob),
@@ -286,7 +363,6 @@ export class JobService {
       throw new NotFoundError('Job not found');
     }
 
-    // Fast-fail org-scoped check before acquiring a transaction connection slot
     const precheck = await db.job.findFirst({
       where: {
         id: jobId,
@@ -338,7 +414,7 @@ export class JobService {
           );
         }
 
-        // Guarded delete ensures a concurrent status change cannot delete a started job
+        // Guarded delete also cascades to job_dispatch_outbox via FK ON DELETE CASCADE
         const deleted = await tx.job.deleteMany({
           where: {
             id: job.id,
@@ -382,9 +458,8 @@ export class JobService {
   }
 
   /**
-   * Trusted internal lifecycle transition method for future worker/scheduler subsystems.
-   * Enforces valid JobStatus state transitions and strict organisation scoping.
-   * Intentionally NOT exposed as a public client-facing status override endpoint.
+   * Trusted internal lifecycle transition method enforcing valid JobStatus state transitions
+   * and strict organisation scoping. Never exposed as a public client-facing endpoint.
    */
   async transitionStatus(orgId: string, jobId: string, targetStatus: JobStatus): Promise<JobView> {
     if (!uuidSchema.safeParse(jobId).success) {
@@ -424,6 +499,240 @@ export class JobService {
       },
       { maxWait: 10_000, timeout: 10_000 },
     );
+  }
+
+  // ─── Trusted Worker Execution Synchronisation Methods ─────────────────────
+
+  /**
+   * Atomically claims a PostgreSQL job for active execution.
+   * Respects valid lifecycle paths (PENDING/DELAYED -> ACTIVE, or PAUSED -> PENDING -> ACTIVE),
+   * never overwrites terminal (COMPLETED/FAILED) states, and handles missing/deleted jobs safely.
+   */
+  async markJobActive(
+    orgId: string,
+    jobId: string,
+    attemptNumber: number,
+  ): Promise<WorkerActivationOutcome> {
+    if (!uuidSchema.safeParse(jobId).success) {
+      return { outcome: 'missing' };
+    }
+
+    return db.$transaction(
+      async (tx) => {
+        const existing = await tx.job.findFirst({
+          where: {
+            id: jobId,
+            queue: { organisationId: orgId },
+          },
+          select: { id: true, status: true },
+        });
+
+        if (!existing) {
+          return { outcome: 'missing' as const };
+        }
+
+        if (isTerminalJobStatus(existing.status)) {
+          return { outcome: 'already_terminal' as const, status: existing.status };
+        }
+
+        if (existing.status === JobStatus.ACTIVE) {
+          return { outcome: 'already_active' as const };
+        }
+
+        // If a job was still PAUSED (e.g. BullMQ resume raced ahead of PG), explicitly
+        // transition PAUSED -> PENDING before PENDING -> ACTIVE
+        if (existing.status === JobStatus.PAUSED) {
+          assertValidJobTransition(JobStatus.PAUSED, JobStatus.PENDING);
+          assertValidJobTransition(JobStatus.PENDING, JobStatus.ACTIVE);
+        } else {
+          assertValidJobTransition(existing.status, JobStatus.ACTIVE);
+        }
+
+        const claimed = await tx.job.updateMany({
+          where: {
+            id: existing.id,
+            status: existing.status,
+            queue: { organisationId: orgId },
+          },
+          data: {
+            status: JobStatus.ACTIVE,
+            startedAt: new Date(),
+            attemptsMade: Math.max(1, attemptNumber),
+          },
+        });
+
+        if (claimed.count !== 1) {
+          const reread = await tx.job.findUnique({
+            where: { id: existing.id },
+            select: { status: true },
+          });
+          if (!reread) return { outcome: 'missing' as const };
+          if (isTerminalJobStatus(reread.status)) {
+            return { outcome: 'already_terminal' as const, status: reread.status };
+          }
+          return { outcome: 'already_active' as const };
+        }
+
+        const updated = await tx.job.findUnique({
+          where: { id: existing.id },
+          include: JOB_INCLUDE,
+        });
+
+        if (!updated) {
+          return { outcome: 'missing' as const };
+        }
+
+        return { outcome: 'activated' as const, job: toJobView(updated) };
+      },
+      { maxWait: 10_000, timeout: 10_000 },
+    );
+  }
+
+  /**
+   * Atomically marks an ACTIVE job COMPLETED and persists structured result & timestamp.
+   * Never overwrites a job that has already reached a terminal state.
+   */
+  async markJobCompleted(
+    orgId: string,
+    jobId: string,
+    result: Prisma.InputJsonValue,
+    attemptNumber: number,
+  ): Promise<WorkerSyncOutcome> {
+    if (!uuidSchema.safeParse(jobId).success) {
+      return { outcome: 'missing' };
+    }
+
+    assertValidJobTransition(JobStatus.ACTIVE, JobStatus.COMPLETED);
+
+    const updatedCount = await db.job.updateMany({
+      where: {
+        id: jobId,
+        status: JobStatus.ACTIVE,
+        queue: { organisationId: orgId },
+      },
+      data: {
+        status: JobStatus.COMPLETED,
+        result,
+        errorMessage: null,
+        completedAt: new Date(),
+        attemptsMade: Math.max(1, attemptNumber),
+      },
+    });
+
+    const job = await db.job.findFirst({
+      where: { id: jobId, queue: { organisationId: orgId } },
+      include: JOB_INCLUDE,
+    });
+
+    if (!job) {
+      return { outcome: 'missing' };
+    }
+
+    if (updatedCount.count !== 1) {
+      if (isTerminalJobStatus(job.status)) {
+        return { outcome: 'already_terminal', status: job.status };
+      }
+      return { outcome: 'not_active', status: job.status };
+    }
+
+    return { outcome: 'updated', job: toJobView(job) };
+  }
+
+  /**
+   * Atomically transitions an ACTIVE job to DELAYED when an attempt failed but BullMQ
+   * still has remaining retry attempts. Does NOT mark the job permanently FAILED.
+   */
+  async markJobRetryScheduled(
+    orgId: string,
+    jobId: string,
+    errorMessage: string,
+    attemptNumber: number,
+  ): Promise<WorkerSyncOutcome> {
+    if (!uuidSchema.safeParse(jobId).success) {
+      return { outcome: 'missing' };
+    }
+
+    assertValidJobTransition(JobStatus.ACTIVE, JobStatus.DELAYED);
+
+    const updatedCount = await db.job.updateMany({
+      where: {
+        id: jobId,
+        status: JobStatus.ACTIVE,
+        queue: { organisationId: orgId },
+      },
+      data: {
+        status: JobStatus.DELAYED,
+        errorMessage: sanitizeErrorMessage(errorMessage),
+        attemptsMade: Math.max(1, attemptNumber),
+      },
+    });
+
+    const job = await db.job.findFirst({
+      where: { id: jobId, queue: { organisationId: orgId } },
+      include: JOB_INCLUDE,
+    });
+
+    if (!job) {
+      return { outcome: 'missing' };
+    }
+
+    if (updatedCount.count !== 1) {
+      if (isTerminalJobStatus(job.status)) {
+        return { outcome: 'already_terminal', status: job.status };
+      }
+      return { outcome: 'not_active', status: job.status };
+    }
+
+    return { outcome: 'updated', job: toJobView(job) };
+  }
+
+  /**
+   * Atomically marks an ACTIVE job permanently FAILED once all BullMQ retry attempts
+   * are exhausted (or an unrecoverable error occurs).
+   */
+  async markJobFailed(
+    orgId: string,
+    jobId: string,
+    errorMessage: string,
+    attemptNumber: number,
+  ): Promise<WorkerSyncOutcome> {
+    if (!uuidSchema.safeParse(jobId).success) {
+      return { outcome: 'missing' };
+    }
+
+    assertValidJobTransition(JobStatus.ACTIVE, JobStatus.FAILED);
+
+    const updatedCount = await db.job.updateMany({
+      where: {
+        id: jobId,
+        status: JobStatus.ACTIVE,
+        queue: { organisationId: orgId },
+      },
+      data: {
+        status: JobStatus.FAILED,
+        errorMessage: sanitizeErrorMessage(errorMessage),
+        failedAt: new Date(),
+        attemptsMade: Math.max(1, attemptNumber),
+      },
+    });
+
+    const job = await db.job.findFirst({
+      where: { id: jobId, queue: { organisationId: orgId } },
+      include: JOB_INCLUDE,
+    });
+
+    if (!job) {
+      return { outcome: 'missing' };
+    }
+
+    if (updatedCount.count !== 1) {
+      if (isTerminalJobStatus(job.status)) {
+        return { outcome: 'already_terminal', status: job.status };
+      }
+      return { outcome: 'not_active', status: job.status };
+    }
+
+    return { outcome: 'updated', job: toJobView(job) };
   }
 }
 
