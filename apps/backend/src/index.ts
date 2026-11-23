@@ -18,6 +18,8 @@ export * from './services/metrics.service.js';
 export * from './services/schedule.service.js';
 export * from './services/scheduleDispatcher.service.js';
 export * from './utils/scheduleTime.js';
+export * from './utils/scheduleLifecycle.js';
+export * from './validators/schedule.validator.js';
 export * from './middleware/auth.middleware.js';
 export * from './middleware/rbac.middleware.js';
 export * from './utils/logger.js';

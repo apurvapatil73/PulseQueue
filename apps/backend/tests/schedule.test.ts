@@ -322,8 +322,8 @@ describe('Advanced Job Scheduling — One-Time, Recurring, Timezones & Reliabili
       const farDispatcher2 = new ScheduleDispatcherService();
       const simNow = new Date('2028-06-15T10:29:45.000Z');
       const [t1, t2] = await Promise.all([
-        farDispatcher1.tick(simNow),
-        farDispatcher2.tick(simNow),
+        farDispatcher1.tick(simNow, { organisationId: orgAId }),
+        farDispatcher2.tick(simNow, { organisationId: orgAId }),
       ]);
       expect(t1.dispatched + t2.dispatched).toBe(1);
 
@@ -422,7 +422,10 @@ describe('Advanced Job Scheduling — One-Time, Recurring, Timezones & Reliabili
       const dispatcher1 = new ScheduleDispatcherService();
       const dispatcher2 = new ScheduleDispatcherService();
 
-      const [sum1, sum2] = await Promise.all([dispatcher1.tick(), dispatcher2.tick()]);
+      const [sum1, sum2] = await Promise.all([
+        dispatcher1.tick(new Date(), { organisationId: orgAId }),
+        dispatcher2.tick(new Date(), { organisationId: orgAId }),
+      ]);
       // Strictly ONE occurrence created despite two racing schedulers!
       expect(sum1.dispatched + sum2.dispatched).toBe(1);
       expect(sum1.skippedContention + sum2.skippedContention).toBeGreaterThanOrEqual(0);
@@ -442,7 +445,7 @@ describe('Advanced Job Scheduling — One-Time, Recurring, Timezones & Reliabili
         data: { nextRunAt: dueTime2 },
       });
 
-      const overlapSummary = await dispatcher1.tick();
+      const overlapSummary = await dispatcher1.tick(new Date(), { organisationId: orgAId });
       expect(overlapSummary.skippedOverlap).toBe(1);
       expect(overlapSummary.dispatched).toBe(0);
 
@@ -470,7 +473,7 @@ describe('Advanced Job Scheduling — One-Time, Recurring, Timezones & Reliabili
         ensureReady: vi.fn().mockRejectedValue(new Error('ECONNREFUSED Redis down')),
       });
       const outageDispatcher = new ScheduleDispatcherService({ bullMQ: failingBullMQ });
-      const outageSummary = await outageDispatcher.tick();
+      const outageSummary = await outageDispatcher.tick(new Date(), { organisationId: orgAId });
       expect(outageSummary.outboxDeferred).toBe(1);
 
       // Verify occurrence job & PENDING outbox survived the Redis outage
@@ -502,7 +505,7 @@ describe('Advanced Job Scheduling — One-Time, Recurring, Timezones & Reliabili
       await request(app)
         .post(`/api/v1/organisations/${orgAId}/schedules/${recurringScheduleId}/pause`)
         .set('Authorization', `Bearer ${adminA.accessToken}`);
-      const pausedTick = await dispatcher1.tick();
+      const pausedTick = await dispatcher1.tick(new Date(), { organisationId: orgAId });
       expect(pausedTick.dispatched).toBe(0);
 
       // Update cron expression while paused, then resume

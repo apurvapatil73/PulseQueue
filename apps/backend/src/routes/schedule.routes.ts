@@ -13,6 +13,8 @@ import {
   deleteSchedule,
   listScheduleExecutions,
   getScheduleNextRun,
+  getScheduleStats,
+  reconcileSchedules,
 } from '../controllers/schedule.controller.js';
 
 /**
@@ -23,6 +25,7 @@ const router = Router({ mergeParams: true });
 
 router.post('/', authenticate, requireOrgRole(Role.ADMIN), createSchedule);
 router.get('/', authenticate, requireOrgRole(Role.MEMBER), listSchedules);
+router.post('/reconcile', authenticate, requireOrgRole(Role.ADMIN), reconcileSchedules);
 router.get('/:scheduleId', authenticate, requireOrgRole(Role.MEMBER), getSchedule);
 router.patch('/:scheduleId', authenticate, requireOrgRole(Role.ADMIN), updateSchedule);
 router.post('/:scheduleId/pause', authenticate, requireOrgRole(Role.ADMIN), pauseSchedule);
@@ -36,5 +39,6 @@ router.get(
   listScheduleExecutions,
 );
 router.get('/:scheduleId/next-run', authenticate, requireOrgRole(Role.MEMBER), getScheduleNextRun);
+router.get('/:scheduleId/stats', authenticate, requireOrgRole(Role.MEMBER), getScheduleStats);
 
 export default router;

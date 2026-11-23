@@ -142,12 +142,13 @@ export class WorkerRuntime {
       organisationIds: this.manager.listRegisteredOrganisationIds(),
     });
 
-    // Run one immediate outbox + schedule tick and start controlled intervals
+    // Run one immediate outbox + BullMQ schedule reconcile + schedule tick and start intervals
     await outboxReconciler.reconcileOnce();
+    await scheduleDispatcherService.reconcileWithBullMQ();
     await scheduleDispatcherService.tick();
     outboxReconciler.start(this.outboxIntervalMs);
     stalledJobRecoveryService.start(this.stalledRecoveryIntervalMs);
-    scheduleDispatcherService.start(1000);
+    scheduleDispatcherService.start(1000, 30_000);
 
     this.heartbeatTimer = setInterval(() => {
       void this.publishHeartbeat();

@@ -76,7 +76,7 @@ export interface JobSubmissionResult {
 }
 
 export type WorkerActivationOutcome =
-  | { outcome: 'activated'; job: JobView }
+  | { outcome: 'activated'; job: JobView; maxDurationMs?: number | null }
   | { outcome: 'already_terminal'; status: JobStatus }
   | { outcome: 'already_active' }
   | { outcome: 'missing' };
@@ -604,14 +604,40 @@ export class JobService {
 
         const updated = await tx.job.findUnique({
           where: { id: existing.id },
-          include: JOB_INCLUDE,
+          include: {
+            ...JOB_INCLUDE,
+            scheduleExecution: {
+              select: {
+                id: true,
+                startedAt: true,
+                schedule: { select: { maxDurationMs: true } },
+              },
+            },
+          },
         });
 
         if (!updated) {
           return { outcome: 'missing' as const };
         }
 
-        return { outcome: 'activated' as const, job: toJobView(updated) };
+        if (updated.scheduleExecution) {
+          await tx.scheduleExecution.update({
+            where: { id: updated.scheduleExecution.id },
+            data: {
+              ...(updated.scheduleExecution.startedAt
+                ? {}
+                : { startedAt: updated.startedAt ?? new Date() }),
+              finalJobStatus: JobStatus.ACTIVE,
+              retryCount: Math.max(0, attemptNumber - 1),
+            },
+          });
+        }
+
+        return {
+          outcome: 'activated' as const,
+          job: toJobView(updated),
+          maxDurationMs: updated.scheduleExecution?.schedule?.maxDurationMs ?? null,
+        };
       },
       { maxWait: 10_000, timeout: 10_000 },
     );
@@ -648,6 +674,7 @@ export class JobService {
 
     assertValidJobTransition(JobStatus.ACTIVE, JobStatus.COMPLETED);
 
+    const completedAt = new Date();
     const updatedCount = await db.job.updateMany({
       where: {
         id: jobId,
@@ -658,7 +685,7 @@ export class JobService {
         status: JobStatus.COMPLETED,
         result,
         errorMessage: null,
-        completedAt: new Date(),
+        completedAt,
         attemptsMade: Math.max(1, attemptNumber),
         ...(options?.durationMs !== undefined
           ? { durationMs: Math.max(0, options.durationMs) }
@@ -682,6 +709,17 @@ export class JobService {
       }
       return { outcome: 'not_active', status: job.status };
     }
+
+    // Persist immutable execution telemetry onto linked ScheduleExecution (if any)
+    await db.scheduleExecution.updateMany({
+      where: { jobId: job.id },
+      data: {
+        finalJobStatus: JobStatus.COMPLETED,
+        completedAt: job.completedAt ?? completedAt,
+        ...(job.durationMs !== null ? { durationMs: job.durationMs } : {}),
+        retryCount: Math.max(0, attemptNumber - 1),
+      },
+    });
 
     await eventService.record({
       type: PlatformEventType.JOB_COMPLETED,
@@ -747,6 +785,14 @@ export class JobService {
       }
       return { outcome: 'not_active', status: job.status };
     }
+
+    await db.scheduleExecution.updateMany({
+      where: { jobId: job.id },
+      data: {
+        finalJobStatus: JobStatus.DELAYED,
+        retryCount: Math.max(1, attemptNumber),
+      },
+    });
 
     await eventService.record({
       type: PlatformEventType.JOB_RETRIED,
@@ -817,6 +863,16 @@ export class JobService {
       }
       return { outcome: 'not_active', status: job.status };
     }
+
+    await db.scheduleExecution.updateMany({
+      where: { jobId: job.id },
+      data: {
+        finalJobStatus: JobStatus.FAILED,
+        completedAt: job.failedAt ?? failedAt,
+        ...(job.durationMs !== null ? { durationMs: job.durationMs } : {}),
+        retryCount: Math.max(0, attemptNumber - 1),
+      },
+    });
 
     await eventService.record({
       type: PlatformEventType.JOB_FAILED,

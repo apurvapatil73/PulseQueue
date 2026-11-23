@@ -475,11 +475,16 @@ describe('Distributed Worker Runtime, Processors & Lifecycle Sync (Step 4.2)', (
         preventOverlap: true,
       });
 
-      // Wait and trigger ticks across 2 seconds to produce 2 distinct occurrences
-      await delay(1150);
-      await scheduleDispatcherService.tick();
-      await delay(1150);
-      await scheduleDispatcherService.tick();
+      // Wait precisely until each of the next 2 scheduled occurrences is due and tick on-time
+      for (let i = 0; i < 2; i++) {
+        const current = await prisma.schedule.findUnique({ where: { id: recurring.schedule.id } });
+        const waitMs = Math.max(
+          50,
+          (current?.nextRunAt?.getTime() ?? Date.now()) - Date.now() + 80,
+        );
+        await delay(waitMs);
+        await scheduleDispatcherService.tick(new Date(), { organisationId: orgAId });
+      }
 
       const execs = await prisma.scheduleExecution.findMany({
         where: { scheduleId: recurring.schedule.id, jobId: { not: null } },
@@ -497,6 +502,73 @@ describe('Distributed Worker Runtime, Processors & Lifecycle Sync (Step 4.2)', (
 
       // Cancel recurring schedule cleanly
       await scheduleService.cancel(orgAId, recurring.schedule.id, userId);
+    }, 20_000);
+
+    it('persists full ScheduleExecution telemetry (dispatchedAt, startedAt, completedAt, durationMs, retryCount) and enforces schedule maxDurationMs timeout', async () => {
+      // Register a slow processor for testing maxDurationMs timeout enforcement
+      workerManager.getProcessorRegistry().register({
+        name: 'test.slow',
+        description: 'Sleeps for requested delayMs to test maxDurationMs timeouts',
+        async execute(context) {
+          const payload = context.payload as { sleepMs?: number };
+          await delay(payload.sleepMs ?? 400);
+          return { finished: true };
+        },
+      });
+
+      // 1. Scheduled job with transient failure on attempt 1 -> recovers on attempt 2 and tracks retryCount
+      const retrySched = await scheduleService.create(orgAId, userId, {
+        queueId: queueA.id,
+        name: `retry-telemetry-${Date.now()}`,
+        type: ScheduleType.ONE_TIME,
+        jobName: 'test.fail',
+        payload: { reason: 'Transient scheduled blip', failUntilAttempt: 1 },
+        maxRetries: 2,
+        backoffMs: 50,
+        timezone: 'UTC',
+        runAt: new Date(Date.now() + 250).toISOString(),
+      });
+
+      expect(retrySched.initialJobId).toBeDefined();
+      const retryJob = await waitForJobStatus(retrySched.initialJobId!, [JobStatus.COMPLETED]);
+      expect(retryJob.status).toBe(JobStatus.COMPLETED);
+      expect(retryJob.attemptsMade).toBe(2);
+
+      const retryExec = await prisma.scheduleExecution.findUnique({
+        where: { jobId: retrySched.initialJobId! },
+      });
+      expect(retryExec).not.toBeNull();
+      expect(retryExec!.dispatchedAt).not.toBeNull();
+      expect(retryExec!.startedAt).not.toBeNull();
+      expect(retryExec!.completedAt).not.toBeNull();
+      expect(retryExec!.finalJobStatus).toBe(JobStatus.COMPLETED);
+      expect(retryExec!.retryCount).toBeGreaterThanOrEqual(1);
+      expect(retryExec!.durationMs).toBeGreaterThanOrEqual(0);
+
+      // 2. Scheduled job exceeding maxDurationMs (120ms limit vs 450ms sleep) -> FAILED + telemetry synced
+      const timeoutSched = await scheduleService.create(orgAId, userId, {
+        queueId: queueA.id,
+        name: `timeout-limit-${Date.now()}`,
+        type: ScheduleType.ONE_TIME,
+        jobName: 'test.slow',
+        payload: { sleepMs: 450 },
+        maxRetries: 0,
+        maxDurationMs: 120,
+        timezone: 'UTC',
+        runAt: new Date(Date.now() + 250).toISOString(),
+      });
+
+      expect(timeoutSched.initialJobId).toBeDefined();
+      const timedOutJob = await waitForJobStatus(timeoutSched.initialJobId!, [JobStatus.FAILED]);
+      expect(timedOutJob.status).toBe(JobStatus.FAILED);
+      expect(timedOutJob.errorMessage).toContain('maxDurationMs');
+
+      const timeoutExec = await prisma.scheduleExecution.findUnique({
+        where: { jobId: timeoutSched.initialJobId! },
+      });
+      expect(timeoutExec?.finalJobStatus).toBe(JobStatus.FAILED);
+      expect(timeoutExec?.completedAt).not.toBeNull();
+      expect(timeoutExec?.durationMs).toBeGreaterThanOrEqual(100);
     }, 20_000);
   });
 });

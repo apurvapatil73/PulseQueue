@@ -196,3 +196,36 @@ export async function getScheduleNextRun(
     next(err);
   }
 }
+
+export async function getScheduleStats(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    if (!req.membership) throw new UnauthorizedError();
+    const stats = await scheduleService.getStats(
+      req.membership.organisationId,
+      param(req, 'scheduleId'),
+    );
+    sendSuccess(res, { stats });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function reconcileSchedules(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    if (!req.membership) throw new UnauthorizedError();
+    const result = await scheduleService.reconcileOrganisationSchedules(
+      req.membership.organisationId,
+    );
+    sendSuccess(res, { reconciliation: result });
+  } catch (err) {
+    next(err);
+  }
+}

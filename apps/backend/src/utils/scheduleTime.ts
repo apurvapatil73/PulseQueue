@@ -195,3 +195,105 @@ export function formatInTimezone(utcDate: Date, timezone: string): string {
     DateTime.fromJSDate(utcDate, { zone: 'utc' }).setZone(timezone).toISO() ?? utcDate.toISOString()
   );
 }
+
+/**
+ * Determines whether a due recurring occurrence (`dueAt <= now`) should be treated as a misfire
+ * rather than a normal on-time tick:
+ * - True if `now - dueAt > misfireGraceMs`, OR
+ * - True if the subsequent cron occurrence after `dueAt` is already `<= now` (an entire slot passed).
+ */
+export function isCronOccurrenceMisfired(
+  expression: string,
+  timezone: string,
+  dueAt: Date,
+  now: Date,
+  misfireGraceMs: number = 60_000,
+): boolean {
+  if (now.getTime() - dueAt.getTime() > misfireGraceMs) {
+    return true;
+  }
+
+  const nextAfterDue = computeNextCronRun(expression, timezone, dueAt);
+  return nextAfterDue.getTime() <= now.getTime();
+}
+
+/**
+ * Collects up to `maxCollect` due cron occurrences in `[firstDue, now]` in chronological order
+ * using bounded O(maxCollect) iteration so extended downtime never causes unbounded CPU loops.
+ *
+ * Sets `truncated = true` when additional missed occurrences exist beyond `maxCollect`.
+ */
+export function collectDueCronRuns(
+  expression: string,
+  timezone: string,
+  firstDue: Date,
+  now: Date,
+  maxCollect: number,
+): { runs: Date[]; truncated: boolean } {
+  validateCronExpression(expression, timezone);
+
+  const safeMax = Math.max(1, Math.min(100, maxCollect));
+  const nowMs = now.getTime();
+  const runs: Date[] = [];
+
+  if (firstDue.getTime() > nowMs) {
+    return { runs, truncated: false };
+  }
+
+  // Always start right before `firstDue` so `firstDue` itself (or the exact matching cron slot) is included
+  const parsed = CronExpressionParser.parse(expression.trim(), {
+    tz: timezone,
+    currentDate: new Date(firstDue.getTime() - 1),
+  });
+
+  // Include `firstDue` explicitly if the schedule's persisted `nextRunAt` slightly differs from cron grid
+  let truncated = false;
+  for (let i = 0; i <= safeMax; i++) {
+    const candidate = parsed.next().toDate();
+    if (candidate.getTime() > nowMs) {
+      break;
+    }
+    if (runs.length > 0 && candidate.getTime() <= runs[runs.length - 1].getTime()) {
+      break;
+    }
+    if (runs.length >= safeMax) {
+      truncated = true;
+      break;
+    }
+    runs.push(candidate);
+  }
+
+  if (runs.length === 0 && firstDue.getTime() <= nowMs) {
+    runs.push(firstDue);
+  }
+
+  return { runs, truncated };
+}
+
+/**
+ * Computes the most recent cron occurrence `<= now` in O(1) time (never lower than `firstDue`),
+ * allowing `FIRE_ONCE` recovery to coalesce arbitrary downtime lengths without looping.
+ */
+export function computeLatestMissedCronRun(
+  expression: string,
+  timezone: string,
+  firstDue: Date,
+  now: Date,
+): Date {
+  validateCronExpression(expression, timezone);
+
+  try {
+    const parsed = CronExpressionParser.parse(expression.trim(), {
+      tz: timezone,
+      currentDate: new Date(now.getTime() + 1),
+    });
+    const prev = parsed.prev().toDate();
+    if (prev.getTime() >= firstDue.getTime() && prev.getTime() <= now.getTime()) {
+      return prev;
+    }
+  } catch {
+    // Fall back safely to firstDue if prev() cannot step backward
+  }
+
+  return firstDue;
+}

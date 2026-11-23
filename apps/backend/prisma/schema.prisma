@@ -74,10 +74,20 @@ enum ScheduleStatus {
   CANCELLED
 }
 
+enum MisfirePolicy {
+  SKIP_MISSED
+  FIRE_ONCE
+  CATCH_UP
+}
+
 enum ScheduleExecutionStatus {
   SCHEDULED
   DISPATCHED
+  MISSED
   SKIPPED_OVERLAP
+  SKIPPED_CONCURRENCY
+  SKIPPED_MIN_INTERVAL
+  SKIPPED_MAX_RUNS
   CANCELLED
 }
 
@@ -303,28 +313,36 @@ model PlatformEvent {
 }
 
 model Schedule {
-  id             String         @id @default(uuid()) @db.Uuid
-  organisationId String         @map("organisation_id") @db.Uuid
-  queueId        String         @map("queue_id") @db.Uuid
-  name           String
-  description    String?
-  type           ScheduleType
-  status         ScheduleStatus @default(ACTIVE)
-  jobName        String         @map("job_name")
-  payload        Json           @default("{}") @db.JsonB
-  priority       Int?
-  maxRetries     Int?           @map("max_retries")
-  backoffMs      Int?           @map("backoff_ms")
-  cronExpression String?        @map("cron_expression")
-  timezone       String         @default("UTC")
-  runAt          DateTime?      @map("run_at")
-  nextRunAt      DateTime?      @map("next_run_at")
-  lastRunAt      DateTime?      @map("last_run_at")
-  runCount       Int            @default(0) @map("run_count")
-  preventOverlap Boolean        @default(true) @map("prevent_overlap")
-  createdById    String?        @map("created_by_id") @db.Uuid
-  createdAt      DateTime       @default(now()) @map("created_at")
-  updatedAt      DateTime       @updatedAt @map("updated_at")
+  id                String         @id @default(uuid()) @db.Uuid
+  organisationId    String         @map("organisation_id") @db.Uuid
+  queueId           String         @map("queue_id") @db.Uuid
+  name              String
+  description       String?
+  type              ScheduleType
+  status            ScheduleStatus @default(ACTIVE)
+  jobName           String         @map("job_name")
+  payload           Json           @default("{}") @db.JsonB
+  priority          Int?
+  maxRetries        Int?           @map("max_retries")
+  backoffMs         Int?           @map("backoff_ms")
+  cronExpression    String?        @map("cron_expression")
+  timezone          String         @default("UTC")
+  runAt             DateTime?      @map("run_at")
+  nextRunAt         DateTime?      @map("next_run_at")
+  lastRunAt         DateTime?      @map("last_run_at")
+  lastDispatchedAt  DateTime?      @map("last_dispatched_at")
+  runCount          Int            @default(0) @map("run_count")
+  preventOverlap    Boolean        @default(true) @map("prevent_overlap")
+  misfirePolicy     MisfirePolicy  @default(SKIP_MISSED) @map("misfire_policy")
+  maxCatchUpRuns    Int            @default(5) @map("max_catch_up_runs")
+  misfireGraceMs    Int            @default(60000) @map("misfire_grace_ms")
+  maxConcurrentRuns Int?           @map("max_concurrent_runs")
+  maxTotalRuns      Int?           @map("max_total_runs")
+  maxDurationMs     Int?           @map("max_duration_ms")
+  minIntervalMs     Int?           @map("min_interval_ms")
+  createdById       String?        @map("created_by_id") @db.Uuid
+  createdAt         DateTime       @default(now()) @map("created_at")
+  updatedAt         DateTime       @updatedAt @map("updated_at")
 
   organisation Organisation        @relation(fields: [organisationId], references: [id], onDelete: Cascade)
   queue        Queue               @relation(fields: [queueId], references: [id], onDelete: Cascade)
@@ -339,20 +357,28 @@ model Schedule {
 }
 
 model ScheduleExecution {
-  id           String                  @id @default(uuid()) @db.Uuid
-  scheduleId   String                  @map("schedule_id") @db.Uuid
-  jobId        String?                 @unique @map("job_id") @db.Uuid
-  scheduledFor DateTime                @map("scheduled_for")
-  status       ScheduleExecutionStatus @default(SCHEDULED)
-  reason       String?
-  createdAt    DateTime                @default(now()) @map("created_at")
-  updatedAt    DateTime                @updatedAt @map("updated_at")
+  id             String                  @id @default(uuid()) @db.Uuid
+  scheduleId     String                  @map("schedule_id") @db.Uuid
+  jobId          String?                 @unique @map("job_id") @db.Uuid
+  scheduledFor   DateTime                @map("scheduled_for")
+  dispatchedAt   DateTime?               @map("dispatched_at")
+  startedAt      DateTime?               @map("started_at")
+  completedAt    DateTime?               @map("completed_at")
+  finalJobStatus JobStatus?              @map("final_job_status")
+  retryCount     Int                     @default(0) @map("retry_count")
+  durationMs     Int?                    @map("duration_ms")
+  isCatchUp      Boolean                 @default(false) @map("is_catch_up")
+  status         ScheduleExecutionStatus @default(SCHEDULED)
+  reason         String?
+  createdAt      DateTime                @default(now()) @map("created_at")
+  updatedAt      DateTime                @updatedAt @map("updated_at")
 
   schedule Schedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
   job      Job?     @relation(fields: [jobId], references: [id], onDelete: SetNull)
 
   @@unique([scheduleId, scheduledFor])
   @@index([scheduleId, createdAt])
+  @@index([scheduleId, status, scheduledFor])
   @@map("schedule_executions")
 }
 

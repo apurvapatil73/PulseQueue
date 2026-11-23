@@ -114,15 +114,22 @@ export class OutboxReconciler {
         });
 
         if (dispatchRes.enqueued) {
-          await db.jobDispatchOutbox.updateMany({
-            where: { id: record.id, status: OutboxStatus.PENDING },
-            data: {
-              status: OutboxStatus.DISPATCHED,
-              dispatchedAt: new Date(),
-              attempts: { increment: 1 },
-              lastError: null,
-            },
-          });
+          const dispatchedAt = new Date();
+          await Promise.all([
+            db.jobDispatchOutbox.updateMany({
+              where: { id: record.id, status: OutboxStatus.PENDING },
+              data: {
+                status: OutboxStatus.DISPATCHED,
+                dispatchedAt,
+                attempts: { increment: 1 },
+                lastError: null,
+              },
+            }),
+            db.scheduleExecution.updateMany({
+              where: { jobId: record.jobId, dispatchedAt: null },
+              data: { dispatchedAt },
+            }),
+          ]);
 
           summary.dispatched += 1;
           if (dispatchRes.deduplicated) {

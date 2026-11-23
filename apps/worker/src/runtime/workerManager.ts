@@ -284,9 +284,9 @@ export class WorkerManager {
 
     const execStartedAt = Date.now();
 
-    // 2. Execute decoupled processor (never log raw user payload contents)
+    // 2. Execute decoupled processor with optional schedule maxDurationMs timeout guard
     try {
-      const procResult = await this.registry.execute({
+      const execPromise = this.registry.execute({
         jobId,
         organisationId,
         queueId: persistedQueue.id,
@@ -296,6 +296,34 @@ export class WorkerManager {
         attemptNumber,
         maxAttempts,
       });
+
+      let procResult: ProcessorResult;
+      const maxDurationMs = activation.maxDurationMs;
+
+      if (maxDurationMs && maxDurationMs > 0) {
+        let timeoutHandle: NodeJS.Timeout | undefined;
+        try {
+          procResult = await Promise.race([
+            execPromise,
+            new Promise<never>((_resolve, reject) => {
+              timeoutHandle = setTimeout(() => {
+                reject(
+                  new Error(
+                    `Job execution exceeded schedule maxDurationMs limit (${maxDurationMs}ms)`,
+                  ),
+                );
+              }, maxDurationMs);
+              timeoutHandle.unref();
+            }),
+          ]);
+        } finally {
+          if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+          }
+        }
+      } else {
+        procResult = await execPromise;
+      }
 
       const sync = await this.jobs.markJobCompleted(
         organisationId,
