@@ -191,13 +191,25 @@ export function QueueDetailPage() {
             Refresh
           </Button>
           {queue && (
-            <Button
-              size="sm"
-              leftIcon={<Plus className="h-3.5 w-3.5" />}
-              onClick={() => setSubmitJobOpen(true)}
-            >
-              Submit Job
-            </Button>
+            <>
+              <Link to={`/schedules?queueId=${queue.id}`}>
+                <Button variant="secondary" size="sm">
+                  Schedules
+                </Button>
+              </Link>
+              <Link to={`/dlq?queueId=${queue.id}`}>
+                <Button variant="secondary" size="sm">
+                  DLQ
+                </Button>
+              </Link>
+              <Button
+                size="sm"
+                leftIcon={<Plus className="h-3.5 w-3.5" />}
+                onClick={() => setSubmitJobOpen(true)}
+              >
+                Submit Job
+              </Button>
+            </>
           )}
           {canManage && queue && (
             <>

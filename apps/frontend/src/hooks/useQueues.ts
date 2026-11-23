@@ -37,6 +37,9 @@ function invalidateQueueQueries(
 ) {
   if (!organisationId) return;
   void queryClient.invalidateQueries({ queryKey: ['queues', organisationId] });
+  void queryClient.invalidateQueries({ queryKey: ['jobs', organisationId] });
+  void queryClient.invalidateQueries({ queryKey: ['schedules', organisationId] });
+  void queryClient.invalidateQueries({ queryKey: ['dlq', organisationId] });
   void queryClient.invalidateQueries({ queryKey: ['org-metrics', organisationId] });
   if (queueId) {
     void queryClient.invalidateQueries({ queryKey: ['queue', organisationId, queueId] });

@@ -234,9 +234,12 @@ export function JobDetailPage() {
             <CalendarClock className="h-4 w-4 shrink-0 text-sky-400" />
             <span>
               Spawned by schedule{' '}
-              <span className="font-mono font-semibold text-sky-100">
+              <Link
+                to={`/schedules/${scheduleMeta.scheduleId}`}
+                className="font-mono font-semibold text-sky-100 underline hover:text-white"
+              >
                 {scheduleMeta.scheduleName ?? scheduleMeta.scheduleId}
-              </span>
+              </Link>
               {scheduleMeta.scheduledFor && (
                 <>
                   {' '}
@@ -373,7 +376,14 @@ export function JobDetailPage() {
                 {job.replayedFromDlqId && (
                   <div className="flex items-center justify-between py-2.5 gap-2">
                     <dt className="text-sky-300">Replayed From DLQ</dt>
-                    <dd className="font-mono text-sky-200 truncate">{job.replayedFromDlqId}</dd>
+                    <dd className="font-mono text-sky-200 truncate">
+                      <Link
+                        to={`/dlq?queueId=${job.queueId}`}
+                        className="underline hover:text-sky-100"
+                      >
+                        {job.replayedFromDlqId}
+                      </Link>
+                    </dd>
                   </div>
                 )}
               </dl>

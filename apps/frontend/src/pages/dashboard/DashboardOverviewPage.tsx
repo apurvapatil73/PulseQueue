@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useOutletContext } from 'react-router-dom';
+import { Link, useOutletContext } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import {
   Activity,
@@ -147,7 +147,12 @@ export function DashboardOverviewPage() {
       header: 'Queue',
       render: (q) => (
         <div className="flex items-center gap-2">
-          <span className="font-mono text-xs font-medium text-slate-100">{q.name}</span>
+          <Link
+            to={`/queues/${q.queueId}`}
+            className="font-mono text-xs font-medium text-sky-300 hover:text-sky-200 hover:underline"
+          >
+            {q.name}
+          </Link>
           <StatusBadge status={q.isPaused ? 'PAUSED' : 'ACTIVE'} />
         </div>
       ),
