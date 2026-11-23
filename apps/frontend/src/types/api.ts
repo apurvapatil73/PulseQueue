@@ -80,6 +80,47 @@ export interface QueueMetricsItem {
   openDeadLetters: number;
 }
 
+export interface QueueView {
+  id: string;
+  organisationId: string;
+  name: string;
+  description: string | null;
+  isPaused: boolean;
+  pausedAt: string | null;
+  concurrency: number;
+  defaultPriority: number;
+  maxRetries: number;
+  backoffMs: number;
+  jobCount: number;
+  createdBy: {
+    id: string;
+    name: string;
+    email: string;
+  } | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface QueueStatsView {
+  queueId: string;
+  organisationId: string;
+  name: string;
+  isPaused: boolean;
+  pausedAt: string | null;
+  config: {
+    concurrency: number;
+    defaultPriority: number;
+    maxRetries: number;
+    backoffMs: number;
+  };
+  jobs: {
+    total: number;
+    byStatus: Record<JobStatus, number>;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface OrgSafeWorkerView {
   workerInstanceId: string;
   hostname: string;

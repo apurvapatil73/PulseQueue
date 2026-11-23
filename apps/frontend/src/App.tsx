@@ -1,6 +1,6 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
-import { Activity, AlertOctagon, CalendarClock, Layers, ListChecks, Settings } from 'lucide-react';
+import { Activity, AlertOctagon, CalendarClock, ListChecks, Settings } from 'lucide-react';
 import { queryClient } from './config/queryClient';
 import { AuthProvider } from './contexts/AuthContext';
 import { OrganisationProvider } from './contexts/OrganisationContext';
@@ -11,6 +11,8 @@ import { LoginPage } from './pages/auth/LoginPage';
 import { RegisterPage } from './pages/auth/RegisterPage';
 import { DashboardOverviewPage } from './pages/dashboard/DashboardOverviewPage';
 import { ModulePlaceholderPage } from './pages/modules/ModulePlaceholderPage';
+import { QueueDetailPage } from './pages/queues/QueueDetailPage';
+import { QueuesPage } from './pages/queues/QueuesPage';
 
 export function AppRoutes() {
   return (
@@ -23,22 +25,8 @@ export function AppRoutes() {
       <Route element={<ProtectedRoute />}>
         <Route element={<AppShell />}>
           <Route path="/dashboard" element={<DashboardOverviewPage />} />
-          <Route
-            path="/queues"
-            element={
-              <ModulePlaceholderPage
-                title="Queues"
-                description="Manage organisation-scoped queues, concurrency, retry policies, and pause/resume controls."
-                icon={<Layers className="h-5 w-5" />}
-                milestoneLabel="Step 6.2 Planned"
-                plannedCapabilities={[
-                  'Create, edit, pause, resume, and delete organisation queues',
-                  'Configure concurrency, default priority, max retries, and exponential backoff',
-                  'Inspect per-queue depth, latency, and BullMQ sync health',
-                ]}
-              />
-            }
-          />
+          <Route path="/queues" element={<QueuesPage />} />
+          <Route path="/queues/:queueId" element={<QueueDetailPage />} />
           <Route
             path="/jobs"
             element={
