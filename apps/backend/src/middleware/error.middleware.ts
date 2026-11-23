@@ -7,6 +7,18 @@ import { sendError } from '../utils/response.js';
 export function errorHandler(err: Error, req: Request, res: Response, _next: NextFunction): void {
   const isProduction = env.NODE_ENV === 'production';
 
+  // Never attempt to send JSON headers if a streaming response (e.g. SSE) already flushed headers
+  if (res.headersSent) {
+    logger.warn(`Error occurred after response headers were sent: ${err.message}`, {
+      method: req.method,
+      url: req.originalUrl,
+    });
+    if (!res.writableEnded) {
+      res.end();
+    }
+    return;
+  }
+
   // Check if it is a known operational AppError
   if (err instanceof AppError) {
     logger.warn(`Operational Error [${err.code}]: ${err.message}`, {
@@ -18,6 +30,17 @@ export function errorHandler(err: Error, req: Request, res: Response, _next: Nex
     });
 
     sendError(res, err.message, err.statusCode, err.code, err.details);
+    return;
+  }
+
+  // Handle oversized request bodies from express.json / express.urlencoded
+  const httpErr = err as Error & { type?: string; status?: number; statusCode?: number };
+  if (httpErr.type === 'entity.too.large' || httpErr.status === 413 || httpErr.statusCode === 413) {
+    logger.warn('Request payload exceeded size limit', {
+      method: req.method,
+      url: req.originalUrl,
+    });
+    sendError(res, 'Request payload exceeds maximum allowed size', 413, 'PAYLOAD_TOO_LARGE');
     return;
   }
 

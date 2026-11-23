@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import { UnauthorizedError } from '../utils/errors.js';
+import { logger } from '../utils/logger.js';
 import { eventService, toRealtimePlatformEvent } from '../services/event.service.js';
 import {
   DEFAULT_MAX_REPLAY_EVENTS,
@@ -22,6 +23,8 @@ export function createMonitoringStreamHandler(
     res: Response,
     next: NextFunction,
   ): Promise<void> {
+    let registeredClientId: string | null = null;
+
     try {
       if (!req.user || !req.membership) {
         throw new UnauthorizedError('Authentication required');
@@ -52,6 +55,7 @@ export function createMonitoringStreamHandler(
         res,
         tokenExp: req.user.tokenExp,
       });
+      registeredClientId = client.id;
 
       const cleanup = () => {
         bus.unregisterClient(client.id, false);
@@ -108,6 +112,18 @@ export function createMonitoringStreamHandler(
       // Drain buffered live Redis events (deduplicated) and enter direct live delivery mode
       bus.finishReplayAndGoLive(client);
     } catch (err) {
+      if (registeredClientId) {
+        bus.unregisterClient(registeredClientId, true);
+      }
+      if (res.headersSent) {
+        logger.warn('SSE stream terminated due to server error after headers were sent', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        if (!res.writableEnded) {
+          res.end();
+        }
+        return;
+      }
       next(err);
     }
   };
