@@ -278,22 +278,26 @@ model DeadLetterJob {
 }
 
 model WorkerHeartbeat {
-  id               String             @id @default(uuid()) @db.Uuid
-  workerInstanceId String             @unique @map("worker_instance_id")
-  hostname         String
-  pid              Int
-  registeredQueues String[]           @default([]) @map("registered_queues")
-  organisationIds  String[]           @default([]) @map("organisation_ids")
-  status           WorkerHealthStatus @default(ONLINE)
-  jobsProcessed    Int                @default(0) @map("jobs_processed")
-  jobsSucceeded    Int                @default(0) @map("jobs_succeeded")
-  jobsFailed       Int                @default(0) @map("jobs_failed")
-  lastError        String?            @map("last_error")
-  lastHeartbeatAt  DateTime           @default(now()) @map("last_heartbeat_at")
-  startedAt        DateTime           @default(now()) @map("started_at")
-  stoppedAt        DateTime?          @map("stopped_at")
-  createdAt        DateTime           @default(now()) @map("created_at")
-  updatedAt        DateTime           @updatedAt @map("updated_at")
+  id                    String             @id @default(uuid()) @db.Uuid
+  workerInstanceId      String             @unique @map("worker_instance_id")
+  hostname              String
+  pid                   Int
+  registeredQueues      String[]           @default([]) @map("registered_queues")
+  organisationIds       String[]           @default([]) @map("organisation_ids")
+  status                WorkerHealthStatus @default(ONLINE)
+  configuredConcurrency Int?               @map("configured_concurrency")
+  cpuUsagePercent       Float?             @map("cpu_usage_percent")
+  memoryRssBytes        BigInt?            @map("memory_rss_bytes")
+  uptimeSeconds         Int?               @map("uptime_seconds")
+  jobsProcessed         Int                @default(0) @map("jobs_processed")
+  jobsSucceeded         Int                @default(0) @map("jobs_succeeded")
+  jobsFailed            Int                @default(0) @map("jobs_failed")
+  lastError             String?            @map("last_error")
+  lastHeartbeatAt       DateTime           @default(now()) @map("last_heartbeat_at")
+  startedAt             DateTime           @default(now()) @map("started_at")
+  stoppedAt             DateTime?          @map("stopped_at")
+  createdAt             DateTime           @default(now()) @map("created_at")
+  updatedAt             DateTime           @updatedAt @map("updated_at")
 
   @@index([status, lastHeartbeatAt])
   @@map("worker_heartbeats")

@@ -15,7 +15,7 @@ import { prisma } from '../src/config/database.js';
 import { bullMQService, buildBullMQQueueName } from '../src/services/bullmq.service.js';
 import { jobService } from '../src/services/job.service.js';
 import { workerHealthService } from '../src/services/workerHealth.service.js';
-import { MIN_PERCENTILE_SAMPLES } from '../src/services/metrics.service.js';
+import { MetricsService, MIN_PERCENTILE_SAMPLES } from '../src/services/metrics.service.js';
 import { EventRetentionService } from '../src/services/eventRetention.service.js';
 
 interface TestUser {
@@ -942,6 +942,129 @@ describe('Step 7.2 — Backend Monitoring Metrics, Tenant Isolation & Event Rete
       });
       expect(remaining).toHaveLength(4);
       expect(remaining[0].message).toBe('Boundary event (29d 23h)');
+    });
+  });
+
+  // ─── 6. Step 7.5 — Worker Telemetry, Queue Analytics & Metrics Cache ──────
+
+  describe('Step 7.5 — Worker Telemetry, Queue Analytics & Metrics Cache', () => {
+    it('persists worker process telemetry, isolates orgConfiguredConcurrency & lastActivityAt, and distinguishes null from zero', async () => {
+      const telWorkerId = `worker-tel-${suffix}`;
+      const bareWorkerId = `worker-bare-${suffix}`;
+      createdWorkerIds.push(telWorkerId, bareWorkerId);
+
+      // Register worker with real telemetry serving both Org A (concurrency 4) and Org B (concurrency 2)
+      await workerHealthService.registerWorkerStart({
+        workerInstanceId: telWorkerId,
+        hostname: 'tel-host',
+        pid: 7777,
+        registeredQueues: [
+          buildBullMQQueueName(orgAId, queueAName),
+          buildBullMQQueueName(orgBId, queueBName),
+        ],
+        organisationIds: [orgAId, orgBId],
+        configuredConcurrency: 6,
+        cpuUsagePercent: 12.34,
+        memoryRssBytes: BigInt(128 * 1024 * 1024),
+        uptimeSeconds: 3600,
+      });
+
+      // Register worker without telemetry fields -> MUST return null (not 0)
+      await workerHealthService.registerWorkerStart({
+        workerInstanceId: bareWorkerId,
+        hostname: 'bare-host',
+        pid: 7778,
+        registeredQueues: [buildBullMQQueueName(orgAId, queueAName)],
+        organisationIds: [orgAId],
+      });
+
+      const [resA, resB] = await Promise.all([
+        request(app)
+          .get(`/api/v1/organisations/${orgAId}/monitoring/workers`)
+          .set('Authorization', `Bearer ${ownerA.accessToken}`),
+        request(app)
+          .get(`/api/v1/organisations/${orgBId}/monitoring/workers`)
+          .set('Authorization', `Bearer ${ownerB.accessToken}`),
+      ]);
+
+      const telA = resA.body.data.workers.find(
+        (w: { workerInstanceId: string }) => w.workerInstanceId === telWorkerId,
+      );
+      const telB = resB.body.data.workers.find(
+        (w: { workerInstanceId: string }) => w.workerInstanceId === telWorkerId,
+      );
+      const bareA = resA.body.data.workers.find(
+        (w: { workerInstanceId: string }) => w.workerInstanceId === bareWorkerId,
+      );
+
+      // Org-scoped configured concurrency (4 for Org A, 2 for Org B — never leaks total 6!)
+      expect(telA.orgConfiguredConcurrency).toBe(4);
+      expect(telB.orgConfiguredConcurrency).toBe(2);
+      expect(telA.cpuUsagePercent).toBe(12.34);
+      expect(telA.memoryRssMb).toBe(128);
+      expect(telA.uptimeSeconds).toBe(3600);
+      expect(telA.lastActivityAt).toBeNull();
+
+      // Unavailable telemetry is strictly null (not fabricated 0)
+      expect(bareA.cpuUsagePercent).toBeNull();
+      expect(bareA.memoryRssMb).toBeNull();
+      expect(bareA.uptimeSeconds).toBeNull();
+    });
+
+    it('computes queue p50/p95/p99 execution latency, queue wait time, distinct retryRate vs failureRate, and enforces bounded cache invalidation', async () => {
+      const orgQRes = await request(app)
+        .post('/api/v1/organisations')
+        .set('Authorization', `Bearer ${ownerA.accessToken}`)
+        .send({ name: 'Monitoring Step 7.5 Queue Org' });
+      const orgQId = orgQRes.body.data.organisation.id;
+      createdOrgIds.push(orgQId);
+
+      const qRes = await request(app)
+        .post(`/api/v1/organisations/${orgQId}/queues`)
+        .set('Authorization', `Bearer ${ownerA.accessToken}`)
+        .send({ name: `q75-${Date.now()}`, concurrency: 3 });
+      const qId = qRes.body.data.queue.id;
+
+      const base = Date.now() - 20_000;
+      // 10 COMPLETED jobs (0 failed!), 2 of which retried (attemptsMade = 2) -> failureRate = 0, retryRate = 0.2
+      await prisma.job.createMany({
+        data: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100].map((d, idx) => ({
+          queueId: qId,
+          name: 'echo',
+          status: JobStatus.COMPLETED,
+          attemptsMade: idx < 2 ? 2 : 1,
+          durationMs: d,
+          delayMs: 0,
+          createdAt: new Date(base + idx * 100),
+          firstStartedAt: new Date(base + idx * 100 + 200), // exact 200ms queue wait
+          startedAt: new Date(base + idx * 100 + (idx < 2 ? 500 : 200)),
+          completedAt: new Date(base + idx * 100 + 600),
+        })),
+      });
+
+      const cachedService = new MetricsService({ cacheTtlMs: 5_000, maxCacheEntries: 10 });
+      const first = await cachedService.getOrganisationMetrics(orgQId, 60);
+      expect(first.queues).toHaveLength(1);
+      const qm = first.queues[0];
+      expect(qm.failureRate).toBe(0);
+      expect(qm.retryRate).toBe(0.2); // 2 retried / 10 processed — distinct from failureRate!
+      expect(qm.p50DurationMs).toBe(55);
+      expect(qm.p95DurationMs).toBe(95.5);
+      expect(qm.p99DurationMs).toBe(99.1);
+      expect(qm.avgQueueWaitMs).toBe(200);
+      expect(qm.p95QueueWaitMs).toBe(200);
+      expect(cachedService.getCacheSize()).toBe(1);
+
+      // Second call hits cache (identical generatedAt)
+      const second = await cachedService.getOrganisationMetrics(orgQId, 60);
+      expect(second.generatedAt).toBe(first.generatedAt);
+
+      // Invalidation forces fresh computation
+      cachedService.invalidateOrganisation(orgQId);
+      expect(cachedService.getCacheSize()).toBe(0);
+      await new Promise((r) => setTimeout(r, 15));
+      const third = await cachedService.getOrganisationMetrics(orgQId, 60);
+      expect(third.generatedAt).not.toBe(first.generatedAt);
     });
   });
 });

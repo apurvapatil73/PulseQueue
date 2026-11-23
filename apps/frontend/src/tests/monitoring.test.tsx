@@ -76,11 +76,16 @@ const SAMPLE_WORKERS: OrgSafeWorkerView[] = [
     pid: 4102,
     status: 'ONLINE',
     registeredQueues: ['payments-high', 'emails'],
+    orgConfiguredConcurrency: 5,
+    cpuUsagePercent: 18.4,
+    memoryRssMb: 142.5,
+    uptimeSeconds: 7265,
     jobsProcessed: 120,
     jobsSucceeded: 118,
     jobsFailed: 2,
     activeJobs: 3,
     lastError: 'Gateway timeout on stripe-charge',
+    lastActivityAt: '2026-11-23T09:59:55.000Z',
     lastHeartbeatAt: '2026-11-23T10:00:00.000Z',
     startedAt: '2026-11-23T08:00:00.000Z',
     stoppedAt: null,
@@ -166,8 +171,13 @@ const SAMPLE_METRICS: OrganisationMetricsView = {
       },
       successRate: 0.95,
       failureRate: 0.05,
+      retryRate: 0.0667,
       averageDurationMs: 145,
+      p50DurationMs: 110,
       p95DurationMs: 280,
+      p99DurationMs: 420,
+      avgQueueWaitMs: 45,
+      p95QueueWaitMs: 120,
       retriedJobs: 8,
       stalledRecoveries: 2,
       processedInWindow: 50,
@@ -316,9 +326,12 @@ describe('Step 7.4 — Real-Time Monitoring Dashboard UI (MonitoringPage)', () =
     const queueLinks = screen.getAllByRole('link', { name: 'payments-high' });
     expect(queueLinks[0]).toHaveAttribute('href', '/queues/q-pay');
 
-    // Worker health row (real metadata only — no invented CPU/memory)
+    // Worker health row (real backend telemetry)
     expect(screen.getByText('worker-prod-01')).toBeInTheDocument();
     expect(screen.getByText('node-west-1 · PID 4102')).toBeInTheDocument();
+    expect(screen.getByText('18.4%')).toBeInTheDocument();
+    expect(screen.getByText('142.5 MB')).toBeInTheDocument();
+    expect(screen.getByText('2h 1m')).toBeInTheDocument();
     expect(screen.getByText('Gateway timeout on stripe-charge')).toBeInTheDocument();
 
     // Persisted event with clickable job link

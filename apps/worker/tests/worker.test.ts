@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import crypto from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { JobStatus, ScheduleStatus, ScheduleType } from '@prisma/client';
@@ -20,6 +20,7 @@ import {
   ProcessorRegistry,
   UnregisteredProcessorError,
   WorkerManager,
+  WorkerRuntime,
 } from '../src/index.js';
 
 async function waitForJobStatus(
@@ -570,5 +571,40 @@ describe('Distributed Worker Runtime, Processors & Lifecycle Sync (Step 4.2)', (
       expect(timeoutExec?.completedAt).not.toBeNull();
       expect(timeoutExec?.durationMs).toBeGreaterThanOrEqual(100);
     }, 20_000);
+
+    it('collects non-blocking process telemetry on heartbeats and survives telemetry errors safely', async () => {
+      const runtime = new WorkerRuntime({ workerManager });
+
+      // First sample initializes CPU baseline; second sample computes CPU %
+      const sample1 = runtime.collectProcessTelemetry();
+      expect(sample1.configuredConcurrency).toBe(workerManager.getConfiguredConcurrency());
+      expect(sample1.memoryRssBytes).not.toBeNull();
+      expect(sample1.memoryRssBytes! > 0n).toBe(true);
+      expect(sample1.uptimeSeconds).not.toBeNull();
+      expect(sample1.uptimeSeconds!).toBeGreaterThanOrEqual(0);
+
+      await delay(20);
+      await runtime.publishHeartbeat();
+
+      const hb = await prisma.workerHeartbeat.findUnique({
+        where: { workerInstanceId: workerManager.getWorkerInstanceId() },
+      });
+      expect(hb?.configuredConcurrency).toBe(workerManager.getConfiguredConcurrency());
+      expect(hb?.memoryRssBytes).not.toBeNull();
+      expect(hb?.uptimeSeconds).not.toBeNull();
+      expect(hb?.cpuUsagePercent).not.toBeNull();
+
+      // Simulate telemetry failure -> must NOT throw or crash worker
+      const memSpy = vi.spyOn(process, 'memoryUsage').mockImplementation(() => {
+        throw new Error('simulated memoryUsage failure');
+      });
+      try {
+        const degradedSample = runtime.collectProcessTelemetry();
+        expect(degradedSample.memoryRssBytes).toBeNull();
+        expect(degradedSample.configuredConcurrency).toBe(workerManager.getConfiguredConcurrency());
+      } finally {
+        memSpy.mockRestore();
+      }
+    });
   });
 });

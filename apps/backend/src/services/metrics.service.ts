@@ -1,12 +1,4 @@
-import {
-  DeadLetterStatus,
-  JobStatus,
-  OutboxStatus,
-  PlatformEventType,
-  Prisma,
-  ScheduleExecutionStatus,
-  WorkerHealthStatus,
-} from '@prisma/client';
+import { JobStatus, Prisma, WorkerHealthStatus } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { NotFoundError } from '../utils/errors.js';
 import { workerHealthService, type OrgSafeWorkerView } from './workerHealth.service.js';
@@ -16,6 +8,9 @@ import { workerHealthService, type OrgSafeWorkerView } from './workerHealth.serv
  * Below this threshold percentiles return `null` to avoid statistically misleading estimates.
  */
 export const MIN_PERCENTILE_SAMPLES = 5;
+
+export const DEFAULT_METRICS_CACHE_TTL_MS = 2_000;
+export const DEFAULT_METRICS_CACHE_MAX_ENTRIES = 200;
 
 export interface LatencyDistribution {
   sampleCount: number;
@@ -38,11 +33,21 @@ export interface QueueMetricsItem {
   successRate: number | null;
   /** All-time failure rate: FAILED / (COMPLETED + FAILED), or null if 0 processed. */
   failureRate: number | null;
+  /** All-time retry rate: retriedJobs / (COMPLETED + FAILED), or null if 0 processed. */
+  retryRate: number | null;
   /** All-time average last-attempt execution duration in ms. */
   averageDurationMs: number | null;
+  /** Windowed p50 execution duration in ms, or null if fewer than MIN_PERCENTILE_SAMPLES. */
+  p50DurationMs: number | null;
   /** Windowed p95 execution duration in ms, or null if fewer than MIN_PERCENTILE_SAMPLES. */
   p95DurationMs: number | null;
-  /** Count of jobs in this queue with attemptsMade > 1. */
+  /** Windowed p99 execution duration in ms, or null if fewer than MIN_PERCENTILE_SAMPLES. */
+  p99DurationMs: number | null;
+  /** Windowed average initial queue wait time (submission -> first start) in ms. */
+  avgQueueWaitMs: number | null;
+  /** Windowed p95 initial queue wait time in ms, or null if fewer than MIN_PERCENTILE_SAMPLES. */
+  p95QueueWaitMs: number | null;
+  /** Count of jobs in this queue with attemptsMade > 1 (distinct from failed jobs). */
   retriedJobs: number;
   /** Cumulative stalled-job recoveries across jobs in this queue. */
   stalledRecoveries: number;
@@ -170,7 +175,18 @@ export interface OrganisationTimeseriesView {
   generatedAt: string;
 }
 
-interface LatencySqlRow {
+interface OrgJobAnalyticsRow {
+  pending: number | bigint | string;
+  active: number | bigint | string;
+  completed: number | bigint | string;
+  failed: number | bigint | string;
+  delayed: number | bigint | string;
+  paused: number | bigint | string;
+  retried_jobs: number | bigint | string;
+  stalled_recoveries: number | bigint | string;
+  all_time_avg_duration_ms: number | string | null;
+  completed_in_window: number | bigint | string;
+  failed_in_window: number | bigint | string;
   exec_count: number | bigint | string;
   exec_avg: number | string | null;
   exec_p50: number | string | null;
@@ -193,15 +209,43 @@ interface LatencySqlRow {
   e2e_p99: number | string | null;
 }
 
-interface QueueWindowSqlRow {
+interface QueueAnalyticsRow {
   queueId: string;
-  completedInWindow: number | bigint | string;
-  failedInWindow: number | bigint | string;
+  pending: number | bigint | string;
+  active: number | bigint | string;
+  completed: number | bigint | string;
+  failed: number | bigint | string;
+  delayed: number | bigint | string;
+  paused: number | bigint | string;
   retriedJobs: number | bigint | string;
   stalledRecoveries: number | bigint | string;
+  allTimeAvgDurationMs: number | string | null;
+  completedInWindow: number | bigint | string;
+  failedInWindow: number | bigint | string;
   durationSampleCount: number | bigint | string;
+  p50DurationMs: number | string | null;
   p95DurationMs: number | string | null;
+  p99DurationMs: number | string | null;
+  waitSampleCount: number | bigint | string;
+  avgQueueWaitMs: number | string | null;
+  p95QueueWaitMs: number | string | null;
   oldestPendingAt: Date | null;
+}
+
+interface OrgReliabilitySqlRow {
+  total_retry_events: number | bigint | string;
+  retries_in_window: number | bigint | string;
+  stalled_events_in_window: number | bigint | string;
+  recovered_events_in_window: number | bigint | string;
+  dlq_open: number | bigint | string;
+  dlq_replayed: number | bigint | string;
+  dlq_created_in_window: number | bigint | string;
+  dlq_replayed_in_window: number | bigint | string;
+  schedule_misfires_total: number | bigint | string;
+  schedule_misfires_in_window: number | bigint | string;
+  schedule_skips_in_window: number | bigint | string;
+  outbox_pending: number | bigint | string;
+  dlq_open_by_queue: Record<string, number> | null;
 }
 
 interface TimeseriesSqlRow {
@@ -216,6 +260,17 @@ interface TimeseriesSqlRow {
   stalled: number | bigint | string;
   dlq_added: number | bigint | string;
   schedule_misfires: number | bigint | string;
+}
+
+interface MetricsCacheEntry {
+  organisationId: string;
+  expiresAtMs: number;
+  value: OrganisationMetricsView;
+}
+
+export interface MetricsServiceOptions {
+  cacheTtlMs?: number;
+  maxCacheEntries?: number;
 }
 
 function toInt(val: number | bigint | string | null | undefined): number {
@@ -268,168 +323,141 @@ export function resolveBucketMinutes(windowMinutes: number, requested?: number):
 /**
  * Genuine persisted execution metrics service.
  * Aggregates exclusively from live PostgreSQL records — strictly scoped by organisationId,
- * read-only (zero DB writes on GET), and never returns synthetic or hardcoded values.
+ * read-only (zero DB writes on GET), optimized via consolidated SQL CTEs and a bounded
+ * short-TTL cache with event-driven invalidation.
  */
 export class MetricsService {
+  private readonly cacheTtlMs: number;
+  private readonly maxCacheEntries: number;
+  private readonly cache = new Map<string, MetricsCacheEntry>();
+
+  constructor(options: MetricsServiceOptions = {}) {
+    this.cacheTtlMs =
+      options.cacheTtlMs ?? (process.env.NODE_ENV === 'test' ? 0 : DEFAULT_METRICS_CACHE_TTL_MS);
+    this.maxCacheEntries = options.maxCacheEntries ?? DEFAULT_METRICS_CACHE_MAX_ENTRIES;
+  }
+
+  /**
+   * Invalidates all cached metrics entries for a specific organisation.
+   */
+  invalidateOrganisation(orgId: string): void {
+    for (const [key, entry] of this.cache.entries()) {
+      if (entry.organisationId === orgId) {
+        this.cache.delete(key);
+      }
+    }
+  }
+
+  clearCache(): void {
+    this.cache.clear();
+  }
+
+  getCacheSize(): number {
+    return this.cache.size;
+  }
+
   async getOrganisationMetrics(
     orgId: string,
     windowMinutes: number = 60,
+    options?: { bypassCache?: boolean },
   ): Promise<OrganisationMetricsView> {
+    const cacheKey = `${orgId}:${windowMinutes}`;
     const now = new Date();
     const nowMs = now.getTime();
+
+    if (this.cacheTtlMs > 0 && !options?.bypassCache) {
+      const cached = this.cache.get(cacheKey);
+      if (cached && cached.expiresAtMs > nowMs) {
+        return cached.value;
+      }
+      if (cached) {
+        this.cache.delete(cacheKey);
+      }
+    }
+
     const windowStart = new Date(nowMs - windowMinutes * 60_000);
 
-    const [
-      queues,
-      jobsByQueueAndStatus,
-      durationAgg,
-      durationByQueue,
-      retriedJobsCount,
-      retryEventsCount,
-      stalledSumAgg,
-      dlqByStatus,
-      dlqOpenByQueue,
-      completedInWindow,
-      failedInWindow,
-      workers,
-      latencyRows,
-      queueWindowRows,
-      windowEventsByType,
-      dlqCreatedInWindow,
-      dlqReplayedInWindow,
-      scheduleWindowGroups,
-      scheduleMisfiresTotal,
-      outboxPending,
-    ] = await Promise.all([
-      db.queue.findMany({
-        where: { organisationId: orgId },
-        select: { id: true, name: true, isPaused: true, concurrency: true },
-        orderBy: { createdAt: 'asc' },
-      }),
-      db.job.groupBy({
-        by: ['queueId', 'status'],
-        where: { queue: { organisationId: orgId } },
-        _count: { _all: true },
-      }),
-      db.job.aggregate({
-        where: {
-          queue: { organisationId: orgId },
-          durationMs: { not: null },
-        },
-        _avg: { durationMs: true },
-      }),
-      db.job.groupBy({
-        by: ['queueId'],
-        where: {
-          queue: { organisationId: orgId },
-          durationMs: { not: null },
-        },
-        _avg: { durationMs: true },
-      }),
-      db.job.count({
-        where: {
-          queue: { organisationId: orgId },
-          attemptsMade: { gt: 1 },
-        },
-      }),
-      db.platformEvent.count({
-        where: {
-          organisationId: orgId,
-          type: PlatformEventType.JOB_RETRIED,
-        },
-      }),
-      db.job.aggregate({
-        where: { queue: { organisationId: orgId } },
-        _sum: { stalledCount: true },
-      }),
-      db.deadLetterJob.groupBy({
-        by: ['status'],
-        where: { organisationId: orgId },
-        _count: { _all: true },
-      }),
-      db.deadLetterJob.groupBy({
-        by: ['queueId'],
-        where: {
-          organisationId: orgId,
-          status: DeadLetterStatus.OPEN,
-        },
-        _count: { _all: true },
-      }),
-      db.job.count({
-        where: {
-          queue: { organisationId: orgId },
-          status: JobStatus.COMPLETED,
-          completedAt: { gte: windowStart },
-        },
-      }),
-      db.job.count({
-        where: {
-          queue: { organisationId: orgId },
-          status: JobStatus.FAILED,
-          failedAt: { gte: windowStart },
-        },
-      }),
-      workerHealthService.listWorkersForOrganisation(orgId),
-      db.$queryRaw<LatencySqlRow[]>`
-        WITH org_window_jobs AS (
+    // Consolidated into 4 compact queries (plus 2 inside listWorkersForOrganisation = 6 max, down from 23)
+    const queues = await db.queue.findMany({
+      where: { organisationId: orgId },
+      select: { id: true, name: true, isPaused: true, concurrency: true },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const [orgJobRows, queueJobRows, reliabilityRows, workers] = await Promise.all([
+      db.$queryRaw<OrgJobAnalyticsRow[]>`
+        WITH org_jobs AS (
           SELECT
             j.id,
             j.status,
             j.attempts_made,
+            j.stalled_count,
             j.duration_ms,
             j.delay_ms,
             j.created_at,
             j.started_at,
             j.completed_at,
-            COALESCE(
-              j.first_started_at,
-              (
-                SELECT MIN(pe.created_at)
-                FROM platform_events pe
-                WHERE pe.job_id = j.id
-                  AND pe.type = 'JOB_STARTED'
-              ),
-              j.started_at
-            ) AS effective_first_started_at
+            j.failed_at,
+            (
+              (j.status = 'COMPLETED' AND j.completed_at >= ${windowStart})
+              OR (j.status = 'FAILED' AND j.failed_at >= ${windowStart})
+            ) AS in_window,
+            CASE
+              WHEN (j.status = 'COMPLETED' AND j.completed_at >= ${windowStart})
+                OR (j.status = 'FAILED' AND j.failed_at >= ${windowStart}) THEN
+                COALESCE(
+                  j.first_started_at,
+                  (
+                    SELECT MIN(pe.created_at)
+                    FROM platform_events pe
+                    WHERE pe.job_id = j.id AND pe.type = 'JOB_STARTED'
+                  ),
+                  j.started_at
+                )
+              ELSE NULL
+            END AS effective_first_started_at
           FROM jobs j
           INNER JOIN queues q ON q.id = j.queue_id
           WHERE q.organisation_id = ${orgId}::uuid
-            AND (
-              (j.status = 'COMPLETED' AND j.completed_at >= ${windowStart})
-              OR (j.status = 'FAILED' AND j.failed_at >= ${windowStart})
-            )
         ),
         computed AS (
           SELECT
-            duration_ms,
+            *,
             CASE
-              WHEN effective_first_started_at IS NOT NULL THEN
-                GREATEST(
-                  0,
-                  EXTRACT(EPOCH FROM (effective_first_started_at - created_at)) * 1000.0 - delay_ms
-                )
+              WHEN in_window AND effective_first_started_at IS NOT NULL THEN
+                GREATEST(0, EXTRACT(EPOCH FROM (effective_first_started_at - created_at)) * 1000.0 - delay_ms)
               ELSE NULL
             END AS queue_wait_ms,
             CASE
-              WHEN attempts_made > 1
-                AND effective_first_started_at IS NOT NULL
-                AND started_at IS NOT NULL THEN
+              WHEN in_window AND attempts_made > 1 AND effective_first_started_at IS NOT NULL AND started_at IS NOT NULL THEN
                 GREATEST(0, EXTRACT(EPOCH FROM (started_at - effective_first_started_at)) * 1000.0)
               ELSE NULL
             END AS retry_overhead_ms,
             CASE
-              WHEN status = 'COMPLETED' AND completed_at IS NOT NULL THEN
+              WHEN in_window AND status = 'COMPLETED' AND completed_at IS NOT NULL THEN
                 GREATEST(0, EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000.0)
               ELSE NULL
             END AS e2e_ms
-          FROM org_window_jobs
+          FROM org_jobs
         )
         SELECT
-          COUNT(duration_ms)::int AS exec_count,
-          AVG(duration_ms) AS exec_avg,
-          PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS exec_p50,
-          PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS exec_p95,
-          PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS exec_p99,
+          COUNT(*) FILTER (WHERE status = 'PENDING')::int AS pending,
+          COUNT(*) FILTER (WHERE status = 'ACTIVE')::int AS active,
+          COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed,
+          COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed,
+          COUNT(*) FILTER (WHERE status = 'DELAYED')::int AS delayed,
+          COUNT(*) FILTER (WHERE status = 'PAUSED')::int AS paused,
+          COUNT(*) FILTER (WHERE attempts_made > 1)::int AS retried_jobs,
+          COALESCE(SUM(stalled_count), 0)::int AS stalled_recoveries,
+          AVG(duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS all_time_avg_duration_ms,
+          COUNT(*) FILTER (WHERE status = 'COMPLETED' AND completed_at >= ${windowStart})::int AS completed_in_window,
+          COUNT(*) FILTER (WHERE status = 'FAILED' AND failed_at >= ${windowStart})::int AS failed_in_window,
+
+          COUNT(duration_ms) FILTER (WHERE in_window)::int AS exec_count,
+          AVG(duration_ms) FILTER (WHERE in_window AND duration_ms IS NOT NULL) AS exec_avg,
+          PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE in_window AND duration_ms IS NOT NULL) AS exec_p50,
+          PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE in_window AND duration_ms IS NOT NULL) AS exec_p95,
+          PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE in_window AND duration_ms IS NOT NULL) AS exec_p99,
 
           COUNT(queue_wait_ms)::int AS wait_count,
           AVG(queue_wait_ms) AS wait_avg,
@@ -450,192 +478,147 @@ export class MetricsService {
           PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY e2e_ms) FILTER (WHERE e2e_ms IS NOT NULL) AS e2e_p99
         FROM computed
       `,
-      db.$queryRaw<QueueWindowSqlRow[]>`
+      db.$queryRaw<QueueAnalyticsRow[]>`
+        WITH q_jobs AS (
+          SELECT
+            j.queue_id,
+            j.status,
+            j.attempts_made,
+            j.stalled_count,
+            j.duration_ms,
+            j.delay_ms,
+            j.created_at,
+            j.completed_at,
+            j.failed_at,
+            (
+              (j.status = 'COMPLETED' AND j.completed_at >= ${windowStart})
+              OR (j.status = 'FAILED' AND j.failed_at >= ${windowStart})
+            ) AS in_window,
+            CASE
+              WHEN (j.status = 'COMPLETED' AND j.completed_at >= ${windowStart})
+                OR (j.status = 'FAILED' AND j.failed_at >= ${windowStart}) THEN
+                COALESCE(j.first_started_at, j.started_at)
+              ELSE NULL
+            END AS eff_first_started
+          FROM jobs j
+          INNER JOIN queues q ON q.id = j.queue_id
+          WHERE q.organisation_id = ${orgId}::uuid
+        ),
+        q_computed AS (
+          SELECT
+            *,
+            CASE
+              WHEN in_window AND eff_first_started IS NOT NULL THEN
+                GREATEST(0, EXTRACT(EPOCH FROM (eff_first_started - created_at)) * 1000.0 - delay_ms)
+              ELSE NULL
+            END AS queue_wait_ms
+          FROM q_jobs
+        )
         SELECT
-          j.queue_id AS "queueId",
-          COUNT(*) FILTER (WHERE j.status = 'COMPLETED' AND j.completed_at >= ${windowStart})::int AS "completedInWindow",
-          COUNT(*) FILTER (WHERE j.status = 'FAILED' AND j.failed_at >= ${windowStart})::int AS "failedInWindow",
-          COUNT(*) FILTER (WHERE j.attempts_made > 1)::int AS "retriedJobs",
-          COALESCE(SUM(j.stalled_count), 0)::int AS "stalledRecoveries",
-          COUNT(j.duration_ms) FILTER (
-            WHERE (j.status = 'COMPLETED' AND j.completed_at >= ${windowStart})
-               OR (j.status = 'FAILED' AND j.failed_at >= ${windowStart})
-          )::int AS "durationSampleCount",
-          PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY j.duration_ms) FILTER (
-            WHERE j.duration_ms IS NOT NULL
-              AND (
-                (j.status = 'COMPLETED' AND j.completed_at >= ${windowStart})
-                OR (j.status = 'FAILED' AND j.failed_at >= ${windowStart})
-              )
-          ) AS "p95DurationMs",
-          MIN(j.created_at) FILTER (WHERE j.status = 'PENDING') AS "oldestPendingAt"
-        FROM jobs j
-        INNER JOIN queues q ON q.id = j.queue_id
-        WHERE q.organisation_id = ${orgId}::uuid
-        GROUP BY j.queue_id
+          queue_id AS "queueId",
+          COUNT(*) FILTER (WHERE status = 'PENDING')::int AS pending,
+          COUNT(*) FILTER (WHERE status = 'ACTIVE')::int AS active,
+          COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed,
+          COUNT(*) FILTER (WHERE status = 'FAILED')::int AS failed,
+          COUNT(*) FILTER (WHERE status = 'DELAYED')::int AS delayed,
+          COUNT(*) FILTER (WHERE status = 'PAUSED')::int AS paused,
+          COUNT(*) FILTER (WHERE attempts_made > 1)::int AS "retriedJobs",
+          COALESCE(SUM(stalled_count), 0)::int AS "stalledRecoveries",
+          AVG(duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS "allTimeAvgDurationMs",
+          COUNT(*) FILTER (WHERE status = 'COMPLETED' AND completed_at >= ${windowStart})::int AS "completedInWindow",
+          COUNT(*) FILTER (WHERE status = 'FAILED' AND failed_at >= ${windowStart})::int AS "failedInWindow",
+          COUNT(duration_ms) FILTER (WHERE in_window)::int AS "durationSampleCount",
+          PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE in_window AND duration_ms IS NOT NULL) AS "p50DurationMs",
+          PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE in_window AND duration_ms IS NOT NULL) AS "p95DurationMs",
+          PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE in_window AND duration_ms IS NOT NULL) AS "p99DurationMs",
+          COUNT(queue_wait_ms)::int AS "waitSampleCount",
+          AVG(queue_wait_ms) AS "avgQueueWaitMs",
+          PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY queue_wait_ms) FILTER (WHERE queue_wait_ms IS NOT NULL) AS "p95QueueWaitMs",
+          MIN(created_at) FILTER (WHERE status = 'PENDING') AS "oldestPendingAt"
+        FROM q_computed
+        GROUP BY queue_id
       `,
-      db.platformEvent.groupBy({
-        by: ['type'],
-        where: {
-          organisationId: orgId,
-          createdAt: { gte: windowStart },
-          type: {
-            in: [
-              PlatformEventType.JOB_RETRIED,
-              PlatformEventType.JOB_STALLED,
-              PlatformEventType.JOB_RECOVERED,
-            ],
-          },
-        },
-        _count: { _all: true },
-      }),
-      db.deadLetterJob.count({
-        where: {
-          organisationId: orgId,
-          createdAt: { gte: windowStart },
-        },
-      }),
-      db.deadLetterJob.count({
-        where: {
-          organisationId: orgId,
-          replayedAt: { gte: windowStart },
-        },
-      }),
-      db.scheduleExecution.groupBy({
-        by: ['status'],
-        where: {
-          schedule: { organisationId: orgId },
-          createdAt: { gte: windowStart },
-          status: {
-            in: [
-              ScheduleExecutionStatus.MISSED,
-              ScheduleExecutionStatus.SKIPPED_OVERLAP,
-              ScheduleExecutionStatus.SKIPPED_CONCURRENCY,
-              ScheduleExecutionStatus.SKIPPED_MIN_INTERVAL,
-              ScheduleExecutionStatus.SKIPPED_MAX_RUNS,
-            ],
-          },
-        },
-        _count: { _all: true },
-      }),
-      db.scheduleExecution.count({
-        where: {
-          schedule: { organisationId: orgId },
-          status: ScheduleExecutionStatus.MISSED,
-        },
-      }),
-      db.jobDispatchOutbox.count({
-        where: {
-          organisationId: orgId,
-          status: OutboxStatus.PENDING,
-        },
-      }),
+      db.$queryRaw<OrgReliabilitySqlRow[]>`
+        SELECT
+          (SELECT COUNT(*)::int FROM platform_events WHERE organisation_id = ${orgId}::uuid AND type = 'JOB_RETRIED') AS total_retry_events,
+          (SELECT COUNT(*)::int FROM platform_events WHERE organisation_id = ${orgId}::uuid AND type = 'JOB_RETRIED' AND created_at >= ${windowStart}) AS retries_in_window,
+          (SELECT COUNT(*)::int FROM platform_events WHERE organisation_id = ${orgId}::uuid AND type = 'JOB_STALLED' AND created_at >= ${windowStart}) AS stalled_events_in_window,
+          (SELECT COUNT(*)::int FROM platform_events WHERE organisation_id = ${orgId}::uuid AND type = 'JOB_RECOVERED' AND created_at >= ${windowStart}) AS recovered_events_in_window,
+          (SELECT COUNT(*)::int FROM dead_letter_jobs WHERE organisation_id = ${orgId}::uuid AND status = 'OPEN') AS dlq_open,
+          (SELECT COUNT(*)::int FROM dead_letter_jobs WHERE organisation_id = ${orgId}::uuid AND status = 'REPLAYED') AS dlq_replayed,
+          (SELECT COUNT(*)::int FROM dead_letter_jobs WHERE organisation_id = ${orgId}::uuid AND created_at >= ${windowStart}) AS dlq_created_in_window,
+          (SELECT COUNT(*)::int FROM dead_letter_jobs WHERE organisation_id = ${orgId}::uuid AND replayed_at >= ${windowStart}) AS dlq_replayed_in_window,
+          (SELECT COUNT(*)::int FROM schedule_executions se INNER JOIN schedules s ON s.id = se.schedule_id WHERE s.organisation_id = ${orgId}::uuid AND se.status = 'MISSED') AS schedule_misfires_total,
+          (SELECT COUNT(*)::int FROM schedule_executions se INNER JOIN schedules s ON s.id = se.schedule_id WHERE s.organisation_id = ${orgId}::uuid AND se.status = 'MISSED' AND se.created_at >= ${windowStart}) AS schedule_misfires_in_window,
+          (SELECT COUNT(*)::int FROM schedule_executions se INNER JOIN schedules s ON s.id = se.schedule_id WHERE s.organisation_id = ${orgId}::uuid AND se.status IN ('SKIPPED_OVERLAP', 'SKIPPED_CONCURRENCY', 'SKIPPED_MIN_INTERVAL', 'SKIPPED_MAX_RUNS') AND se.created_at >= ${windowStart}) AS schedule_skips_in_window,
+          (SELECT COUNT(*)::int FROM job_dispatch_outbox WHERE organisation_id = ${orgId}::uuid AND status = 'PENDING') AS outbox_pending,
+          (
+            SELECT json_object_agg(queue_id::text, cnt)
+            FROM (
+              SELECT queue_id, COUNT(*)::int AS cnt
+              FROM dead_letter_jobs
+              WHERE organisation_id = ${orgId}::uuid AND status = 'OPEN'
+              GROUP BY queue_id
+            ) d
+          ) AS dlq_open_by_queue
+      `,
+      workerHealthService.listWorkersForOrganisation(orgId, undefined, queues),
     ]);
 
-    const statusTotals: Record<JobStatus, number> = {
-      [JobStatus.PENDING]: 0,
-      [JobStatus.ACTIVE]: 0,
-      [JobStatus.COMPLETED]: 0,
-      [JobStatus.FAILED]: 0,
-      [JobStatus.DELAYED]: 0,
-      [JobStatus.PAUSED]: 0,
-    };
+    const orgJob = orgJobRows[0];
+    const rel = reliabilityRows[0];
 
-    const queueStatusMap = new Map<string, Record<JobStatus, number>>();
-    for (const row of jobsByQueueAndStatus) {
-      statusTotals[row.status] += row._count._all;
+    const pending = toInt(orgJob?.pending);
+    const active = toInt(orgJob?.active);
+    const succeeded = toInt(orgJob?.completed);
+    const failed = toInt(orgJob?.failed);
+    const delayed = toInt(orgJob?.delayed);
+    const paused = toInt(orgJob?.paused);
 
-      let qMap = queueStatusMap.get(row.queueId);
-      if (!qMap) {
-        qMap = {
-          [JobStatus.PENDING]: 0,
-          [JobStatus.ACTIVE]: 0,
-          [JobStatus.COMPLETED]: 0,
-          [JobStatus.FAILED]: 0,
-          [JobStatus.DELAYED]: 0,
-          [JobStatus.PAUSED]: 0,
-        };
-        queueStatusMap.set(row.queueId, qMap);
-      }
-      qMap[row.status] = row._count._all;
-    }
+    const totalSubmitted = pending + active + succeeded + failed + delayed + paused;
+    const totalProcessed = succeeded + failed;
+    const queueDepth = pending + delayed + paused;
 
-    const durationMap = new Map<string, number | null>();
-    for (const row of durationByQueue) {
-      durationMap.set(row.queueId, roundMs(row._avg.durationMs));
-    }
-
-    const dlqQueueMap = new Map<string, number>();
-    for (const row of dlqOpenByQueue) {
-      dlqQueueMap.set(row.queueId, row._count._all);
-    }
-
-    const queueWindowMap = new Map<string, QueueWindowSqlRow>();
-    for (const row of queueWindowRows) {
-      queueWindowMap.set(row.queueId, row);
-    }
-
-    let deadLetterOpen = 0;
-    let deadLetterReplayed = 0;
-    for (const row of dlqByStatus) {
-      if (row.status === DeadLetterStatus.OPEN) deadLetterOpen = row._count._all;
-      if (row.status === DeadLetterStatus.REPLAYED) deadLetterReplayed = row._count._all;
-    }
-
-    const eventWindowMap = new Map<PlatformEventType, number>();
-    for (const row of windowEventsByType) {
-      eventWindowMap.set(row.type, row._count._all);
-    }
-
-    let scheduleMisfiresInWindow = 0;
-    let scheduleSkipsInWindow = 0;
-    for (const row of scheduleWindowGroups) {
-      if (row.status === ScheduleExecutionStatus.MISSED) {
-        scheduleMisfiresInWindow = row._count._all;
-      } else {
-        scheduleSkipsInWindow += row._count._all;
-      }
-    }
-
-    const totalSubmitted = Object.values(statusTotals).reduce((acc, v) => acc + v, 0);
-    const totalProcessed = statusTotals[JobStatus.COMPLETED] + statusTotals[JobStatus.FAILED];
-    const queueDepth =
-      statusTotals[JobStatus.PENDING] +
-      statusTotals[JobStatus.DELAYED] +
-      statusTotals[JobStatus.PAUSED];
+    const completedInWindow = toInt(orgJob?.completed_in_window);
+    const failedInWindow = toInt(orgJob?.failed_in_window);
     const processedInWindow = completedInWindow + failedInWindow;
     const jobsPerMinute =
       windowMinutes > 0 ? Math.round((processedInWindow / windowMinutes) * 1000) / 1000 : 0;
 
-    const latencyRow = latencyRows[0];
     const executionDuration = buildDistribution(
-      latencyRow?.exec_count,
-      latencyRow?.exec_avg,
-      latencyRow?.exec_p50,
-      latencyRow?.exec_p95,
-      latencyRow?.exec_p99,
+      orgJob?.exec_count,
+      orgJob?.exec_avg,
+      orgJob?.exec_p50,
+      orgJob?.exec_p95,
+      orgJob?.exec_p99,
     );
     const queueWait = buildDistribution(
-      latencyRow?.wait_count,
-      latencyRow?.wait_avg,
-      latencyRow?.wait_p50,
-      latencyRow?.wait_p95,
-      latencyRow?.wait_p99,
+      orgJob?.wait_count,
+      orgJob?.wait_avg,
+      orgJob?.wait_p50,
+      orgJob?.wait_p95,
+      orgJob?.wait_p99,
     );
     const retryOverhead = buildDistribution(
-      latencyRow?.retry_count,
-      latencyRow?.retry_avg,
-      latencyRow?.retry_p50,
-      latencyRow?.retry_p95,
-      latencyRow?.retry_p99,
+      orgJob?.retry_count,
+      orgJob?.retry_avg,
+      orgJob?.retry_p50,
+      orgJob?.retry_p95,
+      orgJob?.retry_p99,
     );
     const endToEnd = buildDistribution(
-      latencyRow?.e2e_count,
-      latencyRow?.e2e_avg,
-      latencyRow?.e2e_p50,
-      latencyRow?.e2e_p95,
-      latencyRow?.e2e_p99,
+      orgJob?.e2e_count,
+      orgJob?.e2e_avg,
+      orgJob?.e2e_p50,
+      orgJob?.e2e_p95,
+      orgJob?.e2e_p99,
     );
+
+    const dlqOpenByQueue = rel?.dlq_open_by_queue ?? {};
+    const queueRowMap = new Map<string, QueueAnalyticsRow>();
+    for (const row of queueJobRows) {
+      queueRowMap.set(row.queueId, row);
+    }
 
     const workerSummary = {
       total: workers.length,
@@ -654,24 +637,31 @@ export class MetricsService {
     }
 
     const queueMetrics: QueueMetricsItem[] = queues.map((q) => {
-      const byStatus = queueStatusMap.get(q.id) ?? {
-        [JobStatus.PENDING]: 0,
-        [JobStatus.ACTIVE]: 0,
-        [JobStatus.COMPLETED]: 0,
-        [JobStatus.FAILED]: 0,
-        [JobStatus.DELAYED]: 0,
-        [JobStatus.PAUSED]: 0,
+      const qr = queueRowMap.get(q.id);
+      const byStatus: Record<JobStatus, number> = {
+        [JobStatus.PENDING]: toInt(qr?.pending),
+        [JobStatus.ACTIVE]: toInt(qr?.active),
+        [JobStatus.COMPLETED]: toInt(qr?.completed),
+        [JobStatus.FAILED]: toInt(qr?.failed),
+        [JobStatus.DELAYED]: toInt(qr?.delayed),
+        [JobStatus.PAUSED]: toInt(qr?.paused),
       };
-      const totalJobs = Object.values(byStatus).reduce((acc, v) => acc + v, 0);
-      const qProcessed = byStatus[JobStatus.COMPLETED] + byStatus[JobStatus.FAILED];
-      const qDepth =
-        byStatus[JobStatus.PENDING] + byStatus[JobStatus.DELAYED] + byStatus[JobStatus.PAUSED];
-      const qWin = queueWindowMap.get(q.id);
-      const qProcessedWin = qWin ? toInt(qWin.completedInWindow) + toInt(qWin.failedInWindow) : 0;
-      const qSamples = qWin ? toInt(qWin.durationSampleCount) : 0;
+      const totalJobs =
+        byStatus.PENDING +
+        byStatus.ACTIVE +
+        byStatus.COMPLETED +
+        byStatus.FAILED +
+        byStatus.DELAYED +
+        byStatus.PAUSED;
+      const qProcessed = byStatus.COMPLETED + byStatus.FAILED;
+      const qDepth = byStatus.PENDING + byStatus.DELAYED + byStatus.PAUSED;
+      const qRetried = toInt(qr?.retriedJobs);
+      const qProcessedWin = toInt(qr?.completedInWindow) + toInt(qr?.failedInWindow);
+      const durSamples = toInt(qr?.durationSampleCount);
+      const waitSamples = toInt(qr?.waitSampleCount);
       const oldestPendingAgeMs =
-        qWin?.oldestPendingAt != null
-          ? Math.max(0, nowMs - new Date(qWin.oldestPendingAt).getTime())
+        qr?.oldestPendingAt != null
+          ? Math.max(0, nowMs - new Date(qr.oldestPendingAt).getTime())
           : null;
 
       return {
@@ -682,44 +672,51 @@ export class MetricsService {
         totalJobs,
         queueDepth: qDepth,
         byStatus,
-        successRate: roundRate(byStatus[JobStatus.COMPLETED], qProcessed),
-        failureRate: roundRate(byStatus[JobStatus.FAILED], qProcessed),
-        averageDurationMs: durationMap.get(q.id) ?? null,
-        p95DurationMs: qSamples >= MIN_PERCENTILE_SAMPLES ? roundMs(qWin?.p95DurationMs) : null,
-        retriedJobs: qWin ? toInt(qWin.retriedJobs) : 0,
-        stalledRecoveries: qWin ? toInt(qWin.stalledRecoveries) : 0,
+        successRate: roundRate(byStatus.COMPLETED, qProcessed),
+        failureRate: roundRate(byStatus.FAILED, qProcessed),
+        retryRate: roundRate(qRetried, qProcessed),
+        averageDurationMs: roundMs(qr?.allTimeAvgDurationMs),
+        p50DurationMs: durSamples >= MIN_PERCENTILE_SAMPLES ? roundMs(qr?.p50DurationMs) : null,
+        p95DurationMs: durSamples >= MIN_PERCENTILE_SAMPLES ? roundMs(qr?.p95DurationMs) : null,
+        p99DurationMs: durSamples >= MIN_PERCENTILE_SAMPLES ? roundMs(qr?.p99DurationMs) : null,
+        avgQueueWaitMs: waitSamples > 0 ? roundMs(qr?.avgQueueWaitMs) : null,
+        p95QueueWaitMs: waitSamples >= MIN_PERCENTILE_SAMPLES ? roundMs(qr?.p95QueueWaitMs) : null,
+        retriedJobs: qRetried,
+        stalledRecoveries: toInt(qr?.stalledRecoveries),
         processedInWindow: qProcessedWin,
         jobsPerMinute:
           windowMinutes > 0 ? Math.round((qProcessedWin / windowMinutes) * 1000) / 1000 : 0,
         oldestPendingAgeMs,
-        openDeadLetters: dlqQueueMap.get(q.id) ?? 0,
+        openDeadLetters: toInt(dlqOpenByQueue[q.id]),
       };
     });
 
+    const dlqCreatedInWindow = toInt(rel?.dlq_created_in_window);
+    const dlqReplayedInWindow = toInt(rel?.dlq_replayed_in_window);
     const generatedAt = now.toISOString();
 
-    return {
+    const result: OrganisationMetricsView = {
       organisationId: orgId,
       summary: {
         totalSubmitted,
         totalProcessed,
-        succeeded: statusTotals[JobStatus.COMPLETED],
-        failed: statusTotals[JobStatus.FAILED],
-        active: statusTotals[JobStatus.ACTIVE],
-        pending: statusTotals[JobStatus.PENDING],
-        delayed: statusTotals[JobStatus.DELAYED],
-        paused: statusTotals[JobStatus.PAUSED],
+        succeeded,
+        failed,
+        active,
+        pending,
+        delayed,
+        paused,
         queueDepth,
-        successRate: roundRate(statusTotals[JobStatus.COMPLETED], totalProcessed),
-        failureRate: roundRate(statusTotals[JobStatus.FAILED], totalProcessed),
+        successRate: roundRate(succeeded, totalProcessed),
+        failureRate: roundRate(failed, totalProcessed),
         windowSuccessRate: roundRate(completedInWindow, processedInWindow),
         windowFailureRate: roundRate(failedInWindow, processedInWindow),
-        retriedJobs: retriedJobsCount,
-        totalRetryEvents: retryEventsCount,
-        stalledRecoveries: stalledSumAgg._sum.stalledCount ?? 0,
-        deadLetterOpen,
-        deadLetterReplayed,
-        averageDurationMs: roundMs(durationAgg._avg.durationMs),
+        retriedJobs: toInt(orgJob?.retried_jobs),
+        totalRetryEvents: toInt(rel?.total_retry_events),
+        stalledRecoveries: toInt(orgJob?.stalled_recoveries),
+        deadLetterOpen: toInt(rel?.dlq_open),
+        deadLetterReplayed: toInt(rel?.dlq_replayed),
+        averageDurationMs: roundMs(orgJob?.all_time_avg_duration_ms),
         windowAverageDurationMs: executionDuration.avgMs,
       },
       throughput: {
@@ -739,16 +736,16 @@ export class MetricsService {
       },
       reliability: {
         windowMinutes,
-        retriesInWindow: eventWindowMap.get(PlatformEventType.JOB_RETRIED) ?? 0,
-        stalledEventsInWindow: eventWindowMap.get(PlatformEventType.JOB_STALLED) ?? 0,
-        recoveredEventsInWindow: eventWindowMap.get(PlatformEventType.JOB_RECOVERED) ?? 0,
+        retriesInWindow: toInt(rel?.retries_in_window),
+        stalledEventsInWindow: toInt(rel?.stalled_events_in_window),
+        recoveredEventsInWindow: toInt(rel?.recovered_events_in_window),
         dlqCreatedInWindow,
         dlqReplayedInWindow,
         dlqNetGrowthInWindow: dlqCreatedInWindow - dlqReplayedInWindow,
-        scheduleMisfiresInWindow,
-        scheduleSkipsInWindow,
-        scheduleMisfiresTotal,
-        outboxPending,
+        scheduleMisfiresInWindow: toInt(rel?.schedule_misfires_in_window),
+        scheduleSkipsInWindow: toInt(rel?.schedule_skips_in_window),
+        scheduleMisfiresTotal: toInt(rel?.schedule_misfires_total),
+        outboxPending: toInt(rel?.outbox_pending),
       },
       workerSummary,
       queues: queueMetrics,
@@ -757,6 +754,20 @@ export class MetricsService {
       windowEnd: generatedAt,
       generatedAt,
     };
+
+    if (this.cacheTtlMs > 0) {
+      if (this.cache.size >= this.maxCacheEntries) {
+        const oldestKey = this.cache.keys().next().value;
+        if (oldestKey) this.cache.delete(oldestKey);
+      }
+      this.cache.set(cacheKey, {
+        organisationId: orgId,
+        expiresAtMs: Date.now() + this.cacheTtlMs,
+        value: result,
+      });
+    }
+
+    return result;
   }
 
   /**
@@ -782,7 +793,6 @@ export class MetricsService {
     const now = params.now ?? new Date();
     const nowMs = now.getTime();
 
-    // Align to exact UTC bucket boundaries so the current in-progress bucket is included
     const alignedEndMs = Math.floor(nowMs / bucketMs) * bucketMs + bucketMs;
     const bucketCount = Math.ceil(params.windowMinutes / bucketMinutes);
     const alignedStartMs = alignedEndMs - bucketCount * bucketMs;

@@ -1,4 +1,4 @@
-import { JobStatus, PlatformEventType, WorkerHealthStatus } from '@prisma/client';
+import { PlatformEventType, Prisma, WorkerHealthStatus } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { logger } from '../utils/logger.js';
 import { eventService } from './event.service.js';
@@ -10,6 +10,10 @@ export interface WorkerHeartbeatInput {
   pid: number;
   registeredQueues: string[];
   organisationIds: string[];
+  configuredConcurrency?: number | null;
+  cpuUsagePercent?: number | null;
+  memoryRssBytes?: bigint | number | null;
+  uptimeSeconds?: number | null;
   lastError?: string | null;
 }
 
@@ -32,6 +36,14 @@ export interface OrgSafeWorkerView {
   status: WorkerHealthStatus;
   /** Filtered strictly to BullMQ queue names belonging to the caller's organisation. */
   registeredQueues: string[];
+  /** Sum of configured concurrency across this organisation's queues registered on this worker. */
+  orgConfiguredConcurrency: number;
+  /** Process-level worker CPU usage percentage over the last heartbeat interval, or null if unavailable. */
+  cpuUsagePercent: number | null;
+  /** Process-level worker resident set size (RSS) in MB, or null if unavailable. */
+  memoryRssMb: number | null;
+  /** Worker process uptime in seconds, or null if unavailable. */
+  uptimeSeconds: number | null;
   /** Strictly organisation-scoped count of terminal (COMPLETED + FAILED) jobs executed by this worker. */
   jobsProcessed: number;
   /** Strictly organisation-scoped count of COMPLETED jobs executed by this worker. */
@@ -42,10 +54,43 @@ export interface OrgSafeWorkerView {
   activeJobs: number;
   /** Latest FAILED job error message belonging strictly to the caller's organisation (never global). */
   lastError: string | null;
+  /** Strictly organisation-scoped timestamp of the last job activity on this worker, or null if none. */
+  lastActivityAt: Date | null;
   lastHeartbeatAt: Date;
   startedAt: Date;
   stoppedAt: Date | null;
   heartbeatAgeMs: number;
+}
+
+interface WorkerOrgStatsRow {
+  workerId: string;
+  succeeded: number | bigint | string;
+  failed: number | bigint | string;
+  active: number | bigint | string;
+  lastActivityAt: Date | null;
+  lastError: string | null;
+}
+
+function toSafeBigInt(value?: bigint | number | null): bigint | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value === 'bigint') return value >= 0n ? value : 0n;
+  if (!Number.isFinite(value) || value < 0) return null;
+  return BigInt(Math.trunc(value));
+}
+
+function toSafeCpu(value?: number | null): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (!Number.isFinite(value) || value < 0) return null;
+  return Math.round(value * 100) / 100;
+}
+
+function toSafeInt(value?: number | null): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (!Number.isFinite(value) || value < 0) return null;
+  return Math.trunc(value);
 }
 
 /**
@@ -86,6 +131,11 @@ export class WorkerHealthService {
    */
   async registerWorkerStart(input: WorkerHeartbeatInput): Promise<void> {
     const now = new Date();
+    const configuredConcurrency = toSafeInt(input.configuredConcurrency) ?? null;
+    const cpuUsagePercent = toSafeCpu(input.cpuUsagePercent) ?? null;
+    const memoryRssBytes = toSafeBigInt(input.memoryRssBytes) ?? null;
+    const uptimeSeconds = toSafeInt(input.uptimeSeconds) ?? null;
+
     await db.workerHeartbeat.upsert({
       where: { workerInstanceId: input.workerInstanceId },
       create: {
@@ -95,6 +145,10 @@ export class WorkerHealthService {
         registeredQueues: input.registeredQueues,
         organisationIds: Array.from(new Set(input.organisationIds)),
         status: WorkerHealthStatus.ONLINE,
+        configuredConcurrency,
+        cpuUsagePercent,
+        memoryRssBytes,
+        uptimeSeconds,
         lastHeartbeatAt: now,
         startedAt: now,
         stoppedAt: null,
@@ -106,6 +160,10 @@ export class WorkerHealthService {
         registeredQueues: input.registeredQueues,
         organisationIds: Array.from(new Set(input.organisationIds)),
         status: WorkerHealthStatus.ONLINE,
+        configuredConcurrency,
+        cpuUsagePercent,
+        memoryRssBytes,
+        uptimeSeconds,
         lastHeartbeatAt: now,
         startedAt: now,
         stoppedAt: null,
@@ -155,6 +213,11 @@ export class WorkerHealthService {
    */
   async recordHeartbeat(input: WorkerHeartbeatInput): Promise<void> {
     const now = new Date();
+    const configuredConcurrency = toSafeInt(input.configuredConcurrency);
+    const cpuUsagePercent = toSafeCpu(input.cpuUsagePercent);
+    const memoryRssBytes = toSafeBigInt(input.memoryRssBytes);
+    const uptimeSeconds = toSafeInt(input.uptimeSeconds);
+
     await db.workerHeartbeat.upsert({
       where: { workerInstanceId: input.workerInstanceId },
       create: {
@@ -164,6 +227,10 @@ export class WorkerHealthService {
         registeredQueues: input.registeredQueues,
         organisationIds: Array.from(new Set(input.organisationIds)),
         status: WorkerHealthStatus.ONLINE,
+        configuredConcurrency: configuredConcurrency ?? null,
+        cpuUsagePercent: cpuUsagePercent ?? null,
+        memoryRssBytes: memoryRssBytes ?? null,
+        uptimeSeconds: uptimeSeconds ?? null,
         lastHeartbeatAt: now,
         startedAt: now,
         lastError: input.lastError ?? null,
@@ -172,6 +239,10 @@ export class WorkerHealthService {
         registeredQueues: input.registeredQueues,
         organisationIds: Array.from(new Set(input.organisationIds)),
         status: WorkerHealthStatus.ONLINE,
+        ...(configuredConcurrency !== undefined ? { configuredConcurrency } : {}),
+        ...(cpuUsagePercent !== undefined ? { cpuUsagePercent } : {}),
+        ...(memoryRssBytes !== undefined ? { memoryRssBytes } : {}),
+        ...(uptimeSeconds !== undefined ? { uptimeSeconds } : {}),
         lastHeartbeatAt: now,
         stoppedAt: null,
         ...(input.lastError !== undefined ? { lastError: input.lastError } : {}),
@@ -394,67 +465,75 @@ export class WorkerHealthService {
   async listWorkersForOrganisation(
     orgId: string,
     thresholds: WorkerHealthThresholds = DEFAULT_WORKER_HEALTH_THRESHOLDS,
+    orgQueuesHint?: Array<{ name: string; concurrency: number }>,
   ): Promise<OrgSafeWorkerView[]> {
     const nowMs = Date.now();
     const orgPrefix = `org_${orgId}__`;
 
-    const workers = await db.workerHeartbeat.findMany({
-      where: {
-        organisationIds: { has: orgId },
-      },
-      orderBy: [{ lastHeartbeatAt: 'desc' }],
-    });
+    const [workers, orgQueues] = await Promise.all([
+      db.workerHeartbeat.findMany({
+        where: {
+          organisationIds: { has: orgId },
+        },
+        orderBy: [{ lastHeartbeatAt: 'desc' }],
+      }),
+      orgQueuesHint
+        ? Promise.resolve(orgQueuesHint)
+        : db.queue.findMany({
+            where: { organisationId: orgId },
+            select: { name: true, concurrency: true },
+          }),
+    ]);
 
     if (workers.length === 0) {
       return [];
     }
 
-    const workerIds = workers.map((w) => w.workerInstanceId);
-
-    const [orgJobCounts, orgLatestErrors] = await Promise.all([
-      db.job.groupBy({
-        by: ['lastWorkerId', 'status'],
-        where: {
-          queue: { organisationId: orgId },
-          lastWorkerId: { in: workerIds },
-          status: { in: [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.ACTIVE] },
-        },
-        _count: { _all: true },
-      }),
-      db.job.findMany({
-        where: {
-          queue: { organisationId: orgId },
-          lastWorkerId: { in: workerIds },
-          status: JobStatus.FAILED,
-          errorMessage: { not: null },
-        },
-        orderBy: [{ failedAt: 'desc' }, { updatedAt: 'desc' }],
-        distinct: ['lastWorkerId'],
-        select: {
-          lastWorkerId: true,
-          errorMessage: true,
-        },
-      }),
-    ]);
-
-    const countsByWorker = new Map<string, { succeeded: number; failed: number; active: number }>();
-    for (const row of orgJobCounts) {
-      if (!row.lastWorkerId) continue;
-      let entry = countsByWorker.get(row.lastWorkerId);
-      if (!entry) {
-        entry = { succeeded: 0, failed: 0, active: 0 };
-        countsByWorker.set(row.lastWorkerId, entry);
-      }
-      if (row.status === JobStatus.COMPLETED) entry.succeeded = row._count._all;
-      if (row.status === JobStatus.FAILED) entry.failed = row._count._all;
-      if (row.status === JobStatus.ACTIVE) entry.active = row._count._all;
+    const queueConcurrencyByName = new Map<string, number>();
+    for (const q of orgQueues) {
+      queueConcurrencyByName.set(q.name, q.concurrency);
     }
 
-    const lastErrorByWorker = new Map<string, string>();
-    for (const row of orgLatestErrors) {
-      if (row.lastWorkerId && row.errorMessage) {
-        lastErrorByWorker.set(row.lastWorkerId, row.errorMessage);
+    const workerIds = workers.map((w) => w.workerInstanceId);
+
+    // Single combined SQL query for org-scoped counts, lastActivityAt, and latest org-scoped error
+    const statsRows = await db.$queryRaw<WorkerOrgStatsRow[]>`
+      SELECT
+        j.last_worker_id AS "workerId",
+        COUNT(*) FILTER (WHERE j.status = 'COMPLETED')::int AS succeeded,
+        COUNT(*) FILTER (WHERE j.status = 'FAILED')::int AS failed,
+        COUNT(*) FILTER (WHERE j.status = 'ACTIVE')::int AS active,
+        MAX(COALESCE(j.completed_at, j.failed_at, j.started_at)) AS "lastActivityAt",
+        (
+          ARRAY_AGG(j.error_message ORDER BY j.failed_at DESC NULLS LAST, j.updated_at DESC)
+          FILTER (WHERE j.status = 'FAILED' AND j.error_message IS NOT NULL)
+        )[1] AS "lastError"
+      FROM jobs j
+      INNER JOIN queues q ON q.id = j.queue_id
+      WHERE q.organisation_id = ${orgId}::uuid
+        AND j.last_worker_id IN (${Prisma.join(workerIds)})
+        AND j.status IN ('COMPLETED', 'FAILED', 'ACTIVE')
+      GROUP BY j.last_worker_id
+    `;
+
+    const statsByWorker = new Map<
+      string,
+      {
+        succeeded: number;
+        failed: number;
+        active: number;
+        lastActivityAt: Date | null;
+        lastError: string | null;
       }
+    >();
+    for (const row of statsRows) {
+      statsByWorker.set(row.workerId, {
+        succeeded: Number(row.succeeded) || 0,
+        failed: Number(row.failed) || 0,
+        active: Number(row.active) || 0,
+        lastActivityAt: row.lastActivityAt ? new Date(row.lastActivityAt) : null,
+        lastError: row.lastError ?? null,
+      });
     }
 
     return workers.map((w) => {
@@ -464,11 +543,23 @@ export class WorkerHealthService {
         .filter((q) => q.startsWith(orgPrefix))
         .map((q) => q.slice(orgPrefix.length));
 
-      const stats = countsByWorker.get(w.workerInstanceId) ?? {
+      const orgConfiguredConcurrency = orgScopedQueues.reduce(
+        (acc, qName) => acc + (queueConcurrencyByName.get(qName) ?? 0),
+        0,
+      );
+
+      const stats = statsByWorker.get(w.workerInstanceId) ?? {
         succeeded: 0,
         failed: 0,
         active: 0,
+        lastActivityAt: null,
+        lastError: null,
       };
+
+      const memoryRssMb =
+        w.memoryRssBytes !== null && w.memoryRssBytes !== undefined
+          ? Math.round((Number(w.memoryRssBytes) / (1024 * 1024)) * 100) / 100
+          : null;
 
       return {
         workerInstanceId: w.workerInstanceId,
@@ -476,11 +567,16 @@ export class WorkerHealthService {
         pid: w.pid,
         status: effectiveStatus,
         registeredQueues: orgScopedQueues,
+        orgConfiguredConcurrency,
+        cpuUsagePercent: w.cpuUsagePercent ?? null,
+        memoryRssMb,
+        uptimeSeconds: w.uptimeSeconds ?? null,
         jobsProcessed: stats.succeeded + stats.failed,
         jobsSucceeded: stats.succeeded,
         jobsFailed: stats.failed,
         activeJobs: stats.active,
-        lastError: lastErrorByWorker.get(w.workerInstanceId) ?? null,
+        lastError: stats.lastError,
+        lastActivityAt: stats.lastActivityAt,
         lastHeartbeatAt: w.lastHeartbeatAt,
         startedAt: w.startedAt,
         stoppedAt: w.stoppedAt,

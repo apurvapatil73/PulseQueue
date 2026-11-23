@@ -107,6 +107,17 @@ function formatUtcTimestamp(iso: string): string {
   return new Date(iso).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 }
 
+function formatUptime(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) return '—';
+  if (seconds < 60) return `${seconds}s`;
+  const mins = Math.floor(seconds / 60);
+  if (mins < 60) return `${mins}m ${seconds % 60}s`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ${mins % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h`;
+}
+
 function formatResyncReason(reason: string): string {
   switch (reason) {
     case 'redis_reconnected':
@@ -419,21 +430,46 @@ export function MonitoringPage({ streamOptions }: MonitoringPageProps) {
     },
     {
       key: 'latency',
-      header: 'Avg / p95 Latency',
+      header: 'Exec (Avg / p50 / p95 / p99)',
       align: 'right',
       render: (q) => (
-        <span className="font-mono text-xs tabular-nums text-slate-300">
-          {formatDuration(q.averageDurationMs)} / {formatDuration(q.p95DurationMs)}
+        <span
+          className="font-mono text-xs tabular-nums text-slate-300"
+          title="Execution duration: processing start to completion/failure (percentiles require >= 5 samples)"
+        >
+          {formatDuration(q.averageDurationMs)} / {formatDuration(q.p50DurationMs)} /{' '}
+          {formatDuration(q.p95DurationMs)} / {formatDuration(q.p99DurationMs)}
+        </span>
+      ),
+    },
+    {
+      key: 'queueWait',
+      header: 'Queue Wait (Avg / p95)',
+      align: 'right',
+      render: (q) => (
+        <span
+          className="font-mono text-xs tabular-nums text-slate-300"
+          title="Queue wait time: submission to first processing start (excluding configured delay)"
+        >
+          {formatDuration(q.avgQueueWaitMs)} / {formatDuration(q.p95QueueWaitMs)}
         </span>
       ),
     },
     {
       key: 'dlq',
-      header: 'Retries / Open DLQ',
+      header: 'Retries / DLQ',
       align: 'right',
       render: (q) => (
-        <span className="font-mono text-xs tabular-nums">
+        <span
+          className="font-mono text-xs tabular-nums"
+          title="Retried jobs (attempts > 1) and retry rate vs open Dead Letter Queue records"
+        >
           <span className="text-amber-300">{q.retriedJobs ?? 0}</span>
+          {q.retryRate !== null && q.retryRate !== undefined && (
+            <span className="ml-1 text-[11px] text-slate-500">
+              ({formatRatePercent(q.retryRate)})
+            </span>
+          )}
           <span className="text-slate-500"> / </span>
           {q.openDeadLetters > 0 ? (
             <Link
@@ -489,12 +525,43 @@ export function MonitoringPage({ streamOptions }: MonitoringPageProps) {
     },
     {
       key: 'active',
-      header: 'Active Jobs',
+      header: 'Active / Concurrency',
       align: 'right',
       render: (w) => (
-        <span className="font-mono text-xs tabular-nums text-sky-300">
+        <span
+          className="font-mono text-xs tabular-nums text-sky-300"
+          title="Currently active jobs for this organisation / configured concurrency across this organisation's queues"
+        >
           {w.activeJobs !== undefined ? w.activeJobs : '—'}
+          <span className="text-slate-500"> / </span>
+          <span className="text-slate-300">
+            {w.orgConfiguredConcurrency !== undefined ? w.orgConfiguredConcurrency : '—'}
+          </span>
         </span>
+      ),
+    },
+    {
+      key: 'resources',
+      header: 'CPU / RSS / Uptime',
+      align: 'right',
+      render: (w) => (
+        <div
+          className="text-right font-mono text-xs tabular-nums"
+          title="Process-level worker CPU %, Resident Set Size (MB), and uptime (shows — when unavailable)"
+        >
+          <span className="text-slate-200">
+            {w.cpuUsagePercent !== null && w.cpuUsagePercent !== undefined
+              ? `${w.cpuUsagePercent.toFixed(1)}%`
+              : '—'}
+          </span>
+          <span className="text-slate-500"> · </span>
+          <span className="text-slate-300">
+            {w.memoryRssMb !== null && w.memoryRssMb !== undefined
+              ? `${w.memoryRssMb.toFixed(1)} MB`
+              : '—'}
+          </span>
+          <div className="text-[11px] text-slate-500">{formatUptime(w.uptimeSeconds)}</div>
+        </div>
       ),
     },
     {

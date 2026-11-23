@@ -91,6 +91,14 @@ export class WorkerManager {
     return Array.from(orgIds);
   }
 
+  getConfiguredConcurrency(): number {
+    let total = 0;
+    for (const entry of this.workers.values()) {
+      total += entry.concurrency;
+    }
+    return total;
+  }
+
   getWorker(organisationId: string, queueName: string): RegisteredWorkerEntry | undefined {
     const key = buildBullMQQueueName(organisationId, queueName);
     return this.workers.get(key);

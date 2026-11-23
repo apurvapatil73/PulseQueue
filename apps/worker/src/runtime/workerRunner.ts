@@ -42,6 +42,8 @@ export class WorkerRuntime {
   private syncInFlight = false;
   private heartbeatInFlight = false;
   private isShuttingDown = false;
+  private lastCpuUsage: NodeJS.CpuUsage | null = null;
+  private lastCpuHrTimeNs: bigint | null = null;
 
   constructor(options: WorkerRuntimeOptions = {}) {
     this.manager = options.workerManager ?? new WorkerManager();
@@ -56,7 +58,58 @@ export class WorkerRuntime {
   }
 
   /**
-   * Publishes a heartbeat for this worker instance with its registered queues & orgs.
+   * Collects non-blocking process-level telemetry (CPU %, RSS bytes, uptime, concurrency).
+   * Never throws so telemetry issues cannot interrupt job processing or crash the worker.
+   */
+  collectProcessTelemetry(): {
+    configuredConcurrency: number;
+    cpuUsagePercent: number | null;
+    memoryRssBytes: bigint | null;
+    uptimeSeconds: number | null;
+  } {
+    let cpuUsagePercent: number | null = null;
+    let memoryRssBytes: bigint | null = null;
+    let uptimeSeconds: number | null = null;
+
+    try {
+      const nowHr = process.hrtime.bigint();
+      const curCpu = process.cpuUsage();
+      if (this.lastCpuUsage && this.lastCpuHrTimeNs !== null) {
+        const elapsedUs = Number(nowHr - this.lastCpuHrTimeNs) / 1000;
+        const cpuDeltaUs =
+          curCpu.user - this.lastCpuUsage.user + (curCpu.system - this.lastCpuUsage.system);
+        if (elapsedUs > 0 && cpuDeltaUs >= 0) {
+          cpuUsagePercent = Math.round((cpuDeltaUs / elapsedUs) * 100 * 100) / 100;
+        }
+      }
+      this.lastCpuUsage = curCpu;
+      this.lastCpuHrTimeNs = nowHr;
+    } catch {
+      cpuUsagePercent = null;
+    }
+
+    try {
+      memoryRssBytes = BigInt(process.memoryUsage().rss);
+    } catch {
+      memoryRssBytes = null;
+    }
+
+    try {
+      uptimeSeconds = Math.max(0, Math.floor(process.uptime()));
+    } catch {
+      uptimeSeconds = null;
+    }
+
+    return {
+      configuredConcurrency: this.manager.getConfiguredConcurrency(),
+      cpuUsagePercent,
+      memoryRssBytes,
+      uptimeSeconds,
+    };
+  }
+
+  /**
+   * Publishes a heartbeat for this worker instance with its registered queues, orgs & telemetry.
    */
   async publishHeartbeat(): Promise<void> {
     if (this.heartbeatInFlight || this.isShuttingDown) {
@@ -66,8 +119,10 @@ export class WorkerRuntime {
     this.heartbeatInFlight = true;
     try {
       const identity = this.manager.getWorkerIdentity();
+      const telemetry = this.collectProcessTelemetry();
       await workerHealthService.recordHeartbeat({
         ...identity,
+        ...telemetry,
         registeredQueues: this.manager.listRegisteredWorkers(),
         organisationIds: this.manager.listRegisteredOrganisationIds(),
       });
@@ -137,9 +192,11 @@ export class WorkerRuntime {
     const discovered = await this.syncQueuesFromDatabase();
     await this.manager.waitUntilReady();
 
-    // Register initial ONLINE worker heartbeat + WORKER_STARTED event
+    // Register initial ONLINE worker heartbeat + WORKER_STARTED event with initial telemetry
+    const initialTelemetry = this.collectProcessTelemetry();
     await workerHealthService.registerWorkerStart({
       ...identity,
+      ...initialTelemetry,
       registeredQueues: this.manager.listRegisteredWorkers(),
       organisationIds: this.manager.listRegisteredOrganisationIds(),
     });

@@ -9,6 +9,7 @@ import {
   sanitizeRealtimeMetadata,
   type RealtimePlatformEvent,
 } from './realtime.service.js';
+import { metricsService } from './metrics.service.js';
 
 export interface RecordEventInput {
   type: PlatformEventType;
@@ -125,6 +126,11 @@ export class EventService {
           metadata,
         },
       });
+
+      // Invalidate short-TTL organisation metrics cache on operational events
+      if (created.organisationId) {
+        metricsService.invalidateOrganisation(created.organisationId);
+      }
 
       // Best-effort publish to Redis Pub/Sub for real-time SSE fan-out (never throws)
       const realtimePayload = toRealtimePlatformEvent(created);
