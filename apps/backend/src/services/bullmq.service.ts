@@ -428,6 +428,35 @@ export class BullMQService {
   }
 
   /**
+   * Inspects the current BullMQ state of a job in Redis (used by stalled-job reconciliation).
+   * Returns `null` if the job is absent from Redis, or `'unknown'` if Redis is unreachable.
+   */
+  async getBullJobState(
+    persistedQueue: PersistedQueueDescriptor,
+    jobId: string,
+  ): Promise<string | null> {
+    try {
+      const connection = this.getConnectionFn();
+      await this.ensureReadyFn(connection);
+      const { queue } = this.getOrRegisterQueue(persistedQueue);
+
+      const bullJob = await queue.getJob(jobId);
+      if (!bullJob) {
+        return null;
+      }
+
+      return await bullJob.getState();
+    } catch (err) {
+      logger.warn('Failed to inspect BullMQ job state', {
+        jobId,
+        organisationId: persistedQueue.organisationId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return 'unknown';
+    }
+  }
+
+  /**
    * Best-effort removal of a cancelled pre-execution job from BullMQ.
    */
   async removeJobFromBullMQ(

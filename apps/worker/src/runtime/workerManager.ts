@@ -1,11 +1,16 @@
+import crypto from 'node:crypto';
+import os from 'node:os';
 import { Worker, UnrecoverableError, type ConnectionOptions, type Job as BullJob } from 'bullmq';
+import { PlatformEventType } from '@prisma/client';
 import {
   buildBullMQQueueName,
   buildBullMQRedisOptions,
   env,
+  eventService,
   jobService,
   logger,
   sanitizeRedisUrl,
+  workerHealthService,
   type BullMQJobPayload,
   type JobService,
   type PersistedQueueDescriptor,
@@ -28,6 +33,7 @@ export interface RegisteredWorkerEntry {
 }
 
 export interface WorkerManagerOptions {
+  workerInstanceId?: string;
   registry?: ProcessorRegistry;
   jobService?: JobService;
   redisUrl?: string;
@@ -35,28 +41,38 @@ export interface WorkerManagerOptions {
 
 /**
  * Manages BullMQ Worker instances for organisation-scoped queues within a worker process.
- *
- * Guarantees:
- * - Prevents duplicate worker registration for the same org + queue in a process.
- * - Maps persisted queue `concurrency` into BullMQ Worker options.
- * - Each Worker receives its own blocking Redis connection built from REDIS_URL
- *   with `maxRetriesPerRequest: null` (as required by BullMQ).
- * - Synchronizes PostgreSQL job status atomically via `jobService` without ever
- *   overwriting terminal states (`COMPLETED` / `FAILED`) or crashing on deleted jobs.
- * - Keeps PostgreSQL accurate across retries: marks retrying jobs `DELAYED` and only
- *   marks permanently `FAILED` once all BullMQ attempts are exhausted or unrecoverable.
  */
 export class WorkerManager {
   private readonly workers = new Map<string, RegisteredWorkerEntry>();
+  private readonly workerInstanceId: string;
+  private readonly hostname: string;
+  private readonly pid: number;
   private readonly registry: ProcessorRegistry;
   private readonly jobs: JobService;
   private readonly redisUrl: string;
   private isClosing = false;
 
   constructor(options: WorkerManagerOptions = {}) {
+    this.hostname = os.hostname();
+    this.pid = process.pid;
+    this.workerInstanceId =
+      options.workerInstanceId ??
+      `worker-${this.hostname}-${this.pid}-${crypto.randomUUID().slice(0, 8)}`;
     this.registry = options.registry ?? createDefaultProcessorRegistry();
     this.jobs = options.jobService ?? jobService;
     this.redisUrl = options.redisUrl ?? env.REDIS_URL;
+  }
+
+  getWorkerInstanceId(): string {
+    return this.workerInstanceId;
+  }
+
+  getWorkerIdentity(): { workerInstanceId: string; hostname: string; pid: number } {
+    return {
+      workerInstanceId: this.workerInstanceId,
+      hostname: this.hostname,
+      pid: this.pid,
+    };
   }
 
   getProcessorRegistry(): ProcessorRegistry {
@@ -65,6 +81,14 @@ export class WorkerManager {
 
   listRegisteredWorkers(): string[] {
     return Array.from(this.workers.keys());
+  }
+
+  listRegisteredOrganisationIds(): string[] {
+    const orgIds = new Set<string>();
+    for (const entry of this.workers.values()) {
+      orgIds.add(entry.organisationId);
+    }
+    return Array.from(orgIds);
   }
 
   getWorker(organisationId: string, queueName: string): RegisteredWorkerEntry | undefined {
@@ -88,11 +112,11 @@ export class WorkerManager {
 
     const existing = this.workers.get(bullmqQueueName);
     if (existing) {
-      // Update runtime concurrency if changed in PostgreSQL
       if (existing.concurrency !== persistedQueue.concurrency) {
         existing.worker.concurrency = persistedQueue.concurrency;
         existing.concurrency = persistedQueue.concurrency;
         logger.info('Updated worker concurrency', {
+          workerInstanceId: this.workerInstanceId,
           bullmqQueueName,
           organisationId: persistedQueue.organisationId,
           concurrency: persistedQueue.concurrency,
@@ -101,10 +125,7 @@ export class WorkerManager {
       return existing;
     }
 
-    // BullMQ Workers require blocking commands; pass parsed RedisOptions so BullMQ
-    // owns a dedicated connection per worker and closes it cleanly on worker.close()
     const connectionOptions = buildBullMQRedisOptions(this.redisUrl);
-    // Workers connect immediately on startup
     connectionOptions.lazyConnect = false;
 
     const worker = new Worker<BullMQJobPayload, ProcessorResult | null>(
@@ -118,6 +139,7 @@ export class WorkerManager {
 
     worker.on('error', (err) => {
       logger.error('BullMQ Worker connection/runtime error', {
+        workerInstanceId: this.workerInstanceId,
         bullmqQueueName,
         organisationId: persistedQueue.organisationId,
         target: sanitizeRedisUrl(this.redisUrl),
@@ -125,8 +147,29 @@ export class WorkerManager {
       });
     });
 
+    worker.on('stalled', (stalledJobId) => {
+      logger.warn('BullMQ detected stalled job', {
+        workerInstanceId: this.workerInstanceId,
+        bullmqQueueName,
+        organisationId: persistedQueue.organisationId,
+        queueId: persistedQueue.id,
+        jobId: stalledJobId,
+      });
+
+      void eventService.record({
+        type: PlatformEventType.JOB_STALLED,
+        organisationId: persistedQueue.organisationId,
+        queueId: persistedQueue.id,
+        jobId: stalledJobId,
+        workerId: this.workerInstanceId,
+        message: `BullMQ detected stalled job ${stalledJobId} on queue "${persistedQueue.name}"`,
+        metadata: { bullmqQueueName, source: 'bullmq_stalled_event' },
+      });
+    });
+
     worker.on('failed', (bullJob, err) => {
       logger.warn('BullMQ Worker reported failed attempt', {
+        workerInstanceId: this.workerInstanceId,
         bullmqQueueName,
         organisationId: persistedQueue.organisationId,
         jobId: bullJob?.data?.jobId ?? bullJob?.id,
@@ -148,6 +191,7 @@ export class WorkerManager {
     this.workers.set(bullmqQueueName, entry);
 
     logger.info('Worker registered for organisation queue', {
+      workerInstanceId: this.workerInstanceId,
       bullmqQueueName,
       organisationId: persistedQueue.organisationId,
       queueId: persistedQueue.id,
@@ -160,8 +204,6 @@ export class WorkerManager {
 
   /**
    * Core job execution handler invoked by BullMQ.
-   * Handles atomic PostgreSQL activation, processor execution, retry vs terminal failure
-   * synchronisation, and safe handling of missing/deleted/already-terminal jobs.
    */
   private async processBullJob(
     persistedQueue: PersistedQueueDescriptor,
@@ -175,15 +217,16 @@ export class WorkerManager {
 
     if (!jobId) {
       logger.warn('Received BullMQ job without stable jobId; skipping', {
+        workerInstanceId: this.workerInstanceId,
         organisationId,
         queueId: persistedQueue.id,
       });
       return null;
     }
 
-    // Enforce tenant isolation: reject mismatched organisation payload
     if (organisationId !== persistedQueue.organisationId) {
       logger.error('Tenant mismatch between BullMQ worker queue and job payload; aborting', {
+        workerInstanceId: this.workerInstanceId,
         jobId,
         expectedOrganisationId: persistedQueue.organisationId,
         payloadOrganisationId: organisationId,
@@ -192,10 +235,16 @@ export class WorkerManager {
     }
 
     // 1. Atomically claim job as ACTIVE in PostgreSQL
-    const activation = await this.jobs.markJobActive(organisationId, jobId, attemptNumber);
+    const activation = await this.jobs.markJobActive(
+      organisationId,
+      jobId,
+      attemptNumber,
+      this.workerInstanceId,
+    );
 
     if (activation.outcome === 'missing') {
       logger.warn('PostgreSQL job missing or cancelled before execution; skipping', {
+        workerInstanceId: this.workerInstanceId,
         jobId,
         organisationId,
         queueId: persistedQueue.id,
@@ -205,6 +254,7 @@ export class WorkerManager {
 
     if (activation.outcome === 'already_terminal') {
       logger.warn('Ignoring duplicate delivery for job already in terminal state', {
+        workerInstanceId: this.workerInstanceId,
         jobId,
         organisationId,
         terminalStatus: activation.status,
@@ -214,6 +264,7 @@ export class WorkerManager {
 
     if (activation.outcome === 'already_active') {
       logger.warn('Job is already ACTIVE in PostgreSQL; skipping concurrent duplicate delivery', {
+        workerInstanceId: this.workerInstanceId,
         jobId,
         organisationId,
       });
@@ -221,6 +272,7 @@ export class WorkerManager {
     }
 
     logger.info('Job processing started', {
+      workerInstanceId: this.workerInstanceId,
       jobId,
       organisationId,
       queueId: persistedQueue.id,
@@ -229,6 +281,8 @@ export class WorkerManager {
       attemptNumber,
       maxAttempts,
     });
+
+    const execStartedAt = Date.now();
 
     // 2. Execute decoupled processor (never log raw user payload contents)
     try {
@@ -243,7 +297,6 @@ export class WorkerManager {
         maxAttempts,
       });
 
-      // 3a. Persist COMPLETED state + structured result atomically
       const sync = await this.jobs.markJobCompleted(
         organisationId,
         jobId,
@@ -253,9 +306,16 @@ export class WorkerManager {
           durationMs: procResult.durationMs,
         },
         attemptNumber,
+        {
+          durationMs: procResult.durationMs,
+          workerId: this.workerInstanceId,
+        },
       );
 
+      await workerHealthService.recordJobOutcome(this.workerInstanceId, 'succeeded');
+
       logger.info('Job completed', {
+        workerInstanceId: this.workerInstanceId,
         jobId,
         organisationId,
         queueId: persistedQueue.id,
@@ -268,16 +328,19 @@ export class WorkerManager {
 
       return procResult;
     } catch (err) {
+      const durationMs = Math.max(0, Date.now() - execStartedAt);
       const errorMessage = err instanceof Error ? err.message : String(err);
       const isNonRetryable =
         err instanceof InvalidJobPayloadError || err instanceof UnregisteredProcessorError;
       const hasRemainingAttempts = !isNonRetryable && attemptNumber < maxAttempts;
 
       if (hasRemainingAttempts) {
-        // 3b. Retry will be scheduled by BullMQ — mark PG as DELAYED (NOT FAILED!)
-        await this.jobs.markJobRetryScheduled(organisationId, jobId, errorMessage, attemptNumber);
+        await this.jobs.markJobRetryScheduled(organisationId, jobId, errorMessage, attemptNumber, {
+          workerId: this.workerInstanceId,
+        });
 
         logger.warn('Job attempt failed; BullMQ retry scheduled', {
+          workerInstanceId: this.workerInstanceId,
           jobId,
           organisationId,
           queueId: persistedQueue.id,
@@ -287,14 +350,20 @@ export class WorkerManager {
           error: errorMessage,
         });
 
-        // Rethrow so BullMQ applies configured exponential backoff & schedules next attempt
         throw err;
       }
 
-      // 3c. Attempts exhausted or non-retryable error — mark permanently FAILED in PostgreSQL
-      await this.jobs.markJobFailed(organisationId, jobId, errorMessage, attemptNumber);
+      // Exhausted retries or non-retryable error -> mark FAILED + idempotently route to DLQ
+      await this.jobs.markJobFailed(organisationId, jobId, errorMessage, attemptNumber, {
+        durationMs,
+        workerId: this.workerInstanceId,
+        routeToDlq: true,
+      });
+
+      await workerHealthService.recordJobOutcome(this.workerInstanceId, 'failed', errorMessage);
 
       logger.error('Job permanently failed', {
+        workerInstanceId: this.workerInstanceId,
         jobId,
         organisationId,
         queueId: persistedQueue.id,
@@ -313,18 +382,12 @@ export class WorkerManager {
     }
   }
 
-  /**
-   * Waits until all registered workers have established their Redis connections.
-   */
   async waitUntilReady(): Promise<void> {
     await Promise.all(
       Array.from(this.workers.values()).map((entry) => entry.worker.waitUntilReady()),
     );
   }
 
-  /**
-   * Unregisters and gracefully closes a single worker.
-   */
   async unregisterWorker(organisationId: string, queueName: string): Promise<void> {
     const key = buildBullMQQueueName(organisationId, queueName);
     const entry = this.workers.get(key);
@@ -336,20 +399,19 @@ export class WorkerManager {
     try {
       await entry.worker.close();
       logger.info('Worker unregistered and closed', {
+        workerInstanceId: this.workerInstanceId,
         bullmqQueueName: key,
         organisationId,
       });
     } catch (err) {
       logger.warn('Error closing worker during unregister', {
+        workerInstanceId: this.workerInstanceId,
         bullmqQueueName: key,
         error: err instanceof Error ? err.message : String(err),
       });
     }
   }
 
-  /**
-   * Gracefully closes all active BullMQ workers, allowing in-flight jobs to finish.
-   */
   async closeAll(): Promise<void> {
     this.isClosing = true;
     const entries = Array.from(this.workers.values());
@@ -361,6 +423,7 @@ export class WorkerManager {
           await entry.worker.close();
         } catch (err) {
           logger.warn('Error closing BullMQ worker during shutdown', {
+            workerInstanceId: this.workerInstanceId,
             bullmqQueueName: entry.bullmqQueueName,
             error: err instanceof Error ? err.message : String(err),
           });
@@ -368,7 +431,10 @@ export class WorkerManager {
       }),
     );
 
-    logger.info('All BullMQ workers closed cleanly', { closedWorkers: entries.length });
+    logger.info('All BullMQ workers closed cleanly', {
+      workerInstanceId: this.workerInstanceId,
+      closedWorkers: entries.length,
+    });
     this.isClosing = false;
   }
 }

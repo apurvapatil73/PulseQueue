@@ -5,6 +5,7 @@ import orgRoutes from './organisation.routes.js';
 import invitationRoutes from './invitation.routes.js';
 import queueRoutes from './queue.routes.js';
 import { queueJobRoutes, orgJobRoutes } from './job.routes.js';
+import { dlqRoutes, monitoringRoutes } from './monitoring.routes.js';
 
 const router = Router();
 
@@ -22,6 +23,12 @@ router.use('/api/v1/organisations/:organisationId/queues', queueRoutes);
 
 // Organisation-scoped job lookup & cancellation endpoints
 router.use('/api/v1/organisations/:organisationId/jobs', orgJobRoutes);
+
+// Organisation-scoped Dead-Letter Queue (DLQ) endpoints
+router.use('/api/v1/organisations/:organisationId/dlq', dlqRoutes);
+
+// Organisation-scoped Monitoring, Metrics, Worker Health & Events endpoints
+router.use('/api/v1/organisations/:organisationId/monitoring', monitoringRoutes);
 
 // Organisation management endpoints
 router.use('/api/v1/organisations', orgRoutes);

@@ -1,4 +1,4 @@
-import { JobStatus, OutboxStatus, Prisma } from '@prisma/client';
+import { JobStatus, OutboxStatus, PlatformEventType, Prisma } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { ConflictError, NotFoundError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
@@ -15,6 +15,8 @@ import {
   type EnqueueResult,
   type PersistedQueueDescriptor,
 } from './bullmq.service.js';
+import { deadLetterService } from './dlq.service.js';
+import { eventService } from './event.service.js';
 
 export interface JobView {
   id: string;
@@ -29,11 +31,16 @@ export interface JobView {
   backoffMs: number;
   delayMs: number;
   attemptsMade: number;
+  stalledCount: number;
+  durationMs: number | null;
+  lastWorkerId: string | null;
+  replayedFromDlqId: string | null;
   result: Prisma.JsonValue | null;
   errorMessage: string | null;
   startedAt: Date | null;
   completedAt: Date | null;
   failedAt: Date | null;
+  lastRecoveredAt: Date | null;
   createdBy: {
     id: string;
     name: string;
@@ -123,11 +130,16 @@ function toJobView(j: JobWithMeta): JobView {
     backoffMs: j.backoffMs,
     delayMs: j.delayMs,
     attemptsMade: j.attemptsMade,
+    stalledCount: j.stalledCount,
+    durationMs: j.durationMs,
+    lastWorkerId: j.lastWorkerId,
+    replayedFromDlqId: j.replayedFromDlqId,
     result: j.result,
     errorMessage: j.errorMessage,
     startedAt: j.startedAt,
     completedAt: j.completedAt,
     failedAt: j.failedAt,
+    lastRecoveredAt: j.lastRecoveredAt,
     createdBy: j.createdBy,
     createdAt: j.createdAt,
     updatedAt: j.updatedAt,
@@ -251,6 +263,21 @@ export class JobService {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+
+    await eventService.record({
+      type: PlatformEventType.JOB_SUBMITTED,
+      organisationId: orgId,
+      queueId: createdJob.queueId,
+      jobId: createdJob.id,
+      message: `Job "${createdJob.name}" submitted to queue "${persistedQueue.name}"`,
+      metadata: {
+        queueName: persistedQueue.name,
+        status: createdJob.status,
+        priority: createdJob.priority,
+        delayMs: createdJob.delayMs,
+        enqueued: dispatch.enqueued,
+      },
+    });
 
     return {
       job: toJobView(createdJob),
@@ -512,12 +539,13 @@ export class JobService {
     orgId: string,
     jobId: string,
     attemptNumber: number,
+    workerId?: string,
   ): Promise<WorkerActivationOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
       return { outcome: 'missing' };
     }
 
-    return db.$transaction(
+    const activation = await db.$transaction(
       async (tx) => {
         const existing = await tx.job.findFirst({
           where: {
@@ -558,6 +586,7 @@ export class JobService {
             status: JobStatus.ACTIVE,
             startedAt: new Date(),
             attemptsMade: Math.max(1, attemptNumber),
+            ...(workerId ? { lastWorkerId: workerId } : {}),
           },
         });
 
@@ -586,10 +615,24 @@ export class JobService {
       },
       { maxWait: 10_000, timeout: 10_000 },
     );
+
+    if (activation.outcome === 'activated') {
+      await eventService.record({
+        type: PlatformEventType.JOB_STARTED,
+        organisationId: orgId,
+        queueId: activation.job.queueId,
+        jobId: activation.job.id,
+        workerId: workerId ?? null,
+        message: `Job "${activation.job.name}" started (attempt ${attemptNumber})`,
+        metadata: { attemptNumber, queueName: activation.job.queueName },
+      });
+    }
+
+    return activation;
   }
 
   /**
-   * Atomically marks an ACTIVE job COMPLETED and persists structured result & timestamp.
+   * Atomically marks an ACTIVE job COMPLETED and persists structured result, duration & timestamp.
    * Never overwrites a job that has already reached a terminal state.
    */
   async markJobCompleted(
@@ -597,6 +640,7 @@ export class JobService {
     jobId: string,
     result: Prisma.InputJsonValue,
     attemptNumber: number,
+    options?: { durationMs?: number; workerId?: string },
   ): Promise<WorkerSyncOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
       return { outcome: 'missing' };
@@ -616,6 +660,10 @@ export class JobService {
         errorMessage: null,
         completedAt: new Date(),
         attemptsMade: Math.max(1, attemptNumber),
+        ...(options?.durationMs !== undefined
+          ? { durationMs: Math.max(0, options.durationMs) }
+          : {}),
+        ...(options?.workerId ? { lastWorkerId: options.workerId } : {}),
       },
     });
 
@@ -634,6 +682,20 @@ export class JobService {
       }
       return { outcome: 'not_active', status: job.status };
     }
+
+    await eventService.record({
+      type: PlatformEventType.JOB_COMPLETED,
+      organisationId: orgId,
+      queueId: job.queueId,
+      jobId: job.id,
+      workerId: options?.workerId ?? null,
+      message: `Job "${job.name}" completed on attempt ${attemptNumber}`,
+      metadata: {
+        attemptNumber,
+        durationMs: options?.durationMs ?? null,
+        queueName: job.queue.name,
+      },
+    });
 
     return { outcome: 'updated', job: toJobView(job) };
   }
@@ -647,12 +709,14 @@ export class JobService {
     jobId: string,
     errorMessage: string,
     attemptNumber: number,
+    options?: { workerId?: string },
   ): Promise<WorkerSyncOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
       return { outcome: 'missing' };
     }
 
     assertValidJobTransition(JobStatus.ACTIVE, JobStatus.DELAYED);
+    const sanitizedError = sanitizeErrorMessage(errorMessage);
 
     const updatedCount = await db.job.updateMany({
       where: {
@@ -662,8 +726,9 @@ export class JobService {
       },
       data: {
         status: JobStatus.DELAYED,
-        errorMessage: sanitizeErrorMessage(errorMessage),
+        errorMessage: sanitizedError,
         attemptsMade: Math.max(1, attemptNumber),
+        ...(options?.workerId ? { lastWorkerId: options.workerId } : {}),
       },
     });
 
@@ -683,24 +748,41 @@ export class JobService {
       return { outcome: 'not_active', status: job.status };
     }
 
+    await eventService.record({
+      type: PlatformEventType.JOB_RETRIED,
+      organisationId: orgId,
+      queueId: job.queueId,
+      jobId: job.id,
+      workerId: options?.workerId ?? null,
+      message: `Job "${job.name}" failed attempt ${attemptNumber}; retry scheduled`,
+      metadata: {
+        attemptNumber,
+        error: sanitizedError,
+        queueName: job.queue.name,
+      },
+    });
+
     return { outcome: 'updated', job: toJobView(job) };
   }
 
   /**
    * Atomically marks an ACTIVE job permanently FAILED once all BullMQ retry attempts
-   * are exhausted (or an unrecoverable error occurs).
+   * are exhausted (or an unrecoverable error occurs), and routes it idempotently to DLQ.
    */
   async markJobFailed(
     orgId: string,
     jobId: string,
     errorMessage: string,
     attemptNumber: number,
+    options?: { durationMs?: number; workerId?: string; routeToDlq?: boolean },
   ): Promise<WorkerSyncOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
       return { outcome: 'missing' };
     }
 
     assertValidJobTransition(JobStatus.ACTIVE, JobStatus.FAILED);
+    const sanitizedError = sanitizeErrorMessage(errorMessage);
+    const failedAt = new Date();
 
     const updatedCount = await db.job.updateMany({
       where: {
@@ -710,9 +792,13 @@ export class JobService {
       },
       data: {
         status: JobStatus.FAILED,
-        errorMessage: sanitizeErrorMessage(errorMessage),
-        failedAt: new Date(),
+        errorMessage: sanitizedError,
+        failedAt,
         attemptsMade: Math.max(1, attemptNumber),
+        ...(options?.durationMs !== undefined
+          ? { durationMs: Math.max(0, options.durationMs) }
+          : {}),
+        ...(options?.workerId ? { lastWorkerId: options.workerId } : {}),
       },
     });
 
@@ -730,6 +816,38 @@ export class JobService {
         return { outcome: 'already_terminal', status: job.status };
       }
       return { outcome: 'not_active', status: job.status };
+    }
+
+    await eventService.record({
+      type: PlatformEventType.JOB_FAILED,
+      organisationId: orgId,
+      queueId: job.queueId,
+      jobId: job.id,
+      workerId: options?.workerId ?? null,
+      message: `Job "${job.name}" permanently failed on attempt ${attemptNumber}`,
+      metadata: {
+        attemptNumber,
+        durationMs: options?.durationMs ?? null,
+        error: sanitizedError,
+        queueName: job.queue.name,
+      },
+    });
+
+    // Route permanently failed job into DLQ idempotently (unless explicitly disabled)
+    if (options?.routeToDlq !== false) {
+      await deadLetterService.recordDeadLetter({
+        originalJobId: job.id,
+        organisationId: orgId,
+        queueId: job.queueId,
+        queueName: job.queue.name,
+        jobName: job.name,
+        payload: job.payload,
+        failureReason: sanitizedError,
+        attemptsMade: job.attemptsMade,
+        maxRetries: job.maxRetries,
+        failedAt: job.failedAt ?? failedAt,
+        workerId: options?.workerId,
+      });
     }
 
     return { outcome: 'updated', job: toJobView(job) };

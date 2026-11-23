@@ -8,6 +8,8 @@ import {
   logger,
   outboxReconciler,
   prisma,
+  stalledJobRecoveryService,
+  workerHealthService,
   type PersistedQueueDescriptor,
 } from '@pulsequeue/backend';
 import { WorkerManager } from './workerManager.js';
@@ -15,30 +17,65 @@ import { WorkerManager } from './workerManager.js';
 export interface WorkerRuntimeOptions {
   queueSyncIntervalMs?: number;
   outboxIntervalMs?: number;
+  heartbeatIntervalMs?: number;
+  stalledRecoveryIntervalMs?: number;
   workerManager?: WorkerManager;
 }
 
 /**
  * Standalone worker process runtime.
  * Discovers persisted organisation queues from PostgreSQL, registers deduplicated
- * BullMQ workers, runs controlled outbox reconciliation, and supports graceful shutdown.
+ * BullMQ workers, publishes periodic heartbeats, runs outbox reconciliation &
+ * stalled-job recovery, and shuts down gracefully.
  */
 export class WorkerRuntime {
   private readonly manager: WorkerManager;
   private readonly queueSyncIntervalMs: number;
   private readonly outboxIntervalMs: number;
+  private readonly heartbeatIntervalMs: number;
+  private readonly stalledRecoveryIntervalMs: number;
   private syncTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
   private syncInFlight = false;
+  private heartbeatInFlight = false;
   private isShuttingDown = false;
 
   constructor(options: WorkerRuntimeOptions = {}) {
     this.manager = options.workerManager ?? new WorkerManager();
     this.queueSyncIntervalMs = options.queueSyncIntervalMs ?? 10_000;
     this.outboxIntervalMs = options.outboxIntervalMs ?? 5_000;
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5_000;
+    this.stalledRecoveryIntervalMs = options.stalledRecoveryIntervalMs ?? 15_000;
   }
 
   getWorkerManager(): WorkerManager {
     return this.manager;
+  }
+
+  /**
+   * Publishes a heartbeat for this worker instance with its registered queues & orgs.
+   */
+  async publishHeartbeat(): Promise<void> {
+    if (this.heartbeatInFlight || this.isShuttingDown) {
+      return;
+    }
+
+    this.heartbeatInFlight = true;
+    try {
+      const identity = this.manager.getWorkerIdentity();
+      await workerHealthService.recordHeartbeat({
+        ...identity,
+        registeredQueues: this.manager.listRegisteredWorkers(),
+        organisationIds: this.manager.listRegisteredOrganisationIds(),
+      });
+    } catch (err) {
+      logger.warn('Failed to publish worker heartbeat', {
+        workerInstanceId: this.manager.getWorkerInstanceId(),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.heartbeatInFlight = false;
+    }
   }
 
   /**
@@ -71,6 +108,7 @@ export class WorkerRuntime {
       return queues.length;
     } catch (err) {
       logger.error('Failed to synchronize persisted queues for worker runtime', {
+        workerInstanceId: this.manager.getWorkerInstanceId(),
         error: err instanceof Error ? err.message : String(err),
       });
       return 0;
@@ -80,7 +118,11 @@ export class WorkerRuntime {
   }
 
   async start(): Promise<void> {
+    const identity = this.manager.getWorkerIdentity();
+
     logger.info(`Starting PulseQueue Worker Runtime in [${env.NODE_ENV}] mode...`, {
+      workerInstanceId: identity.workerInstanceId,
+      pid: identity.pid,
       processors: this.manager.getProcessorRegistry().list(),
     });
 
@@ -92,9 +134,22 @@ export class WorkerRuntime {
     const discovered = await this.syncQueuesFromDatabase();
     await this.manager.waitUntilReady();
 
-    // Run one immediate reconciliation pass and start controlled interval reconciliation
+    // Register initial ONLINE worker heartbeat + WORKER_STARTED event
+    await workerHealthService.registerWorkerStart({
+      ...identity,
+      registeredQueues: this.manager.listRegisteredWorkers(),
+      organisationIds: this.manager.listRegisteredOrganisationIds(),
+    });
+
+    // Run one immediate outbox reconciliation pass and start controlled intervals
     await outboxReconciler.reconcileOnce();
     outboxReconciler.start(this.outboxIntervalMs);
+    stalledJobRecoveryService.start(this.stalledRecoveryIntervalMs);
+
+    this.heartbeatTimer = setInterval(() => {
+      void this.publishHeartbeat();
+    }, this.heartbeatIntervalMs);
+    this.heartbeatTimer.unref();
 
     this.syncTimer = setInterval(() => {
       void this.syncQueuesFromDatabase();
@@ -102,10 +157,12 @@ export class WorkerRuntime {
     this.syncTimer.unref();
 
     logger.info('PulseQueue Worker Runtime started', {
+      workerInstanceId: identity.workerInstanceId,
       registeredWorkers: this.manager.listRegisteredWorkers().length,
       discoveredQueues: discovered,
       queueSyncIntervalMs: this.queueSyncIntervalMs,
       outboxIntervalMs: this.outboxIntervalMs,
+      heartbeatIntervalMs: this.heartbeatIntervalMs,
     });
   }
 
@@ -115,20 +172,40 @@ export class WorkerRuntime {
     }
     this.isShuttingDown = true;
 
-    logger.info(`Worker runtime received ${signal}. Initiating graceful shutdown...`);
+    const workerId = this.manager.getWorkerInstanceId();
+    logger.info(`Worker runtime received ${signal}. Initiating graceful shutdown...`, {
+      workerInstanceId: workerId,
+    });
 
     if (this.syncTimer) {
       clearInterval(this.syncTimer);
       this.syncTimer = null;
     }
 
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+
     outboxReconciler.stop();
+    stalledJobRecoveryService.stop();
     await this.manager.closeAll();
+
+    // Record graceful STOPPED state before closing PostgreSQL
+    try {
+      await workerHealthService.markWorkerStopped(workerId, `Graceful shutdown (${signal})`);
+    } catch (err) {
+      logger.warn('Failed to mark worker stopped in database', {
+        workerInstanceId: workerId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     await bullMQService.closeAll();
     await disconnectDatabase();
     await disconnectRedis();
 
-    logger.info('PulseQueue Worker Runtime shutdown complete.');
+    logger.info('PulseQueue Worker Runtime shutdown complete.', { workerInstanceId: workerId });
   }
 }
 

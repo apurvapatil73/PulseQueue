@@ -35,6 +35,33 @@ enum OutboxStatus {
   CANCELLED
 }
 
+enum DeadLetterStatus {
+  OPEN
+  REPLAYED
+}
+
+enum WorkerHealthStatus {
+  ONLINE
+  DEGRADED
+  STALE
+  STOPPED
+}
+
+enum PlatformEventType {
+  JOB_SUBMITTED
+  JOB_STARTED
+  JOB_COMPLETED
+  JOB_FAILED
+  JOB_RETRIED
+  JOB_STALLED
+  JOB_RECOVERED
+  JOB_MOVED_TO_DLQ
+  JOB_REPLAYED
+  WORKER_STARTED
+  WORKER_STOPPED
+  WORKER_HEARTBEAT_STALE
+}
+
 model User {
   id           String         @id @default(uuid()) @db.Uuid
   name         String
@@ -74,9 +101,10 @@ model Organisation {
   createdAt   DateTime     @default(now()) @map("created_at")
   updatedAt   DateTime     @updatedAt @map("updated_at")
 
-  memberships Membership[]
-  invitations Invitation[]
-  queues      Queue[]
+  memberships    Membership[]
+  invitations    Invitation[]
+  queues         Queue[]
+  deadLetterJobs DeadLetterJob[]
 
   @@map("organisations")
 }
@@ -134,9 +162,10 @@ model Queue {
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
 
-  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
-  createdBy    User?        @relation("CreatedQueues", fields: [createdById], references: [id], onDelete: SetNull)
-  jobs         Job[]
+  organisation   Organisation    @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  createdBy      User?           @relation("CreatedQueues", fields: [createdById], references: [id], onDelete: SetNull)
+  jobs           Job[]
+  deadLetterJobs DeadLetterJob[]
 
   @@unique([organisationId, name])
   @@index([organisationId])
@@ -145,35 +174,109 @@ model Queue {
 }
 
 model Job {
-  id           String    @id @default(uuid()) @db.Uuid
-  queueId      String    @map("queue_id") @db.Uuid
-  name         String
-  status       JobStatus @default(PENDING)
-  priority     Int       @default(5)
-  payload      Json      @default("{}") @db.JsonB
-  maxRetries   Int       @default(3) @map("max_retries")
-  backoffMs    Int       @default(1000) @map("backoff_ms")
-  delayMs      Int       @default(0) @map("delay_ms")
-  attemptsMade Int       @default(0) @map("attempts_made")
-  result       Json?     @db.JsonB
-  errorMessage String?   @map("error_message")
-  startedAt    DateTime? @map("started_at")
-  completedAt  DateTime? @map("completed_at")
-  failedAt     DateTime? @map("failed_at")
-  createdById  String?   @map("created_by_id") @db.Uuid
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime  @updatedAt @map("updated_at")
+  id                String    @id @default(uuid()) @db.Uuid
+  queueId           String    @map("queue_id") @db.Uuid
+  name              String
+  status            JobStatus @default(PENDING)
+  priority          Int       @default(5)
+  payload           Json      @default("{}") @db.JsonB
+  maxRetries        Int       @default(3) @map("max_retries")
+  backoffMs         Int       @default(1000) @map("backoff_ms")
+  delayMs           Int       @default(0) @map("delay_ms")
+  attemptsMade      Int       @default(0) @map("attempts_made")
+  stalledCount      Int       @default(0) @map("stalled_count")
+  durationMs        Int?      @map("duration_ms")
+  lastWorkerId      String?   @map("last_worker_id")
+  replayedFromDlqId String?   @map("replayed_from_dlq_id") @db.Uuid
+  result            Json?     @db.JsonB
+  errorMessage      String?   @map("error_message")
+  startedAt         DateTime? @map("started_at")
+  completedAt       DateTime? @map("completed_at")
+  failedAt          DateTime? @map("failed_at")
+  lastRecoveredAt   DateTime? @map("last_recovered_at")
+  createdById       String?   @map("created_by_id") @db.Uuid
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
 
-  queue          Queue              @relation(fields: [queueId], references: [id], onDelete: Cascade)
-  createdBy      User?              @relation("CreatedJobs", fields: [createdById], references: [id], onDelete: SetNull)
-  dispatchOutbox JobDispatchOutbox?
+  queue            Queue              @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  createdBy        User?              @relation("CreatedJobs", fields: [createdById], references: [id], onDelete: SetNull)
+  dispatchOutbox   JobDispatchOutbox?
+  deadLetterRecord DeadLetterJob?     @relation("OriginalDeadLetter")
 
   @@index([queueId])
   @@index([queueId, status, createdAt])
   @@index([status])
+  @@index([status, startedAt])
   @@index([priority])
   @@index([createdAt])
   @@map("jobs")
+}
+
+model DeadLetterJob {
+  id             String           @id @default(uuid()) @db.Uuid
+  originalJobId  String           @unique @map("original_job_id") @db.Uuid
+  organisationId String           @map("organisation_id") @db.Uuid
+  queueId        String           @map("queue_id") @db.Uuid
+  queueName      String           @map("queue_name")
+  jobName        String           @map("job_name")
+  payloadSummary Json             @default("{}") @map("payload_summary") @db.JsonB
+  failureReason  String           @map("failure_reason")
+  attemptsMade   Int              @map("attempts_made")
+  maxRetries     Int              @map("max_retries")
+  status         DeadLetterStatus @default(OPEN)
+  failedAt       DateTime         @map("failed_at")
+  replayedAt     DateTime?        @map("replayed_at")
+  replayedById   String?          @map("replayed_by_id") @db.Uuid
+  replayedJobId  String?          @unique @map("replayed_job_id") @db.Uuid
+  createdAt      DateTime         @default(now()) @map("created_at")
+  updatedAt      DateTime         @updatedAt @map("updated_at")
+
+  originalJob  Job          @relation("OriginalDeadLetter", fields: [originalJobId], references: [id], onDelete: Cascade)
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  queue        Queue        @relation(fields: [queueId], references: [id], onDelete: Cascade)
+
+  @@index([organisationId, status, createdAt])
+  @@index([organisationId, queueId])
+  @@map("dead_letter_jobs")
+}
+
+model WorkerHeartbeat {
+  id               String             @id @default(uuid()) @db.Uuid
+  workerInstanceId String             @unique @map("worker_instance_id")
+  hostname         String
+  pid              Int
+  registeredQueues String[]           @default([]) @map("registered_queues")
+  organisationIds  String[]           @default([]) @map("organisation_ids")
+  status           WorkerHealthStatus @default(ONLINE)
+  jobsProcessed    Int                @default(0) @map("jobs_processed")
+  jobsSucceeded    Int                @default(0) @map("jobs_succeeded")
+  jobsFailed       Int                @default(0) @map("jobs_failed")
+  lastError        String?            @map("last_error")
+  lastHeartbeatAt  DateTime           @default(now()) @map("last_heartbeat_at")
+  startedAt        DateTime           @default(now()) @map("started_at")
+  stoppedAt        DateTime?          @map("stopped_at")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+
+  @@index([status, lastHeartbeatAt])
+  @@map("worker_heartbeats")
+}
+
+model PlatformEvent {
+  id             String            @id @default(uuid()) @db.Uuid
+  type           PlatformEventType
+  organisationId String?           @map("organisation_id") @db.Uuid
+  queueId        String?           @map("queue_id") @db.Uuid
+  jobId          String?           @map("job_id") @db.Uuid
+  workerId       String?           @map("worker_id")
+  message        String
+  metadata       Json              @default("{}") @db.JsonB
+  createdAt      DateTime          @default(now()) @map("created_at")
+
+  @@index([organisationId, createdAt])
+  @@index([organisationId, type, createdAt])
+  @@index([jobId, createdAt])
+  @@map("platform_events")
 }
 
 model JobDispatchOutbox {

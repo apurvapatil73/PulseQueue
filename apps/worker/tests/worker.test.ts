@@ -4,10 +4,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { JobStatus } from '@prisma/client';
 import {
   bullMQService,
+  deadLetterService,
   jobService,
   organisationService,
   prisma,
   queueService,
+  workerHealthService,
   type PersistedQueueDescriptor,
 } from '@pulsequeue/backend';
 import {
@@ -371,5 +373,63 @@ describe('Distributed Worker Runtime, Processors & Lifecycle Sync (Step 4.2)', (
       expect(after?.result).toEqual({ preserved: true });
       expect(after?.errorMessage).toBeNull();
     }, 15_000);
+
+    it('routes exhausted failed jobs to DLQ and processes replayed DLQ jobs to COMPLETED while tracking worker heartbeats', async () => {
+      const identity = workerManager.getWorkerIdentity();
+      await workerHealthService.registerWorkerStart({
+        ...identity,
+        registeredQueues: workerManager.listRegisteredWorkers(),
+        organisationIds: workerManager.listRegisteredOrganisationIds(),
+      });
+
+      // 1. Submit invalid-payload job -> fails -> enters DLQ automatically
+      const failingSub = await jobService.create(orgAId, queueA.id, userId, {
+        name: 'echo',
+        payload: { message: '' }, // invalid
+        maxRetries: 1,
+        backoffMs: 50,
+        delayMs: 0,
+      });
+
+      const failed = await waitForJobStatus(failingSub.job.id, [JobStatus.FAILED]);
+      expect(failed.status).toBe(JobStatus.FAILED);
+      expect(failed.lastWorkerId).toBe(identity.workerInstanceId);
+
+      // Confirm DLQ record created
+      const dlqRecord = await prisma.deadLetterJob.findUnique({
+        where: { originalJobId: failingSub.job.id },
+      });
+      expect(dlqRecord).not.toBeNull();
+      expect(dlqRecord?.status).toBe('OPEN');
+
+      // 2. Replay DLQ job with valid payload -> worker automatically executes it to COMPLETED
+      const replay = await deadLetterService.replay(orgAId, dlqRecord!.id, userId, {
+        payload: { message: 'replayed-and-succeeded' },
+      });
+      expect(replay.deadLetterJob.status).toBe('REPLAYED');
+
+      const replayedDone = await waitForJobStatus(replay.replayedJob.id, [JobStatus.COMPLETED]);
+      expect(replayedDone.status).toBe(JobStatus.COMPLETED);
+      expect(replayedDone.replayedFromDlqId).toBe(dlqRecord!.id);
+      expect(replayedDone.durationMs).not.toBeNull();
+      expect(replayedDone.result).toMatchObject({
+        processor: 'echo',
+        output: { echoed: 'replayed-and-succeeded' },
+      });
+
+      // Verify worker heartbeat tracked real processing counters
+      const hb = await prisma.workerHeartbeat.findUnique({
+        where: { workerInstanceId: identity.workerInstanceId },
+      });
+      expect(hb).not.toBeNull();
+      expect(hb!.jobsProcessed).toBeGreaterThanOrEqual(2);
+      expect(hb!.jobsSucceeded).toBeGreaterThanOrEqual(1);
+      expect(hb!.jobsFailed).toBeGreaterThanOrEqual(1);
+
+      // Clean up test worker heartbeat row
+      await prisma.workerHeartbeat.deleteMany({
+        where: { workerInstanceId: identity.workerInstanceId },
+      });
+    }, 20_000);
   });
 });
