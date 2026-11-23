@@ -1,6 +1,6 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
-import { Activity, Settings } from 'lucide-react';
+import { Activity } from 'lucide-react';
 import { queryClient } from './config/queryClient';
 import { AuthProvider } from './contexts/AuthContext';
 import { OrganisationProvider } from './contexts/OrganisationContext';
@@ -18,6 +18,7 @@ import { QueueDetailPage } from './pages/queues/QueueDetailPage';
 import { QueuesPage } from './pages/queues/QueuesPage';
 import { ScheduleDetailPage } from './pages/schedules/ScheduleDetailPage';
 import { SchedulesPage } from './pages/schedules/SchedulesPage';
+import { OrganisationSettingsPage } from './pages/settings/OrganisationSettingsPage';
 
 export function AppRoutes() {
   return (
@@ -53,22 +54,7 @@ export function AppRoutes() {
             }
           />
           <Route path="/dlq" element={<DlqPage />} />
-          <Route
-            path="/settings"
-            element={
-              <ModulePlaceholderPage
-                title="Organisation Settings"
-                description="Manage workspace details, team memberships, RBAC roles, invitations, and ownership transfer."
-                icon={<Settings className="h-5 w-5" />}
-                milestoneLabel="Step 6.4 Planned"
-                plannedCapabilities={[
-                  'Rename or delete organisations (OWNER-protected)',
-                  'Invite team members, update OWNER/ADMIN/MEMBER roles, and revoke pending invitations',
-                  'Transfer organisation ownership safely with confirmation guards',
-                ]}
-              />
-            }
-          />
+          <Route path="/settings" element={<OrganisationSettingsPage />} />
         </Route>
       </Route>
 
