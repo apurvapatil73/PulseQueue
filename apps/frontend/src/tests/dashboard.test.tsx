@@ -8,6 +8,7 @@ import { AuthProvider } from '../contexts/AuthContext';
 import { OrganisationProvider } from '../contexts/OrganisationContext';
 import { AppRoutes } from '../App';
 import { authApi } from '../api/auth.api';
+import { dlqApi } from '../api/dlq.api';
 import { organisationApi } from '../api/organisation.api';
 import { monitoringApi } from '../api/monitoring.api';
 import { queueApi } from '../api/queue.api';
@@ -169,6 +170,18 @@ describe('SaaS Dashboard Shell, Organisation Switching, Navigation & Error Handl
 
     vi.spyOn(queueApi, 'list').mockResolvedValue([]);
 
+    vi.spyOn(dlqApi, 'list').mockResolvedValue({
+      items: [],
+      pagination: {
+        page: 1,
+        limit: 15,
+        total: 0,
+        totalPages: 0,
+        hasNextPage: false,
+        hasPreviousPage: false,
+      },
+    });
+
     vi.spyOn(scheduleApi, 'list').mockResolvedValue({
       schedules: [],
       pagination: {
@@ -209,7 +222,7 @@ describe('SaaS Dashboard Shell, Organisation Switching, Navigation & Error Handl
     expect(await screen.findByText('No schedules created yet')).toBeInTheDocument();
 
     await user.click(screen.getByRole('link', { name: 'Dead Letter Queue' }));
-    expect(await screen.findByText('Dead Letter Queue Module Scaffold')).toBeInTheDocument();
+    expect(await screen.findByText('No dead-letter jobs recorded')).toBeInTheDocument();
 
     await user.click(screen.getByRole('link', { name: 'Overview' }));
     expect(await screen.findByText('invoices-prod')).toBeInTheDocument();

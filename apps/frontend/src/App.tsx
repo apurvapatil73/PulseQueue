@@ -1,6 +1,6 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
-import { Activity, AlertOctagon, Settings } from 'lucide-react';
+import { Activity, Settings } from 'lucide-react';
 import { queryClient } from './config/queryClient';
 import { AuthProvider } from './contexts/AuthContext';
 import { OrganisationProvider } from './contexts/OrganisationContext';
@@ -10,6 +10,7 @@ import { PublicOnlyRoute } from './components/routing/PublicOnlyRoute';
 import { LoginPage } from './pages/auth/LoginPage';
 import { RegisterPage } from './pages/auth/RegisterPage';
 import { DashboardOverviewPage } from './pages/dashboard/DashboardOverviewPage';
+import { DlqPage } from './pages/dlq/DlqPage';
 import { JobDetailPage } from './pages/jobs/JobDetailPage';
 import { JobsPage } from './pages/jobs/JobsPage';
 import { ModulePlaceholderPage } from './pages/modules/ModulePlaceholderPage';
@@ -51,22 +52,7 @@ export function AppRoutes() {
               />
             }
           />
-          <Route
-            path="/dlq"
-            element={
-              <ModulePlaceholderPage
-                title="Dead Letter Queue"
-                description="Inspect permanently failed jobs with redacted payloads and safely replay them."
-                icon={<AlertOctagon className="h-5 w-5" />}
-                milestoneLabel="Step 6.4 Planned"
-                plannedCapabilities={[
-                  'List OPEN and REPLAYED dead-letter records per queue and organisation',
-                  'Review sanitized payload summaries, failure reasons, and exhausted attempt counts',
-                  'Idempotently replay dead-lettered jobs with optional retry/priority overrides',
-                ]}
-              />
-            }
-          />
+          <Route path="/dlq" element={<DlqPage />} />
           <Route
             path="/settings"
             element={
