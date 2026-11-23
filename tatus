@@ -1,0 +1,21 @@
+warning: in the working copy of 'apps/backend/prisma/schema.prisma', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/backend/src/controllers/monitoring.controller.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/backend/src/index.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/backend/src/routes/monitoring.routes.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/backend/src/services/job.service.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/backend/src/services/metrics.service.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/backend/src/services/workerHealth.service.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/backend/src/validators/monitoring.validator.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/backend/tests/reliability.test.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/worker/src/runtime/workerRunner.ts', LF will be replaced by CRLF the next time Git touches it
+ apps/backend/prisma/schema.prisma                  |   6 [32m+[m
+ .../src/controllers/monitoring.controller.ts       |  19 [32m+[m
+ apps/backend/src/index.ts                          |   1 [32m+[m
+ apps/backend/src/routes/monitoring.routes.ts       |   7 [32m+[m
+ apps/backend/src/services/job.service.ts           |   6 [32m+[m[31m-[m
+ apps/backend/src/services/metrics.service.ts       | 720 [32m++++++++++++++++++++[m[31m-[m
+ apps/backend/src/services/workerHealth.service.ts  | 137 [32m+++[m[31m-[m
+ .../backend/src/validators/monitoring.validator.ts |  53 [32m+[m[31m-[m
+ apps/backend/tests/reliability.test.ts             |   6 [32m+[m[31m-[m
+ apps/worker/src/runtime/workerRunner.ts            |   5 [32m+[m
+ 10 files changed, 926 insertions(+), 34 deletions(-)

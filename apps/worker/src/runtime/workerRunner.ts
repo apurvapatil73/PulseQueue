@@ -5,6 +5,7 @@ import {
   disconnectDatabase,
   disconnectRedis,
   env,
+  eventRetentionService,
   logger,
   outboxReconciler,
   prisma,
@@ -149,6 +150,8 @@ export class WorkerRuntime {
     outboxReconciler.start(this.outboxIntervalMs);
     stalledJobRecoveryService.start(this.stalledRecoveryIntervalMs);
     scheduleDispatcherService.start(1000, 30_000);
+    workerHealthService.startStaleSweep(15_000);
+    eventRetentionService.start();
 
     this.heartbeatTimer = setInterval(() => {
       void this.publishHeartbeat();
@@ -194,6 +197,8 @@ export class WorkerRuntime {
     outboxReconciler.stop();
     stalledJobRecoveryService.stop();
     scheduleDispatcherService.stop();
+    workerHealthService.stopStaleSweep();
+    eventRetentionService.stop();
     await this.manager.closeAll();
 
     // Record graceful STOPPED state before closing PostgreSQL

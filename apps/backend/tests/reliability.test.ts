@@ -430,14 +430,16 @@ describe('Advanced Job Reliability, DLQ, Stalled Recovery & Monitoring (Step 4.3
       const staleW = workers.find((w) => w.workerInstanceId === staleWorkerId);
 
       expect(onlineW?.status).toBe(WorkerHealthStatus.ONLINE);
-      expect(onlineW?.jobsSucceeded).toBe(1);
+      // Global worker counters from recordJobOutcome must NOT leak into org-scoped view without an Org A job
+      expect(onlineW?.jobsSucceeded).toBe(0);
       // MUST only expose Org A's queue name — Org B's queue name MUST NOT leak!
       expect(onlineW?.registeredQueues).toEqual([queueAName]);
       expect(onlineW?.registeredQueues).not.toContain(queueBName);
 
       expect(staleW?.status).toBe(WorkerHealthStatus.STALE);
 
-      // Confirm WORKER_HEARTBEAT_STALE event was persisted
+      // GET /monitoring/workers is read-only; background detectStaleWorkers() persists STALE & event
+      await workerHealthService.detectStaleWorkers();
       const staleEvent = await prisma.platformEvent.findFirst({
         where: {
           type: PlatformEventType.WORKER_HEARTBEAT_STALE,

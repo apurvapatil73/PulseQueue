@@ -63,10 +63,61 @@ export const metricsQuerySchema = z.object({
     .number({ invalid_type_error: 'windowMinutes must be a positive integer' })
     .int('windowMinutes must be a positive integer')
     .min(1, 'windowMinutes must be at least 1')
-    .max(1440, 'windowMinutes must not exceed 1440 (24 hours)')
+    .max(10080, 'windowMinutes must not exceed 10080 (7 days)')
     .optional()
     .default(60),
 });
+
+export const ALLOWED_BUCKET_MINUTES = [1, 5, 15, 60] as const;
+export const MAX_TIMESERIES_BUCKETS = 360;
+
+export const metricsTimeseriesQuerySchema = z
+  .object({
+    windowMinutes: z.coerce
+      .number({ invalid_type_error: 'windowMinutes must be a positive integer' })
+      .int('windowMinutes must be a positive integer')
+      .min(5, 'windowMinutes must be at least 5')
+      .max(10080, 'windowMinutes must not exceed 10080 (7 days)')
+      .optional()
+      .default(60),
+    bucketMinutes: z.coerce
+      .number({ invalid_type_error: 'bucketMinutes must be an integer (1, 5, 15, or 60)' })
+      .int('bucketMinutes must be an integer (1, 5, 15, or 60)')
+      .refine(
+        (v): v is (typeof ALLOWED_BUCKET_MINUTES)[number] =>
+          (ALLOWED_BUCKET_MINUTES as readonly number[]).includes(v),
+        { message: 'bucketMinutes must be one of 1, 5, 15, or 60' },
+      )
+      .optional(),
+    queueId: z.string().uuid('queueId must be a valid UUID').optional(),
+  })
+  .superRefine((data, ctx) => {
+    const resolvedBucket =
+      data.bucketMinutes ??
+      (data.windowMinutes <= 60
+        ? 1
+        : data.windowMinutes <= 360
+          ? 5
+          : data.windowMinutes <= 1440
+            ? 15
+            : 60);
+
+    if (resolvedBucket > data.windowMinutes) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['bucketMinutes'],
+        message: 'bucketMinutes must not exceed windowMinutes',
+      });
+    }
+
+    if (Math.ceil(data.windowMinutes / resolvedBucket) > MAX_TIMESERIES_BUCKETS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['bucketMinutes'],
+        message: `Requested window and bucket size exceed maximum of ${MAX_TIMESERIES_BUCKETS} buckets`,
+      });
+    }
+  });
 
 export const listEventsQuerySchema = z.object({
   type: z.nativeEnum(PlatformEventType).optional(),

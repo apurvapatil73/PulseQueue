@@ -7,6 +7,7 @@ import {
   getDlqJob,
   replayDlqJob,
   getOrganisationMetrics,
+  getOrganisationMetricsTimeseries,
   listOrganisationWorkers,
   listOrganisationEvents,
   triggerStalledRecovery,
@@ -29,6 +30,12 @@ dlqRoutes.post('/:dlqId/replay', authenticate, requireOrgRole(Role.ADMIN), repla
 export const monitoringRoutes = Router({ mergeParams: true });
 
 monitoringRoutes.get('/metrics', authenticate, requireOrgRole(Role.MEMBER), getOrganisationMetrics);
+monitoringRoutes.get(
+  '/metrics/timeseries',
+  authenticate,
+  requireOrgRole(Role.MEMBER),
+  getOrganisationMetricsTimeseries,
+);
 monitoringRoutes.get(
   '/workers',
   authenticate,

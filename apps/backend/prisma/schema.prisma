@@ -222,6 +222,7 @@ model Job {
   replayedFromDlqId String?   @map("replayed_from_dlq_id") @db.Uuid
   result            Json?     @db.JsonB
   errorMessage      String?   @map("error_message")
+  firstStartedAt    DateTime? @map("first_started_at")
   startedAt         DateTime? @map("started_at")
   completedAt       DateTime? @map("completed_at")
   failedAt          DateTime? @map("failed_at")
@@ -238,6 +239,9 @@ model Job {
 
   @@index([queueId])
   @@index([queueId, status, createdAt])
+  @@index([queueId, completedAt])
+  @@index([queueId, failedAt])
+  @@index([lastWorkerId, status])
   @@index([status])
   @@index([status, startedAt])
   @@index([priority])
@@ -309,6 +313,7 @@ model PlatformEvent {
   @@index([organisationId, createdAt])
   @@index([organisationId, type, createdAt])
   @@index([jobId, createdAt])
+  @@index([createdAt])
   @@map("platform_events")
 }
 
@@ -379,6 +384,7 @@ model ScheduleExecution {
   @@unique([scheduleId, scheduledFor])
   @@index([scheduleId, createdAt])
   @@index([scheduleId, status, scheduledFor])
+  @@index([status, createdAt])
   @@map("schedule_executions")
 }
 

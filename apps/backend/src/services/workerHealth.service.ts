@@ -1,4 +1,4 @@
-import { PlatformEventType, WorkerHealthStatus } from '@prisma/client';
+import { JobStatus, PlatformEventType, WorkerHealthStatus } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { logger } from '../utils/logger.js';
 import { eventService } from './event.service.js';
@@ -31,9 +31,15 @@ export interface OrgSafeWorkerView {
   status: WorkerHealthStatus;
   /** Filtered strictly to BullMQ queue names belonging to the caller's organisation. */
   registeredQueues: string[];
+  /** Strictly organisation-scoped count of terminal (COMPLETED + FAILED) jobs executed by this worker. */
   jobsProcessed: number;
+  /** Strictly organisation-scoped count of COMPLETED jobs executed by this worker. */
   jobsSucceeded: number;
+  /** Strictly organisation-scoped count of FAILED jobs executed by this worker. */
   jobsFailed: number;
+  /** Strictly organisation-scoped count of currently ACTIVE jobs on this worker. */
+  activeJobs: number;
+  /** Latest FAILED job error message belonging strictly to the caller's organisation (never global). */
   lastError: string | null;
   lastHeartbeatAt: Date;
   startedAt: Date;
@@ -71,6 +77,9 @@ export function classifyWorkerHealth(
  * records audit events on start/stop/staleness, and serves organisation-safe views.
  */
 export class WorkerHealthService {
+  private staleSweepTimer: NodeJS.Timeout | null = null;
+  private staleSweepInFlight = false;
+
   /**
    * Registers a worker startup heartbeat and persists a WORKER_STARTED event.
    */
@@ -151,12 +160,15 @@ export class WorkerHealthService {
   }
 
   /**
-   * Increments real per-worker processing counters atomically in PostgreSQL.
+   * Increments internal per-worker processing counters atomically in PostgreSQL.
+   * Tenant-specific job error messages are intentionally NOT stored on the global
+   * worker_heartbeats row to prevent cross-tenant error leakage; organisation-scoped
+   * views derive lastError strictly from that organisation's own failed jobs.
    */
   async recordJobOutcome(
     workerInstanceId: string,
     outcome: 'succeeded' | 'failed',
-    errorMessage?: string,
+    _errorMessage?: string,
   ): Promise<void> {
     try {
       await db.workerHeartbeat.updateMany({
@@ -165,10 +177,7 @@ export class WorkerHealthService {
           jobsProcessed: { increment: 1 },
           ...(outcome === 'succeeded'
             ? { jobsSucceeded: { increment: 1 } }
-            : {
-                jobsFailed: { increment: 1 },
-                lastError: errorMessage ? errorMessage.slice(0, 1000) : null,
-              }),
+            : { jobsFailed: { increment: 1 } }),
           lastHeartbeatAt: new Date(),
         },
       });
@@ -276,17 +285,52 @@ export class WorkerHealthService {
   }
 
   /**
-   * Returns organisation-safe worker monitoring views.
-   * Only includes workers serving the caller's organisation and strips foreign
-   * organisations' queue identifiers from `registeredQueues`.
+   * Starts a periodic background sweep that persists DEGRADED/STALE worker transitions
+   * without requiring GET monitoring endpoints to perform database writes.
+   */
+  startStaleSweep(
+    intervalMs: number = 15_000,
+    thresholds: WorkerHealthThresholds = DEFAULT_WORKER_HEALTH_THRESHOLDS,
+  ): void {
+    if (this.staleSweepTimer) return;
+    const safeInterval = Math.max(2000, intervalMs);
+    this.staleSweepTimer = setInterval(() => {
+      if (this.staleSweepInFlight) return;
+      this.staleSweepInFlight = true;
+      void this.detectStaleWorkers(thresholds)
+        .catch((err) => {
+          logger.warn('Background stale worker sweep failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+        .finally(() => {
+          this.staleSweepInFlight = false;
+        });
+    }, safeInterval);
+    this.staleSweepTimer.unref();
+    logger.info('Worker stale-heartbeat sweep started', { intervalMs: safeInterval });
+  }
+
+  stopStaleSweep(): void {
+    if (this.staleSweepTimer) {
+      clearInterval(this.staleSweepTimer);
+      this.staleSweepTimer = null;
+      logger.info('Worker stale-heartbeat sweep stopped');
+    }
+  }
+
+  /**
+   * Returns strictly organisation-safe worker monitoring views (read-only: performs zero DB writes).
+   * - Only includes workers serving the caller's organisation.
+   * - Strips foreign organisations' queue identifiers from `registeredQueues`.
+   * - Computes `jobsProcessed`, `jobsSucceeded`, `jobsFailed`, `activeJobs`, and `lastError`
+   *   exclusively from the caller's own persisted jobs (never leaking global worker counters
+   *   or another organisation's error messages).
    */
   async listWorkersForOrganisation(
     orgId: string,
     thresholds: WorkerHealthThresholds = DEFAULT_WORKER_HEALTH_THRESHOLDS,
   ): Promise<OrgSafeWorkerView[]> {
-    // Re-evaluate freshness before returning
-    await this.detectStaleWorkers(thresholds);
-
     const nowMs = Date.now();
     const orgPrefix = `org_${orgId}__`;
 
@@ -297,6 +341,58 @@ export class WorkerHealthService {
       orderBy: [{ lastHeartbeatAt: 'desc' }],
     });
 
+    if (workers.length === 0) {
+      return [];
+    }
+
+    const workerIds = workers.map((w) => w.workerInstanceId);
+
+    const [orgJobCounts, orgLatestErrors] = await Promise.all([
+      db.job.groupBy({
+        by: ['lastWorkerId', 'status'],
+        where: {
+          queue: { organisationId: orgId },
+          lastWorkerId: { in: workerIds },
+          status: { in: [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.ACTIVE] },
+        },
+        _count: { _all: true },
+      }),
+      db.job.findMany({
+        where: {
+          queue: { organisationId: orgId },
+          lastWorkerId: { in: workerIds },
+          status: JobStatus.FAILED,
+          errorMessage: { not: null },
+        },
+        orderBy: [{ failedAt: 'desc' }, { updatedAt: 'desc' }],
+        distinct: ['lastWorkerId'],
+        select: {
+          lastWorkerId: true,
+          errorMessage: true,
+        },
+      }),
+    ]);
+
+    const countsByWorker = new Map<string, { succeeded: number; failed: number; active: number }>();
+    for (const row of orgJobCounts) {
+      if (!row.lastWorkerId) continue;
+      let entry = countsByWorker.get(row.lastWorkerId);
+      if (!entry) {
+        entry = { succeeded: 0, failed: 0, active: 0 };
+        countsByWorker.set(row.lastWorkerId, entry);
+      }
+      if (row.status === JobStatus.COMPLETED) entry.succeeded = row._count._all;
+      if (row.status === JobStatus.FAILED) entry.failed = row._count._all;
+      if (row.status === JobStatus.ACTIVE) entry.active = row._count._all;
+    }
+
+    const lastErrorByWorker = new Map<string, string>();
+    for (const row of orgLatestErrors) {
+      if (row.lastWorkerId && row.errorMessage) {
+        lastErrorByWorker.set(row.lastWorkerId, row.errorMessage);
+      }
+    }
+
     return workers.map((w) => {
       const effectiveStatus = classifyWorkerHealth(w.status, w.lastHeartbeatAt, nowMs, thresholds);
       // Strictly filter queue names so no foreign organisation IDs or queue names leak
@@ -304,16 +400,23 @@ export class WorkerHealthService {
         .filter((q) => q.startsWith(orgPrefix))
         .map((q) => q.slice(orgPrefix.length));
 
+      const stats = countsByWorker.get(w.workerInstanceId) ?? {
+        succeeded: 0,
+        failed: 0,
+        active: 0,
+      };
+
       return {
         workerInstanceId: w.workerInstanceId,
         hostname: w.hostname,
         pid: w.pid,
         status: effectiveStatus,
         registeredQueues: orgScopedQueues,
-        jobsProcessed: w.jobsProcessed,
-        jobsSucceeded: w.jobsSucceeded,
-        jobsFailed: w.jobsFailed,
-        lastError: w.lastError,
+        jobsProcessed: stats.succeeded + stats.failed,
+        jobsSucceeded: stats.succeeded,
+        jobsFailed: stats.failed,
+        activeJobs: stats.active,
+        lastError: lastErrorByWorker.get(w.workerInstanceId) ?? null,
         lastHeartbeatAt: w.lastHeartbeatAt,
         startedAt: w.startedAt,
         stoppedAt: w.stoppedAt,

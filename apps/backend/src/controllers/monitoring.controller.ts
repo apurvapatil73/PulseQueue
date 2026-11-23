@@ -9,6 +9,7 @@ import {
   listDlqQuerySchema,
   replayDlqBodySchema,
   metricsQuerySchema,
+  metricsTimeseriesQuerySchema,
   listEventsQuerySchema,
   recoverStalledBodySchema,
 } from '../validators/monitoring.validator.js';
@@ -91,6 +92,24 @@ export async function getOrganisationMetrics(
       windowMinutes,
     );
     sendSuccess(res, { metrics });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getOrganisationMetricsTimeseries(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    if (!req.membership) throw new UnauthorizedError();
+    const query = parseInput(metricsTimeseriesQuerySchema, req.query);
+    const timeseries = await metricsService.getOrganisationTimeseries(
+      req.membership.organisationId,
+      query,
+    );
+    sendSuccess(res, { timeseries });
   } catch (err) {
     next(err);
   }

@@ -552,7 +552,7 @@ export class JobService {
             id: jobId,
             queue: { organisationId: orgId },
           },
-          select: { id: true, status: true },
+          select: { id: true, status: true, firstStartedAt: true },
         });
 
         if (!existing) {
@@ -576,6 +576,7 @@ export class JobService {
           assertValidJobTransition(existing.status, JobStatus.ACTIVE);
         }
 
+        const now = new Date();
         const claimed = await tx.job.updateMany({
           where: {
             id: existing.id,
@@ -584,7 +585,8 @@ export class JobService {
           },
           data: {
             status: JobStatus.ACTIVE,
-            startedAt: new Date(),
+            ...(existing.firstStartedAt ? {} : { firstStartedAt: now }),
+            startedAt: now,
             attemptsMade: Math.max(1, attemptNumber),
             ...(workerId ? { lastWorkerId: workerId } : {}),
           },
