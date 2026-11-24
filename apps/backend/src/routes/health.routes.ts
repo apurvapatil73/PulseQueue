@@ -1,11 +1,13 @@
 import { Router } from 'express';
-import { getHealth } from '../controllers/health.controller.js';
+import { getHealth, getLiveness, getReadiness } from '../controllers/health.controller.js';
 import { schedulerMetricsRegistry } from '../services/schedulerMetrics.service.js';
 import { sendSuccess } from '../utils/response.js';
 
 const router = Router();
 
 router.get('/', getHealth);
+router.get('/live', getLiveness);
+router.get('/ready', getReadiness);
 
 /**
  * Privacy-safe global aggregate scheduler metrics (bounded labels only; zero tenant data).

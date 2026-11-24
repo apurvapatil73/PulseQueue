@@ -26,7 +26,19 @@ export interface WorkerRuntimeOptions {
   stalledRecoveryIntervalMs?: number;
   alertEvalIntervalMs?: number;
   schedulerIntervalMs?: number;
+  shutdownDrainTimeoutMs?: number;
+  shutdownEscalationGraceMs?: number;
   workerManager?: WorkerManager;
+  schedulerService?: typeof prioritySchedulerService;
+  disconnectDeps?: () => Promise<void>;
+}
+
+export interface WorkerStopResult {
+  clean: boolean;
+  schedulerDrained: boolean;
+  escalated: boolean;
+  timedOut: boolean;
+  dependenciesClosed: boolean;
 }
 
 /**
@@ -43,11 +55,17 @@ export class WorkerRuntime {
   private readonly stalledRecoveryIntervalMs: number;
   private readonly alertEvalIntervalMs: number;
   private readonly schedulerIntervalMs: number;
+  private readonly shutdownDrainTimeoutMs: number;
+  private readonly shutdownEscalationGraceMs: number;
+  private readonly scheduler: typeof prioritySchedulerService;
+  private readonly disconnectDeps: () => Promise<void>;
   private syncTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private syncInFlight = false;
   private heartbeatInFlight = false;
   private isShuttingDown = false;
+  private shutdownPromise: Promise<WorkerStopResult> | null = null;
+  private depsClosed = false;
   private lastCpuUsage: NodeJS.CpuUsage | null = null;
   private lastCpuHrTimeNs: bigint | null = null;
 
@@ -59,6 +77,16 @@ export class WorkerRuntime {
     this.stalledRecoveryIntervalMs = options.stalledRecoveryIntervalMs ?? 15_000;
     this.alertEvalIntervalMs = options.alertEvalIntervalMs ?? 30_000;
     this.schedulerIntervalMs = options.schedulerIntervalMs ?? 250;
+    this.shutdownDrainTimeoutMs = Math.max(50, options.shutdownDrainTimeoutMs ?? 5_000);
+    this.shutdownEscalationGraceMs = Math.max(50, options.shutdownEscalationGraceMs ?? 5_000);
+    this.scheduler = options.schedulerService ?? prioritySchedulerService;
+    this.disconnectDeps =
+      options.disconnectDeps ??
+      (async () => {
+        await bullMQService.closeAll();
+        await disconnectDatabase();
+        await disconnectRedis();
+      });
   }
 
   getWorkerManager(): WorkerManager {
@@ -250,12 +278,25 @@ export class WorkerRuntime {
     });
   }
 
-  async stop(signal: string = 'SIGTERM'): Promise<void> {
-    if (this.isShuttingDown) {
+  private async closeDependenciesOnce(): Promise<void> {
+    if (this.depsClosed) {
       return;
+    }
+    this.depsClosed = true;
+    await this.disconnectDeps();
+  }
+
+  async stop(signal: string = 'SIGTERM'): Promise<WorkerStopResult> {
+    if (this.shutdownPromise) {
+      return this.shutdownPromise;
     }
     this.isShuttingDown = true;
 
+    this.shutdownPromise = this.performStop(signal);
+    return this.shutdownPromise;
+  }
+
+  private async performStop(signal: string): Promise<WorkerStopResult> {
     const workerId = this.manager.getWorkerInstanceId();
     logger.info(`Worker runtime received ${signal}. Initiating graceful shutdown...`, {
       workerInstanceId: workerId,
@@ -271,16 +312,22 @@ export class WorkerRuntime {
       this.heartbeatTimer = null;
     }
 
-    prioritySchedulerService.stop();
     outboxReconciler.stop();
     stalledJobRecoveryService.stop();
     scheduleDispatcherService.stop();
     workerHealthService.stopStaleSweep();
     eventRetentionService.stop();
     alertEvaluatorService.stop();
+
+    // Phase 1: Stop scheduler loop and wait up to shutdownDrainTimeoutMs for in-flight ticks
+    let { drained: schedulerDrained } = await this.scheduler.stopAndDrain(
+      this.shutdownDrainTimeoutMs,
+    );
+    let escalated = false;
+
     await this.manager.closeAll();
 
-    // Record graceful STOPPED state before closing PostgreSQL
+    // Record graceful STOPPED state while PostgreSQL is still connected
     try {
       await workerHealthService.markWorkerStopped(workerId, `Graceful shutdown (${signal})`);
     } catch (err) {
@@ -291,11 +338,58 @@ export class WorkerRuntime {
     }
 
     await realtimeEventBus.closeAll();
-    await bullMQService.closeAll();
-    await disconnectDatabase();
-    await disconnectRedis();
+
+    // Phase 2: Bounded escalation retry if scheduler tick was still active after Phase 1
+    if (!schedulerDrained) {
+      escalated = true;
+      logger.warn(
+        'Priority scheduler tick still in flight after initial drain timeout; entering bounded grace retry',
+        {
+          workerInstanceId: workerId,
+          escalationGraceMs: this.shutdownEscalationGraceMs,
+        },
+      );
+      const retryRes = await this.scheduler.stopAndDrain(this.shutdownEscalationGraceMs);
+      schedulerDrained = retryRes.drained;
+    }
+
+    // Phase 3: Never disconnect BullMQ/Prisma/Redis underneath an active tick.
+    // If still active after bounded escalation, attach deferred cleanup to whenDrained()
+    // and return timedOut=true so the CLI signal handler exits non-zero in bounded time.
+    if (!schedulerDrained) {
+      logger.error(
+        'Priority scheduler tick did not finish within bounded shutdown window; deferring dependency disconnect until tick settles',
+        { workerInstanceId: workerId },
+      );
+      void this.scheduler
+        .whenDrained()
+        .then(() => this.closeDependenciesOnce())
+        .catch((err) => {
+          logger.warn('Deferred worker dependency cleanup failed', {
+            workerInstanceId: workerId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+      return {
+        clean: false,
+        schedulerDrained: false,
+        escalated,
+        timedOut: true,
+        dependenciesClosed: false,
+      };
+    }
+
+    await this.closeDependenciesOnce();
 
     logger.info('PulseQueue Worker Runtime shutdown complete.', { workerInstanceId: workerId });
+    return {
+      clean: true,
+      schedulerDrained: true,
+      escalated,
+      timedOut: false,
+      dependenciesClosed: true,
+    };
   }
 }
 
@@ -306,11 +400,20 @@ const isDirectRunner =
 
 if (process.env.NODE_ENV !== 'test' && isDirectRunner) {
   const runtime = new WorkerRuntime();
+  let forceExitTimer: NodeJS.Timeout | null = null;
 
   const handleSignal = (sig: string) => {
+    if (!forceExitTimer) {
+      forceExitTimer = setTimeout(() => {
+        logger.error('Worker graceful shutdown exceeded hard bound; forcing exit(1)');
+        process.exit(1);
+      }, 15_000);
+      forceExitTimer.unref();
+    }
+
     runtime
       .stop(sig)
-      .then(() => process.exit(0))
+      .then((res) => process.exit(res.clean ? 0 : 1))
       .catch(() => process.exit(1));
   };
 

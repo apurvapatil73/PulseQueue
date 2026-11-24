@@ -122,6 +122,21 @@ const envSchema = z
       .refine((val) => !isNaN(val) && val >= 1 && val <= 100_000, {
         message: 'RATE_LIMIT_GENERAL_MAX must be between 1 and 100000',
       }),
+    INSTANCE_ID: z.string().trim().min(1).optional(),
+    DATABASE_POOL_SIZE: z
+      .string()
+      .optional()
+      .transform((val) => (val && val.trim() !== '' ? parseInt(val, 10) : undefined))
+      .refine((val) => val === undefined || (!isNaN(val) && val >= 1 && val <= 100), {
+        message: 'DATABASE_POOL_SIZE must be between 1 and 100',
+      }),
+    DATABASE_POOL_TIMEOUT_SEC: z
+      .string()
+      .optional()
+      .transform((val) => (val && val.trim() !== '' ? parseInt(val, 10) : undefined))
+      .refine((val) => val === undefined || (!isNaN(val) && val >= 1 && val <= 120), {
+        message: 'DATABASE_POOL_TIMEOUT_SEC must be between 1 and 120',
+      }),
   })
   .superRefine((data, ctx) => {
     if (data.NODE_ENV === 'production') {

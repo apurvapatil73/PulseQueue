@@ -6,6 +6,7 @@ import { logger } from './utils/logger.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { connectRedis, disconnectRedis } from './config/redis.js';
 import { bullMQService } from './services/bullmq.service.js';
+import { healthService } from './services/health.service.js';
 import { outboxReconciler } from './services/outboxReconciler.service.js';
 import { realtimeEventBus } from './services/realtime.service.js';
 
@@ -53,6 +54,7 @@ async function startServer(): Promise<http.Server> {
 export async function shutdown(signal: string = 'SIGTERM'): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
+  healthService.markShuttingDown();
 
   logger.info(`Received ${signal}. Initiating graceful shutdown...`);
 

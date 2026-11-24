@@ -635,6 +635,8 @@ export class PrioritySchedulerService {
   private readonly defaultAdapter: JobDispatchAdapter;
   private timer: NodeJS.Timeout | null = null;
   private tickInFlight = false;
+  private stopping = false;
+  private readonly inFlightTicks = new Set<Promise<unknown>>();
   private roundRobinOffset = 0;
   private activeClaimerId = 'scheduler-default';
   private activeIntervalMs = 250;
@@ -1729,14 +1731,17 @@ export class PrioritySchedulerService {
    * Only fires when the scheduler loop is running.
    */
   nudgeQueue(queueId: string, delayMs: number = 10): void {
-    if (!this.timer || this.nudgeTimers.has(queueId)) {
+    if (!this.timer || this.stopping || this.nudgeTimers.has(queueId)) {
       return;
     }
     const handle = setTimeout(
       () => {
         this.nudgeTimers.delete(queueId);
-        if (!this.timer) return;
-        void this.tickAllQueues({ queueId, claimerId: this.activeClaimerId });
+        if (!this.timer || this.stopping) return;
+        const run = this.tickAllQueues({ queueId, claimerId: this.activeClaimerId }).finally(() => {
+          this.inFlightTicks.delete(run);
+        });
+        this.inFlightTicks.add(run);
       },
       Math.max(0, delayMs),
     );
@@ -1751,20 +1756,23 @@ export class PrioritySchedulerService {
     if (this.timer) {
       return;
     }
+    this.stopping = false;
     this.activeIntervalMs = Math.max(50, options?.intervalMs ?? 250);
     this.activeClaimerId = options?.claimerId ?? `scheduler-${process.pid}`;
     this.activeStaleAfterMs =
       options?.staleAfterMs ?? SCHEDULING_DEFAULTS.DEFAULT_RESERVATION_STALE_MS;
 
     this.timer = setInterval(() => {
-      if (this.tickInFlight) return;
+      if (this.tickInFlight || this.stopping) return;
       this.tickInFlight = true;
-      void this.tickAllQueues({
+      const run = this.tickAllQueues({
         claimerId: this.activeClaimerId,
         staleAfterMs: this.activeStaleAfterMs,
       }).finally(() => {
         this.tickInFlight = false;
+        this.inFlightTicks.delete(run);
       });
+      this.inFlightTicks.add(run);
     }, this.activeIntervalMs);
     this.timer.unref();
     schedulerMetricsRegistry.setLoopRunning(true);
@@ -1780,6 +1788,7 @@ export class PrioritySchedulerService {
    * Stops the periodic scheduler loop and clears all pending per-queue nudges.
    */
   stop(): void {
+    this.stopping = true;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -1792,6 +1801,43 @@ export class PrioritySchedulerService {
       clearTimeout(handle);
     }
     this.nudgeTimers.clear();
+  }
+
+  /**
+   * Stops the periodic scheduler loop and waits up to `timeoutMs` for all in-flight ticks
+   * (periodic and nudged) to settle cleanly before database/Redis connections are closed.
+   * Safe to call repeatedly; errors in an in-flight tick never reject or block shutdown.
+   */
+  async stopAndDrain(timeoutMs: number = 5000): Promise<{ drained: boolean }> {
+    this.stop();
+    if (this.inFlightTicks.size === 0) {
+      return { drained: true };
+    }
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    try {
+      const drained = await Promise.race([
+        Promise.allSettled(Array.from(this.inFlightTicks)).then(() => true),
+        new Promise<boolean>((resolve) => {
+          timeoutHandle = setTimeout(() => resolve(false), Math.max(50, timeoutMs));
+          timeoutHandle.unref();
+        }),
+      ]);
+      return { drained };
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
+    }
+  }
+
+  /**
+   * Resolves once all currently tracked in-flight scheduler ticks have settled.
+   * Used by callers to attach deferred cleanup strictly after active operations finish.
+   */
+  async whenDrained(): Promise<void> {
+    while (this.inFlightTicks.size > 0) {
+      await Promise.allSettled(Array.from(this.inFlightTicks));
+    }
   }
 
   isRunning(): boolean {

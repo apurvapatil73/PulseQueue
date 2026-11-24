@@ -1,4 +1,27 @@
+import crypto from 'node:crypto';
+import os from 'node:os';
+
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+export interface InstanceIdentity {
+  instanceId: string;
+  hostname: string;
+  pid: number;
+}
+
+const INSTANCE_HOSTNAME = os.hostname();
+const INSTANCE_PID = process.pid;
+const INSTANCE_ID =
+  process.env.INSTANCE_ID?.trim() ||
+  `pq-${INSTANCE_HOSTNAME}-${INSTANCE_PID}-${crypto.randomUUID().slice(0, 6)}`;
+
+export function getInstanceIdentity(): InstanceIdentity {
+  return {
+    instanceId: INSTANCE_ID,
+    hostname: INSTANCE_HOSTNAME,
+    pid: INSTANCE_PID,
+  };
+}
 
 interface LogContext {
   [key: string]: unknown;
@@ -87,12 +110,14 @@ class StructuredLogger {
       const entry = {
         timestamp,
         level: level.toUpperCase(),
+        instanceId: INSTANCE_ID,
+        pid: INSTANCE_PID,
         message,
         ...cleanContext,
       };
       console.log(JSON.stringify(entry));
     } else {
-      const prefix = `[${timestamp}] [${level.toUpperCase()}]`;
+      const prefix = `[${timestamp}] [${level.toUpperCase()}] [${INSTANCE_ID}]`;
       if (level === 'error') {
         console.error(`${prefix} ${message}`, cleanContext ? cleanContext : '');
       } else if (level === 'warn') {
