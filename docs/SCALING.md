@@ -54,21 +54,37 @@ npm run docker:up
 Start two API replicas on distinct ports with explicit instance IDs and bounded DB pools:
 
 ```bash
-# Terminal 1 — API Replica 1
+# Terminal 1 - API Replica 1 (Bash/zsh)
 INSTANCE_ID=api-1 PORT=3001 DATABASE_POOL_SIZE=8 npm run dev:backend
 
-# Terminal 2 — API Replica 2
+# Terminal 2 - API Replica 2 (Bash/zsh)
 INSTANCE_ID=api-2 PORT=3002 DATABASE_POOL_SIZE=8 npm run dev:backend
+```
+
+```powershell
+# Terminal 1 - API Replica 1 (Windows PowerShell)
+$env:INSTANCE_ID='api-1'; $env:PORT='3001'; $env:DATABASE_POOL_SIZE='8'; npm run dev:backend
+
+# Terminal 2 - API Replica 2 (Windows PowerShell)
+$env:INSTANCE_ID='api-2'; $env:PORT='3002'; $env:DATABASE_POOL_SIZE='8'; npm run dev:backend
 ```
 
 Start two Worker/Scheduler replicas:
 
 ```bash
-# Terminal 3 — Worker Replica 1
+# Terminal 3 - Worker Replica 1 (Bash/zsh)
 INSTANCE_ID=worker-1 DATABASE_POOL_SIZE=8 npm run dev:worker
 
-# Terminal 4 — Worker Replica 2
+# Terminal 4 - Worker Replica 2 (Bash/zsh)
 INSTANCE_ID=worker-2 DATABASE_POOL_SIZE=8 npm run dev:worker
+```
+
+```powershell
+# Terminal 3 - Worker Replica 1 (Windows PowerShell)
+$env:INSTANCE_ID='worker-1'; $env:DATABASE_POOL_SIZE='8'; npm run dev:worker
+
+# Terminal 4 - Worker Replica 2 (Windows PowerShell)
+$env:INSTANCE_ID='worker-2'; $env:DATABASE_POOL_SIZE='8'; npm run dev:worker
 ```
 
 Verify liveness and dependency readiness per replica:

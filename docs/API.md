@@ -226,8 +226,19 @@ At least one field required (`.strict()`): `maxOutstandingJobs` (`1..1000000`), 
 curl -s -X POST "http://localhost:3000/api/v1/organisations/${ORG_ID}/queues/${QUEUE_ID}/jobs" \
   -H "X-API-Key: ${API_KEY}" \
   -H "Content-Type: application/json" \
-  -d '{"name":"invoice.render","payload":{"invoiceId":"inv_1042"},"priority":10,"maxRetries":3,"backoffMs":2000,"delayMs":0,"schedulingCost":4,"deadlineAt":"2026-11-24T19:00:00Z","idempotencyKey":"inv-1042-v1"}'
+  -d '{"name":"echo","payload":{"message":"hello pulsequeue","metadata":{"source":"api-demo"}},"priority":10,"maxRetries":3,"backoffMs":2000,"delayMs":0,"schedulingCost":4,"deadlineAt":"2026-11-24T19:00:00Z","idempotencyKey":"echo-demo-v1"}'
 ```
+
+### Built-in Worker Processors (`apps/worker/src/processors/builtin.processors.ts`)
+
+The default worker `ProcessorRegistry` registers exactly four built-in processors. Submitting a job whose `name` is not registered causes the worker to throw `UnregisteredProcessorError` and fail the job. Invalid payloads throw `InvalidJobPayloadError`.
+
+| Job `name`       | Payload Schema                                                                                                | Behavior & Returned Output                                                                                                                                                                                                                                                                         |
+| ---------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `echo`           | `{ message: string (1-4096 chars), metadata?: Record<string, string \| number \| boolean> }`                  | Computes the SHA-256 digest of `message` and returns `{ echoed, length, sha256, attemptNumber, metadata? }`.                                                                                                                                                                                       |
+| `math.sum`       | `{ numbers: number[] (1-10,000 finite numbers) }`                                                             | Computes aggregate statistics and returns `{ sum, count, min, max, average }`.                                                                                                                                                                                                                     |
+| `transform.json` | `{ records: Record<string, string \| number \| boolean \| null>, uppercaseKeys?: boolean (default false) }`   | Sorts keys deterministically (optionally uppercasing them) and returns `{ keyCount, transformed }`.                                                                                                                                                                                                |
+| `test.fail`      | `{ reason?: string (1-500 chars, default "Simulated processor failure"), failUntilAttempt?: integer (1-20) }` | Throws an error on every attempt when `failUntilAttempt` is omitted (demonstrating retry exhaustion and DLQ movement), or throws while `attemptNumber <= failUntilAttempt` and then succeeds with `{ recovered: true, recoveredOnAttempt, maxAttempts }` (demonstrating transient retry recovery). |
 
 ---
 

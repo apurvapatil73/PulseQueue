@@ -161,6 +161,7 @@ PulseQueue/
 ├── docs/
 │   ├── architecture/
 │   │   └── overview.md   # Deep-dive system architecture & Mermaid lifecycle diagrams
+│   ├── API.md            # REST & SSE API reference, auth, RBAC, scopes & curl examples
 │   ├── PERFORMANCE.md    # Phase 10.1 & 10.3 benchmark baselines & optimization evidence
 │   ├── SCALING.md        # Multi-instance architecture, DB pool budgeting & resource profiling
 │   ├── SECURITY.md       # Security architecture, auth, API keys, RBAC & rate limiting
@@ -245,6 +246,19 @@ To run multiple local API and worker replicas simultaneously, see [docs/SCALING.
 
 ---
 
+## Built-in Worker Processors
+
+The default worker `ProcessorRegistry` (`apps/worker/src/processors/builtin.processors.ts`) registers four built-in processors. Any unregistered job `name` fails with `UnregisteredProcessorError`, and invalid payloads fail with `InvalidJobPayloadError`:
+
+| Job `name`       | Payload Schema                                                                                                    | Behavior & Output                                                                                                                                                                                                                                                                                          |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `echo`           | `{ "message": string (1-4096 chars), "metadata"?: Record<string, string \| number \| boolean> }`                  | Computes SHA-256 digest of `message` and returns `{ echoed, length, sha256, attemptNumber, metadata? }`.                                                                                                                                                                                                   |
+| `math.sum`       | `{ "numbers": number[] (1-10,000 finite numbers) }`                                                               | Computes aggregate statistics and returns `{ sum, count, min, max, average }`.                                                                                                                                                                                                                             |
+| `transform.json` | `{ "records": Record<string, string \| number \| boolean \| null>, "uppercaseKeys"?: boolean (default false) }`   | Deterministically sorts keys (optionally uppercasing them) and returns `{ keyCount, transformed }`.                                                                                                                                                                                                        |
+| `test.fail`      | `{ "reason"?: string (1-500 chars, default "Simulated processor failure"), "failUntilAttempt"?: integer (1-20) }` | Throws on every attempt when `failUntilAttempt` is omitted (to demonstrate retry exhaustion and DLQ movement), or throws while `attemptNumber <= failUntilAttempt` and succeeds on the next attempt with `{ recovered: true, recoveredOnAttempt, maxAttempts }` (to demonstrate transient retry recovery). |
+
+---
+
 ## Testing, Quality & Benchmark Commands
 
 All commands below match root [package.json](package.json) verbatim:
@@ -277,6 +291,7 @@ npm run benchmark:large-scale
 ## Documentation Index
 
 - [Architecture Overview](docs/architecture/overview.md) — System design, data flows, distributed coordination, and failure recovery diagrams
+- [REST & SSE API Reference](docs/API.md) - All 12 mounted route groups, authentication, RBAC, API-key scopes, built-in processors, and `curl` examples
 - [Security Architecture](docs/SECURITY.md) — Authentication, refresh rotation, API keys, RBAC, tenant isolation, and rate limiting
 - [Security & Fault-Injection Testing Guide](docs/SECURITY_TESTING.md) — Security regression and adversarial test coverage
 - [Performance Baseline & Optimization Guide](docs/PERFORMANCE.md) — Phase 10.1 & 10.3 measurements, bottlenecks, and reproduction commands

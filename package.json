@@ -1,7 +1,7 @@
 {
   "name": "pulsequeue",
   "version": "0.1.0",
-  "description": "PulseQueue - Distributed Job Processing and Workflow Management Platform",
+  "description": "PulseQueue - Distributed Job Processing and Fair-Scheduling Platform",
   "private": true,
   "workspaces": [
     "packages/*",

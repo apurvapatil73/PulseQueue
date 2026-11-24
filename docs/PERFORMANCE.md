@@ -83,6 +83,16 @@ NODE_ENV=test npm run benchmark:large-scale -- --jobs 1000,5000,10000 --worker-d
 NODE_ENV=test npx tsx apps/backend/scripts/runLargeScaleBenchmark.ts --format csv --out large-scale.csv
 ```
 
+Windows PowerShell equivalents:
+
+```powershell
+# Full 1,000 / 5,000 / 10,000-job suite + live Worker OS drain + 6-policy fairness + 15s stability
+$env:NODE_ENV='test'; npm run benchmark:large-scale -- --jobs 1000,5000,10000 --worker-drain-jobs 300 --stability-sec 15
+
+# CSV export
+$env:NODE_ENV='test'; npx tsx apps/backend/scripts/runLargeScaleBenchmark.ts --format csv --out large-scale.csv
+```
+
 ### Workload Separation & Measurements (Local Single-Node Docker)
 
 All numbers below are **local single-node Docker measurements** (Intel i5-12450H, 15.73 GiB RAM, Node.js `v22.19.0`, PostgreSQL `16.16`, Redis `7.4.12`), **not** production capacity guarantees. Three distinct workload tiers are measured separately:
