@@ -70,3 +70,51 @@ npx vitest run apps/backend/tests/performanceRegression.test.ts --config apps/ba
 - **Single-Job Submission Transaction Cost (~13–15 ms local):** Each `jobService.create` executes a durable PostgreSQL transaction (job + outbox + event); batch submission endpoints (`POST /jobs/batch`) can be introduced in a future milestone for high-ingestion producers.
 - **PostgreSQL Tuning in Production:** Local Docker uses default `shared_buffers=128MB` and `work_mem=4MB`. Production deployments should size `shared_buffers` (~25% RAM), `effective_cache_size`, and PgBouncer transaction pooling for high replica counts.
 - **Multi-Org Parallelism in `tickAllQueues`:** Currently sweeps queues sequentially per tick; partitioning queues across multiple horizontal scheduler replicas scales linearly using `FOR UPDATE SKIP LOCKED` and per-org advisory locks.
+
+## 7. Phase 10.3 — Large-Scale Workloads, Worker Hot-Path Optimization & Stability
+
+### Reproducing the Large-Scale Suite
+
+```bash
+# Full 1,000 / 5,000 / 10,000-job suite + live Worker OS drain + 6-policy fairness + 15s stability
+NODE_ENV=test npm run benchmark:large-scale -- --jobs 1000,5000,10000 --worker-drain-jobs 300 --stability-sec 15
+
+# CSV export
+NODE_ENV=test npx tsx apps/backend/scripts/runLargeScaleBenchmark.ts --format csv --out large-scale.csv
+```
+
+### Workload Separation & Measurements (Local Single-Node Docker)
+
+All numbers below are **local single-node Docker measurements** (Intel i5-12450H, 15.73 GiB RAM, Node.js `v22.19.0`, PostgreSQL `16.16`, Redis `7.4.12`), **not** production capacity guarantees. Three distinct workload tiers are measured separately:
+
+1. **Tier A — High-Volume Scheduler + PostgreSQL Drain (`1,000` / `5,000` / `10,000` jobs):** Measures batched job submission, `PrioritySchedulerService` claim/dispatch (`batchLimit=100`, 4 tenants, mixed 128 B / 1 KB / 4 KB payloads, mock transport adapter), and batched PostgreSQL completion commit. **This does not represent 10,000 jobs executed through the live BullMQ Worker OS runtime.**
+2. **Tier B — Live Worker OS End-to-End Execution (`300` `echo` jobs):** Measures a separate Node.js Worker OS process (`concurrency=20`) executing real jobs end-to-end through PostgreSQL claim → BullMQ enqueue → `markJobActive` → processor → `markJobCompleted` + `PlatformEvent`, verified from final PostgreSQL `COMPLETED`/`FAILED` counts.
+3. **Tier C — 15-Second Sustained Stability (`5,575` jobs):** Continuous scheduler claim + PostgreSQL completion + Redis `PING` loop sampling heap, RSS, event-loop p95, PG connections, and Redis memory every 3 s.
+
+| Tier / Workload                             | Completed / Target | Failed / Quarantined / Remaining | Submit (jobs/s) | Dispatch (jobs/s) | Completion (jobs/s) |  Drain (ms)  | Tick p95 (ms) | PG p95 (ms) | Redis p95 (ms) | RSS / Heap (MB) | EL p95 (ms) |
+| :------------------------------------------ | :----------------: | :------------------------------: | :-------------: | :---------------: | :-----------------: | :----------: | :-----------: | :---------: | :------------: | :-------------: | :---------: |
+| **Tier A: 1,000 Jobs (Scheduler+DB)**       |   1,000 / 1,000    |            0 / 0 / 0             |    1,547.24     |      937.57       |       863.62        |   1,157.91   |    115.36     |    3.05     |      2.03      | 126.53 / 24.30  |    16.65    |
+| **Tier A: 5,000 Jobs (Scheduler+DB)**       |   5,000 / 5,000    |            0 / 0 / 0             |    1,828.64     |     1,059.65      |      1,005.23       |   4,973.97   |    115.50     |    2.66     |      2.29      | 133.90 / 33.34  |    18.99    |
+| **Tier A: 10,000 Jobs (Scheduler+DB)**      |  10,000 / 10,000   |            0 / 0 / 0             |    1,956.97     |     1,017.56      |       970.56        |  10,303.37   |    122.92     |    3.03     |      2.55      | 142.94 / 32.67  |    19.92    |
+| **Tier B: Live Worker OS Drain (300 echo)** |     300 / 300      |            0 / 0 / 0             |    2,255.53     |       44.11       |      **44.11**      | **6,801.34** |       —       |      —      |       —        | 149.31 / 55.26  |    19.12    |
+
+### Evidence-Backed Worker Hot-Path Optimization (`apps/backend/src/services/job.service.ts`)
+
+- **Bottleneck Identified:** On every worker job execution, `markJobActive` unconditionally ran `tx.jobDispatchOutbox.updateMany(...)` inside the interactive activation transaction even when the outbox was already `DISPATCHED`, and `markJobCompleted` unconditionally ran `db.scheduleExecution.updateMany(...)` sequentially before `eventService.record(...)` even for non-scheduled jobs.
+- **Optimization Implemented:** Included `dispatchOutbox: { select: { status: true } }` in `markJobActive` to skip `jobDispatchOutbox.updateMany` unless `status === PENDING`; included `scheduleExecution: { select: { id: true } }` in `markJobCompleted` to skip `scheduleExecution.updateMany` on non-scheduled jobs while preserving strict causal ordering (`scheduleExecution.updateMany` awaited BEFORE `eventService.record`) for linked scheduled jobs.
+- **Before vs. After (Identical Live Worker OS Process Drain — 300 `echo` Jobs, `concurrency=20`):**
+  - **Before:** `300/300` completed in `8,618.94 ms` (`34.81 jobs/s`).
+  - **After:** `300/300` completed in `6,801.34 ms` (`44.11 jobs/s`) — **+26.7% throughput improvement (−21.1% drain wall-clock time)** with all fencing, outbox-recovery, and schedule-telemetry guarantees preserved.
+
+### 15-Second Sustained Stability Profile (`PRIORITY_AGING`, 5,575 Jobs Completed, 0 Errors)
+
+| Elapsed (s) | Completed | Backlog | Errors | Heap (MB) | RSS (MB) | EL p95 (ms) | PG Conns | Redis Mem |
+| :---------: | :-------: | :-----: | :----: | :-------: | :------: | :---------: | :------: | :-------: |
+|    0.08     |    25     |    0    |   0    |   21.43   |  114.46  |    15.42    |    3     |   9.81M   |
+|    3.10     |   1,075   |    0    |   0    |   26.00   |  114.93  |    18.01    |    3     |   9.81M   |
+|    6.17     |   2,125   |    0    |   0    |   28.97   |  117.66  |    18.01    |    3     |   9.81M   |
+|    9.17     |   3,300   |    0    |   0    |   29.77   |  127.02  |    17.69    |    3     |   9.81M   |
+|    12.19    |   4,525   |    0    |   0    |   31.99   |  127.04  |    17.66    |    3     |   9.81M   |
+|    15.02    |   5,575   |    0    |   0    |   30.95   |  129.67  |    17.55    |    3     |   9.81M   |
+
+Heap plateaued around ~31 MB (young-gen fluctuation, no monotonic leak), PostgreSQL connections stayed flat at `3`, Redis memory stayed flat at `9.81M`, and event-loop p95 remained steady at `17.5–18.0 ms`.

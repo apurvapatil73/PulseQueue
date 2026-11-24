@@ -139,3 +139,30 @@ npx tsx apps/backend/scripts/runResourceProfile.ts --format csv --out resource-p
   2. Runs a 2-stage bounded scheduler drain (`shutdownDrainTimeoutMs = 5000 ms`, followed by `shutdownEscalationGraceMs = 5000 ms` if a tick is still active).
   3. Never disconnects BullMQ/Prisma/Redis underneath an active tick: if still active after bounded escalation, `WorkerRuntime` attaches idempotent deferred cleanup to `PrioritySchedulerService.whenDrained()` and returns `{ clean: false, timedOut: true }`, causing the CLI signal handler to exit with code `1` (bounded by a 15 s hard `forceExitTimer`).
 - **Sustained Heap Delta:** `+4.19 MB` over 10 consecutive `HYBRID_FAIR_DEADLINE` claim rounds (`200` jobs) with `12.01 ms` p95 event-loop delay.
+
+## 5. Phase 10.3 — Multi-Tenant Fairness & Fault-Injection Verification
+
+### Multi-Tenant Fairness Across All 6 Policies (`npm run benchmark:large-scale`)
+
+Evaluated under **saturated contention** (6 rounds, 2 competing `PrioritySchedulerService` instances, `drrBaseQuantum=2`, DB-verified `COMPLETED` counts, `res.policy === policy` asserted): `heavy-w1-c1` (`weight=1, cost=1, maxActive=10, 80 jobs`), `costly-w2-c2` (`weight=2, cost=2, maxActive=10, 80 jobs`), and `rejoin-w4-c1` (`weight=4, cost=1, maxActive=12`, idle rounds 0–1, joins round 2 with `80` jobs):
+
+| Policy                 | `heavy-w1-c1` Completed | `costly-w2-c2` Completed | `rejoin-w4-c1` Completed | Jain's (Unweighted) | Jain's (Cost/Weight Normalized) | Starved / Violations | EDF Order |
+| :--------------------- | :---------------------: | :----------------------: | :----------------------: | :-----------------: | :-----------------------------: | :------------------: | :-------: |
+| `FIFO`                 |    60 (maxActive=10)    |    60 (maxActive=10)     |    48 (maxActive=12)     |       0.9899        |             0.7908              |        0 / 0         |     —     |
+| `STRICT_PRIORITY`      |    60 (maxActive=10)    |    60 (maxActive=10)     |    48 (maxActive=12)     |       0.9899        |             0.7908              |        0 / 0         |     —     |
+| `PRIORITY_AGING`       |    60 (maxActive=10)    |    60 (maxActive=10)     |    48 (maxActive=12)     |       0.9899        |             0.7908              |        0 / 0         |     —     |
+| `WEIGHTED_FAIR`        |    12 (maxActive=2)     |     12 (maxActive=2)     |     32 (maxActive=8)     |       0.7967        |           **0.9697**            |        0 / 0         |     —     |
+| `DEADLINE_AWARE`       |    60 (maxActive=10)    |    60 (maxActive=10)     |    48 (maxActive=12)     |       0.9899        |             0.7908              |        0 / 0         | **true**  |
+| `HYBRID_FAIR_DEADLINE` |    12 (maxActive=2)     |     12 (maxActive=2)     |     32 (maxActive=8)     |       0.7967        |           **0.9697**            |        0 / 0         | **true**  |
+
+### Fault-Injection & Recovery Matrix (`apps/backend/tests/faultInjectionAndScale.test.ts` & `multiProcessScaling.test.ts`)
+
+| Fault Scenario                                                              | Verified Outcome                                                                                                                                                                                                      |
+| :-------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Controlled PostgreSQL backend termination (`pg_terminate_backend`)          | Dedicated `PrismaClient` backend PID terminated server-side; client reconnected on a new backend PID with durable job state intact, claimed, activated, and completed cleanly.                                        |
+| Simulated Redis outage during multi-tenant outbox dispatch                  | All 8 jobs across Org A & Org B remained durable (`OutboxStatus.PENDING`); recovered to `DISPATCHED` on Redis restoration with zero cross-tenant leakage or duplicates.                                               |
+| Significant multi-tenant outbox backlog (120 jobs, `batchSize=40`)          | Reconciled across 3 bounded passes (`60` Org A + `60` Org B), `0` remaining `PENDING` rows, zero duplicates.                                                                                                          |
+| Delayed job delivery & `markJobActive`/`markJobCompleted` hot-path          | `DELAYED + QUEUED` job never claimed before `readyAt`; promoted & completed after `readyAt`; `PENDING` outbox synced by `markJobActive`; `ScheduleExecution` telemetry updated before `JOB_COMPLETED` event emission. |
+| Worker termination during `ACTIVE` execution (expired lease)                | `StalledJobRecoveryService` incremented `fencingToken` (`1 -> 2`), returned job to `PENDING`/`QUEUED`; healthy Worker B completed (`fencingToken = 3`); stale Worker A rejected with `stale_fencing_token`.           |
+| Scheduler OS process `SIGKILL` mid-dispatch (`multiProcessScaling.test.ts`) | Claimed `DISPATCHING` job stranded by killed PID was reclaimed by another OS worker process and completed (`attemptsMade = 1`, `fencingToken = 1`).                                                                   |
+| Poison-job quarantine & repeated scheduler `start -> stopAndDrain` cycles   | Quarantined jobs never re-claimed; 3 consecutive restart cycles drained cleanly with zero leaked timers or stranded rows.                                                                                             |

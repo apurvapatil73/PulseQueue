@@ -815,6 +815,9 @@ export class JobService {
           where: { id: existing.id },
           include: {
             ...JOB_INCLUDE,
+            dispatchOutbox: {
+              select: { status: true },
+            },
             scheduleExecution: {
               select: {
                 id: true,
@@ -842,11 +845,13 @@ export class JobService {
           });
         }
 
-        // Synchronize outbox if a scheduler crashed after BullMQ enqueue but before markDispatched
-        await tx.jobDispatchOutbox.updateMany({
-          where: { jobId: existing.id, status: OutboxStatus.PENDING },
-          data: { status: OutboxStatus.DISPATCHED, dispatchedAt: now, lastError: null },
-        });
+        // Synchronize outbox ONLY if still PENDING (e.g. scheduler crashed before markDispatched)
+        if (updated.dispatchOutbox?.status === OutboxStatus.PENDING) {
+          await tx.jobDispatchOutbox.updateMany({
+            where: { jobId: existing.id, status: OutboxStatus.PENDING },
+            data: { status: OutboxStatus.DISPATCHED, dispatchedAt: now, lastError: null },
+          });
+        }
 
         return {
           outcome: 'activated' as const,
@@ -952,7 +957,10 @@ export class JobService {
 
     const job = await db.job.findFirst({
       where: { id: jobId, queue: { organisationId: orgId } },
-      include: JOB_INCLUDE,
+      include: {
+        ...JOB_INCLUDE,
+        scheduleExecution: { select: { id: true } },
+      },
     });
 
     if (!job) {
@@ -999,16 +1007,19 @@ export class JobService {
       return { outcome: 'not_active', status: job.status };
     }
 
-    // Persist immutable execution telemetry onto linked ScheduleExecution (if any)
-    await db.scheduleExecution.updateMany({
-      where: { jobId: job.id },
-      data: {
-        finalJobStatus: JobStatus.COMPLETED,
-        completedAt: job.completedAt ?? completedAt,
-        ...(job.durationMs !== null ? { durationMs: job.durationMs } : {}),
-        retryCount: Math.max(0, attemptNumber - 1),
-      },
-    });
+    // Persist immutable execution telemetry onto linked ScheduleExecution (only if linked)
+    // BEFORE emitting JOB_COMPLETED so SSE/API readers always observe consistent telemetry.
+    if (job.scheduleExecution) {
+      await db.scheduleExecution.updateMany({
+        where: { jobId: job.id },
+        data: {
+          finalJobStatus: JobStatus.COMPLETED,
+          completedAt: job.completedAt ?? completedAt,
+          ...(job.durationMs !== null ? { durationMs: job.durationMs } : {}),
+          retryCount: Math.max(0, attemptNumber - 1),
+        },
+      });
+    }
 
     await eventService.record({
       type: PlatformEventType.JOB_COMPLETED,

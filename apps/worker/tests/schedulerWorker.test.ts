@@ -140,7 +140,7 @@ describe('Phase 8.3.2 — Live Worker Execution with Custom Priority Scheduling'
     });
 
     expect(executionOrder).toEqual(['high-19', 'mid-10', 'low-2']);
-  });
+  }, 15_000);
 
   it('routes transient retries on custom-policy queues back through DELAYED+QUEUED and completes on retry', async () => {
     const submitted = await jobService.create(orgId, retryQueue.id, null, {

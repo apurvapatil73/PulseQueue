@@ -26,6 +26,7 @@
     "benchmark:scheduler": "npx tsx apps/backend/scripts/runSchedulerBenchmark.ts",
     "benchmark:performance": "npx tsx apps/backend/scripts/runPerformanceBenchmark.ts",
     "benchmark:profile": "npx tsx apps/backend/scripts/runResourceProfile.ts",
+    "benchmark:large-scale": "npx tsx apps/backend/scripts/runLargeScaleBenchmark.ts",
     "prisma:generate": "npm run --workspace=@pulsequeue/backend prisma:generate",
     "prisma:migrate": "npm run --workspace=@pulsequeue/backend prisma:migrate",
     "prisma:studio": "npm run --workspace=@pulsequeue/backend prisma:studio",

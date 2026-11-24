@@ -523,7 +523,8 @@ describe('Phase 8.2 — Tenant Quotas, Backpressure, Retry Budgets & Poison-Job 
     expect(schedRes.status).toBe(429);
 
     // 3. Due RECURRING schedule tick must enforce quota (skip materialization, create no job)
-    const pastSlot = new Date(Date.now() - 10_000);
+    // Anchor nextRunAt to current UTC minute start so it is always <= now while next occurrence > now
+    const pastSlot = new Date(Math.floor(Date.now() / 60_000) * 60_000);
     const recurring = await prisma.schedule.create({
       data: {
         organisationId: orgAId,
