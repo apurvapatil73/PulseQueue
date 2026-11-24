@@ -21,7 +21,7 @@ export interface RateLimitOptions {
    */
   failurePolicy?: RateLimitFailurePolicy;
   /** Optional explicit Redis client (used for multi-instance and failure-mode integration tests). */
-  redisClient?: Pick<Redis, 'eval' | 'status' | 'connect'>;
+  redisClient?: Pick<Redis, 'eval' | 'status' | 'connect'> & Partial<Pick<Redis, 'evalsha'>>;
   /** When true, enforces rate limiting even in NODE_ENV === 'test' without requiring header opt-in. */
   alwaysEnforce?: boolean;
   /** Key prefix namespace for Redis isolation (defaults to `pq:rl`). */
@@ -53,6 +53,11 @@ if pttl < 0 then
 end
 return {current, pttl}
 `;
+
+const ATOMIC_RATE_LIMIT_LUA_SHA = crypto
+  .createHash('sha1')
+  .update(ATOMIC_RATE_LIMIT_LUA)
+  .digest('hex');
 
 const activeStores = new Set<Map<string, BucketEntry>>();
 
@@ -90,17 +95,36 @@ function defaultKeyGenerator(name: string, req: Request): string {
 }
 
 async function consumeRedisWindow(
-  client: Pick<Redis, 'eval' | 'status' | 'connect'>,
+  client: Pick<Redis, 'eval' | 'status' | 'connect'> & Partial<Pick<Redis, 'evalsha'>>,
   key: string,
   windowMs: number,
 ): Promise<{ count: number; pttlMs: number }> {
   if (client.status === 'wait') {
     await client.connect();
   }
-  const res = (await client.eval(ATOMIC_RATE_LIMIT_LUA, 1, key, String(windowMs))) as [
-    number | string,
-    number | string,
-  ];
+  let res: [number | string, number | string];
+  if (typeof client.evalsha === 'function') {
+    try {
+      res = (await client.evalsha(ATOMIC_RATE_LIMIT_LUA_SHA, 1, key, String(windowMs))) as [
+        number | string,
+        number | string,
+      ];
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      if (!msg.includes('NOSCRIPT')) {
+        throw err;
+      }
+      res = (await client.eval(ATOMIC_RATE_LIMIT_LUA, 1, key, String(windowMs))) as [
+        number | string,
+        number | string,
+      ];
+    }
+  } else {
+    res = (await client.eval(ATOMIC_RATE_LIMIT_LUA, 1, key, String(windowMs))) as [
+      number | string,
+      number | string,
+    ];
+  }
   const count = Number(res[0]);
   const pttlMs = Math.max(1, Number(res[1]));
   if (!Number.isFinite(count) || !Number.isFinite(pttlMs)) {

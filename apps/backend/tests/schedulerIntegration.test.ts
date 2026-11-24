@@ -283,6 +283,9 @@ describe('Phase 8.3.2 — Production Scheduler Integration (PostgreSQL + Redis/B
     expect(oneTimeJob?.dispatchState).toBe(JobDispatchState.QUEUED);
 
     // 3. Due RECURRING schedule on custom agingQueueId
+    // Anchor nextRunAt to the start of the current UTC minute so it is always <= now
+    // while the next `* * * * *` occurrence is strictly > now (immune to minute-boundary SKIP_MISSED).
+    const currentMinuteStart = new Date(Math.floor(Date.now() / 60_000) * 60_000);
     const recurring = await prisma.schedule.create({
       data: {
         organisationId: orgId,
@@ -294,7 +297,7 @@ describe('Phase 8.3.2 — Production Scheduler Integration (PostgreSQL + Redis/B
         payload: { message: 'sched-recurring' },
         cronExpression: '* * * * *',
         timezone: 'UTC',
-        nextRunAt: new Date(Date.now() - 10_000),
+        nextRunAt: currentMinuteStart,
       },
     });
     await scheduleDispatcherService.tick(new Date(), { organisationId: orgId });

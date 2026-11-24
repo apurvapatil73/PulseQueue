@@ -1075,19 +1075,44 @@ export class PrioritySchedulerService {
           }
         }
 
-        // Atomically transition only the selected locked rows from QUEUED -> DISPATCHING
-        // and persist explainability decision + deadlineMissedAt in the same transaction
-        for (const entry of selectedEntries) {
-          await tx.job.update({
-            where: { id: entry.row.id },
-            data: {
-              dispatchState: JobDispatchState.DISPATCHING,
-              dispatchClaimedAt: now,
-              dispatchClaimedBy: params.claimerId,
-              schedulingDecision: entry.audit as unknown as Prisma.InputJsonValue,
-              ...(entry.deadlineMissedAt ? { deadlineMissedAt: entry.deadlineMissedAt } : {}),
-            },
-          });
+        // Atomically transition all selected locked rows from QUEUED -> DISPATCHING in a SINGLE
+        // batched PostgreSQL UPDATE (eliminating N sequential round-trips under the org advisory lock).
+        // Explicit WHERE guards + affected-row count assertion guarantee zero out-of-scope or
+        // non-eligible transitions and atomic rollback of DRR/reservation state on any mismatch.
+        if (selectedEntries.length > 0) {
+          const updateRecords = JSON.stringify(
+            selectedEntries.map((entry) => ({
+              id: entry.row.id,
+              scheduling_decision: entry.audit,
+              deadline_missed_at: entry.deadlineMissedAt
+                ? entry.deadlineMissedAt.toISOString()
+                : null,
+            })),
+          );
+          const updatedCount = await tx.$executeRaw`
+            UPDATE jobs AS j
+            SET dispatch_state = 'DISPATCHING'::"JobDispatchState",
+                dispatch_claimed_at = ${now},
+                dispatch_claimed_by = ${params.claimerId},
+                scheduling_decision = v.scheduling_decision,
+                deadline_missed_at = COALESCE(v.deadline_missed_at, j.deadline_missed_at),
+                updated_at = ${now}
+            FROM jsonb_to_recordset(${updateRecords}::jsonb) AS v(
+              id uuid,
+              scheduling_decision jsonb,
+              deadline_missed_at timestamptz
+            )
+            WHERE j.id = v.id
+              AND j.queue_id = ${queue.id}::uuid
+              AND j.status = 'PENDING'::"JobStatus"
+              AND j.dispatch_state = 'QUEUED'::"JobDispatchState"
+              AND j.is_quarantined = false
+          `;
+          if (Number(updatedCount) !== selectedEntries.length) {
+            throw new Error(
+              `Batched scheduler claim count mismatch: expected ${selectedEntries.length}, updated ${updatedCount}`,
+            );
+          }
         }
 
         const claimLatencyMs = Math.max(0, Date.now() - claimStartedAt);
@@ -1376,6 +1401,7 @@ export class PrioritySchedulerService {
         const res = await tx.job.updateMany({
           where: {
             id: { in: jobIds },
+            status: JobStatus.PENDING,
             dispatchState: JobDispatchState.DISPATCHING,
             dispatchClaimedBy: claimerId,
           },
@@ -1390,6 +1416,7 @@ export class PrioritySchedulerService {
           where: {
             jobId: { in: jobIds },
             status: OutboxStatus.PENDING,
+            job: { dispatchState: JobDispatchState.DISPATCHED },
           },
           data: {
             status: OutboxStatus.DISPATCHED,
@@ -1403,6 +1430,7 @@ export class PrioritySchedulerService {
           where: {
             jobId: { in: jobIds },
             dispatchedAt: null,
+            job: { dispatchState: JobDispatchState.DISPATCHED },
           },
           data: {
             dispatchedAt,
@@ -1423,6 +1451,7 @@ export class PrioritySchedulerService {
     const res = await db.job.updateMany({
       where: {
         id: { in: jobIds },
+        status: JobStatus.PENDING,
         dispatchState: JobDispatchState.DISPATCHING,
         dispatchClaimedBy: claimerId,
       },
@@ -1502,31 +1531,41 @@ export class PrioritySchedulerService {
     const dispatchedIds: string[] = [];
     const failedIds: string[] = [];
     const nowMs = Date.now();
+    const DISPATCH_CONCURRENCY = 8;
 
-    for (const job of claimResult.claimed) {
-      try {
-        const res = await adapter.dispatchClaimedJob(queue, job, job.evaluation.effectivePriority);
-        if (res.enqueued) {
-          dispatchedIds.push(job.id);
-          const latencyMs = Math.max(0, nowMs - job.readyAt.getTime());
-          this.dispatchLatencySumMs += latencyMs;
-          this.dispatchLatencyCount += 1;
-          schedulerMetricsRegistry.recordDispatchSuccess(claimResult.policy, latencyMs);
-        } else {
-          failedIds.push(job.id);
-          this.dispatchFailuresTotal += 1;
-          schedulerMetricsRegistry.recordDispatchFailure(claimResult.policy);
-        }
-      } catch (err) {
-        failedIds.push(job.id);
-        this.dispatchFailuresTotal += 1;
-        schedulerMetricsRegistry.recordDispatchFailure(claimResult.policy);
-        logger.warn('Custom scheduler failed to dispatch claimed job to transport', {
-          policy: claimResult.policy,
-          jobId: job.id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+    for (let i = 0; i < claimResult.claimed.length; i += DISPATCH_CONCURRENCY) {
+      const chunk = claimResult.claimed.slice(i, i + DISPATCH_CONCURRENCY);
+      await Promise.all(
+        chunk.map(async (job) => {
+          try {
+            const res = await adapter.dispatchClaimedJob(
+              queue,
+              job,
+              job.evaluation.effectivePriority,
+            );
+            if (res.enqueued) {
+              dispatchedIds.push(job.id);
+              const latencyMs = Math.max(0, nowMs - job.readyAt.getTime());
+              this.dispatchLatencySumMs += latencyMs;
+              this.dispatchLatencyCount += 1;
+              schedulerMetricsRegistry.recordDispatchSuccess(claimResult.policy, latencyMs);
+            } else {
+              failedIds.push(job.id);
+              this.dispatchFailuresTotal += 1;
+              schedulerMetricsRegistry.recordDispatchFailure(claimResult.policy);
+            }
+          } catch (err) {
+            failedIds.push(job.id);
+            this.dispatchFailuresTotal += 1;
+            schedulerMetricsRegistry.recordDispatchFailure(claimResult.policy);
+            logger.warn('Custom scheduler failed to dispatch claimed job to transport', {
+              policy: claimResult.policy,
+              jobId: job.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }),
+      );
     }
 
     const [dispatched, released] = await Promise.all([
