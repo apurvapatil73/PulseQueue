@@ -6,13 +6,18 @@ on:
   pull_request:
     branches: [main, master, develop]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   validate:
-    name: Lint, Typecheck & Build
+    name: Quality, Build & Frontend Tests (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [20.x, 22.x]
+        node-version: [22.x]
 
     steps:
       - name: Checkout code
@@ -27,6 +32,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Generate Prisma Client
+        run: npm run prisma:generate
+
       - name: Format check
         run: npm run format:check
 
@@ -36,5 +44,78 @@ jobs:
       - name: Type check
         run: npm run typecheck
 
-      - name: Build packages and apps
+      - name: Build backend, worker, and shared packages
         run: npm run build
+
+      - name: Build frontend
+        run: npm run build:frontend
+
+      - name: Run frontend tests
+        run: npm run test:frontend
+
+  integration-tests:
+    name: Backend & Worker Integration Tests
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pulsequeue
+          POSTGRES_PASSWORD: pulsequeue_ci_password
+          POSTGRES_DB: pulsequeue_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pulsequeue -d pulsequeue_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://pulsequeue:pulsequeue_ci_password@127.0.0.1:5432/pulsequeue_test?schema=public
+      REDIS_URL: redis://127.0.0.1:6379
+      JWT_SECRET: ci-test-jwt-secret-must-be-at-least-32-chars-long
+      API_KEY_SECRET: ci-test-api-key-secret-distinct-32-chars-long
+      DATABASE_POOL_SIZE: '10'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npm run prisma:generate
+
+      - name: Build backend, worker, and shared packages
+        run: npm run build
+
+      - name: Apply PostgreSQL migrations
+        run: npm exec --workspace=@pulsequeue/backend -- prisma migrate deploy
+
+      - name: Run backend test suite
+        run: npm run test:backend
+
+      - name: Run worker test suite
+        run: npm run test:worker
