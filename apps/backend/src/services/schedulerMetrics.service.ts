@@ -17,6 +17,9 @@ export const SCHEDULING_POLICIES: readonly SchedulingPolicy[] = [
   SchedulingPolicy.FIFO,
   SchedulingPolicy.STRICT_PRIORITY,
   SchedulingPolicy.PRIORITY_AGING,
+  SchedulingPolicy.WEIGHTED_FAIR,
+  SchedulingPolicy.DEADLINE_AWARE,
+  SchedulingPolicy.HYBRID_FAIR_DEADLINE,
 ];
 
 export function mapPriorityToTier(priority: number): PriorityTier {
@@ -35,6 +38,7 @@ export const SCHEDULER_HISTOGRAM_BUCKETS = {
   dispatchLatencyMs: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 15000, 60000] as const,
   tickDurationMs: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000] as const,
   batchSizeCount: [1, 2, 4, 8, 16, 32, 64, 128] as const,
+  deadlineLatenessMs: [10, 50, 100, 250, 500, 1000, 5000, 30000, 60000] as const,
 } as const;
 
 export interface HistogramBucketEntry {
@@ -146,6 +150,12 @@ export interface GlobalSchedulerMetricsSnapshot {
     priorityInversionsTotal: number;
     tenantCapacityDenialsTotal: number;
     reservationRecoveriesTotal: number;
+    drrRoundsTotal: number;
+    drrDeficitUpdatesTotal: number;
+    drrDeficitConsumedTotal: number;
+    drrFairnessDenialsTotal: number;
+    deadlineAwareDispatchesTotal: number;
+    deadlineMissesTotal: number;
     byPolicy: Record<
       SchedulingPolicy,
       {
@@ -165,6 +175,7 @@ export interface GlobalSchedulerMetricsSnapshot {
     dispatchLatencyMs: HistogramSnapshot;
     tickDurationMs: HistogramSnapshot;
     batchSize: HistogramSnapshot;
+    deadlineLatenessMs: HistogramSnapshot;
   };
 }
 
@@ -177,6 +188,9 @@ function createZeroPolicyRecord(): Record<
     [SchedulingPolicy.FIFO]: { claims: 0, dispatches: 0, failures: 0 },
     [SchedulingPolicy.STRICT_PRIORITY]: { claims: 0, dispatches: 0, failures: 0 },
     [SchedulingPolicy.PRIORITY_AGING]: { claims: 0, dispatches: 0, failures: 0 },
+    [SchedulingPolicy.WEIGHTED_FAIR]: { claims: 0, dispatches: 0, failures: 0 },
+    [SchedulingPolicy.DEADLINE_AWARE]: { claims: 0, dispatches: 0, failures: 0 },
+    [SchedulingPolicy.HYBRID_FAIR_DEADLINE]: { claims: 0, dispatches: 0, failures: 0 },
   };
 }
 
@@ -196,6 +210,12 @@ export class SchedulerMetricsRegistry {
   private priorityInversionsTotal = 0;
   private tenantCapacityDenialsTotal = 0;
   private reservationRecoveriesTotal = 0;
+  private drrRoundsTotal = 0;
+  private drrDeficitUpdatesTotal = 0;
+  private drrDeficitConsumedTotal = 0;
+  private drrFairnessDenialsTotal = 0;
+  private deadlineAwareDispatchesTotal = 0;
+  private deadlineMissesTotal = 0;
   private byPolicy = createZeroPolicyRecord();
 
   private lastTickDurationMs: number | null = null;
@@ -217,6 +237,10 @@ export class SchedulerMetricsRegistry {
   private readonly batchSize = new BoundedHistogram(
     SCHEDULER_HISTOGRAM_BUCKETS.batchSizeCount,
     'jobs',
+  );
+  private readonly deadlineLatenessMs = new BoundedHistogram(
+    SCHEDULER_HISTOGRAM_BUCKETS.deadlineLatenessMs,
+    'ms',
   );
 
   recordClaim(policy: SchedulingPolicy, count: number, latencyMs: number): void {
@@ -263,6 +287,33 @@ export class SchedulerMetricsRegistry {
     if (count > 0) this.reservationRecoveriesTotal += count;
   }
 
+  recordDrrRound(): void {
+    this.drrRoundsTotal += 1;
+    this.drrDeficitUpdatesTotal += 1;
+  }
+
+  recordDrrDeficitConsumed(cost: number): void {
+    if (cost > 0) {
+      this.drrDeficitConsumedTotal += cost;
+      this.drrDeficitUpdatesTotal += 1;
+    }
+  }
+
+  recordDrrFairnessDenial(): void {
+    this.drrFairnessDenialsTotal += 1;
+  }
+
+  recordDeadlineDispatch(): void {
+    this.deadlineAwareDispatchesTotal += 1;
+  }
+
+  recordDeadlineMiss(latenessMs: number): void {
+    this.deadlineMissesTotal += 1;
+    if (Number.isFinite(latenessMs) && latenessMs >= 0) {
+      this.deadlineLatenessMs.observe(latenessMs);
+    }
+  }
+
   recordTickDuration(durationMs: number): void {
     this.lastTickDurationMs = Math.round(durationMs * 100) / 100;
     this.tickDurationMs.observe(durationMs);
@@ -286,6 +337,12 @@ export class SchedulerMetricsRegistry {
         priorityInversionsTotal: this.priorityInversionsTotal,
         tenantCapacityDenialsTotal: this.tenantCapacityDenialsTotal,
         reservationRecoveriesTotal: this.reservationRecoveriesTotal,
+        drrRoundsTotal: this.drrRoundsTotal,
+        drrDeficitUpdatesTotal: this.drrDeficitUpdatesTotal,
+        drrDeficitConsumedTotal: Math.round(this.drrDeficitConsumedTotal * 100) / 100,
+        drrFairnessDenialsTotal: this.drrFairnessDenialsTotal,
+        deadlineAwareDispatchesTotal: this.deadlineAwareDispatchesTotal,
+        deadlineMissesTotal: this.deadlineMissesTotal,
         byPolicy: {
           [SchedulingPolicy.LEGACY_BULLMQ]: { ...this.byPolicy[SchedulingPolicy.LEGACY_BULLMQ] },
           [SchedulingPolicy.FIFO]: { ...this.byPolicy[SchedulingPolicy.FIFO] },
@@ -293,6 +350,11 @@ export class SchedulerMetricsRegistry {
             ...this.byPolicy[SchedulingPolicy.STRICT_PRIORITY],
           },
           [SchedulingPolicy.PRIORITY_AGING]: { ...this.byPolicy[SchedulingPolicy.PRIORITY_AGING] },
+          [SchedulingPolicy.WEIGHTED_FAIR]: { ...this.byPolicy[SchedulingPolicy.WEIGHTED_FAIR] },
+          [SchedulingPolicy.DEADLINE_AWARE]: { ...this.byPolicy[SchedulingPolicy.DEADLINE_AWARE] },
+          [SchedulingPolicy.HYBRID_FAIR_DEADLINE]: {
+            ...this.byPolicy[SchedulingPolicy.HYBRID_FAIR_DEADLINE],
+          },
         },
       },
       gauges: {
@@ -305,6 +367,7 @@ export class SchedulerMetricsRegistry {
         dispatchLatencyMs: this.dispatchLatencyMs.snapshot(),
         tickDurationMs: this.tickDurationMs.snapshot(),
         batchSize: this.batchSize.snapshot(),
+        deadlineLatenessMs: this.deadlineLatenessMs.snapshot(),
       },
     };
   }
@@ -319,6 +382,12 @@ export class SchedulerMetricsRegistry {
     this.priorityInversionsTotal = 0;
     this.tenantCapacityDenialsTotal = 0;
     this.reservationRecoveriesTotal = 0;
+    this.drrRoundsTotal = 0;
+    this.drrDeficitUpdatesTotal = 0;
+    this.drrDeficitConsumedTotal = 0;
+    this.drrFairnessDenialsTotal = 0;
+    this.deadlineAwareDispatchesTotal = 0;
+    this.deadlineMissesTotal = 0;
     this.byPolicy = createZeroPolicyRecord();
     this.lastTickDurationMs = null;
     this.lastBatchSize = null;
@@ -327,6 +396,7 @@ export class SchedulerMetricsRegistry {
     this.dispatchLatencyMs.reset();
     this.tickDurationMs.reset();
     this.batchSize.reset();
+    this.deadlineLatenessMs.reset();
   }
 }
 

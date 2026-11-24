@@ -75,6 +75,18 @@ export const createJobSchema = z.object({
     .min(1, 'idempotencyKey must not be empty')
     .max(128, 'idempotencyKey must not exceed 128 characters')
     .optional(),
+  schedulingCost: z
+    .number({ invalid_type_error: 'schedulingCost must be an integer' })
+    .int('schedulingCost must be an integer')
+    .min(1, 'schedulingCost must be at least 1')
+    .max(100, 'schedulingCost must not exceed 100')
+    .optional()
+    .default(1),
+  deadlineAt: z
+    .string()
+    .datetime({ offset: true, message: 'deadlineAt must be a valid ISO-8601 timestamp' })
+    .nullable()
+    .optional(),
 });
 
 export const listJobsQuerySchema = z.object({

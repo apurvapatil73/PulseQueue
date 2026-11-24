@@ -80,6 +80,8 @@ export const createQueueSchema = z.object({
   agingRatePerSec: z.number().min(0.001).max(10.0).optional(),
   maxEffectivePriority: z.number().min(QUEUE_LIMITS.MAX_PRIORITY).max(100.0).optional(),
   starvationThresholdSec: z.number().int().min(10).max(86_400).nullable().optional(),
+  schedulingWeight: z.number().int().min(1).max(100).optional(),
+  deadlineUrgencyWindowSec: z.number().int().min(5).max(86_400).optional(),
 });
 
 export const updateQueueSchema = z
@@ -99,6 +101,8 @@ export const updateQueueSchema = z
     agingRatePerSec: z.number().min(0.001).max(10.0).optional(),
     maxEffectivePriority: z.number().min(QUEUE_LIMITS.MAX_PRIORITY).max(100.0).optional(),
     starvationThresholdSec: z.number().int().min(10).max(86_400).nullable().optional(),
+    schedulingWeight: z.number().int().min(1).max(100).optional(),
+    deadlineUrgencyWindowSec: z.number().int().min(5).max(86_400).optional(),
   })
   .refine(
     (data) =>
@@ -116,7 +120,9 @@ export const updateQueueSchema = z
       data.schedulingPolicy !== undefined ||
       data.agingRatePerSec !== undefined ||
       data.maxEffectivePriority !== undefined ||
-      data.starvationThresholdSec !== undefined,
+      data.starvationThresholdSec !== undefined ||
+      data.schedulingWeight !== undefined ||
+      data.deadlineUrgencyWindowSec !== undefined,
     { message: 'At least one updatable field must be provided' },
   );
 

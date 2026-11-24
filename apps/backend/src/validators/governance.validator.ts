@@ -16,9 +16,12 @@ export const updateOrgQuotasSchema = z
       .optional(),
     retryBudgetMaxRetries: z.number().int().min(0).max(100_000).nullable().optional(),
     retryBudgetWindowSeconds: z.number().int().min(10).max(86_400).optional(),
+    schedulingWeight: z.number().int().min(1).max(100).optional(),
+    drrBaseQuantum: z.number().min(1).max(1_000).optional(),
+    drrMaxDeficit: z.number().min(100).max(10_000).optional(),
   })
   .refine((obj) => Object.keys(obj).length > 0, {
-    message: 'At least one quota or retry-budget field must be provided',
+    message: 'At least one quota, retry-budget, or fairness field must be provided',
   });
 
 export type UpdateOrgQuotasInput = z.infer<typeof updateOrgQuotasSchema>;

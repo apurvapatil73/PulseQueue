@@ -145,4 +145,58 @@ describe('Phase 8.3.3 — SchedulerObservabilitySection UI states', () => {
     expect(screen.getByText(/14.5 jobs\/s/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/Scheduler auto-refresh interval/i)).toBeInTheDocument();
   });
+
+  it('renders Phase 8.4 weighted fairness (DRR) and deadline urgency panels when present', () => {
+    const phase84Data: OrganisationSchedulerMetricsView = {
+      ...SAMPLE_METRICS,
+      policyDistribution: [
+        ...SAMPLE_METRICS.policyDistribution,
+        { policy: 'WEIGHTED_FAIR', queueCount: 1, eligibleQueuedJobs: 5, delayedJobs: 0 },
+        { policy: 'DEADLINE_AWARE', queueCount: 1, eligibleQueuedJobs: 3, delayedJobs: 0 },
+        { policy: 'HYBRID_FAIR_DEADLINE', queueCount: 1, eligibleQueuedJobs: 2, delayedJobs: 0 },
+      ],
+      schedulerHealth: {
+        ...SAMPLE_METRICS.schedulerHealth,
+        processCounters: {
+          ...SAMPLE_METRICS.schedulerHealth.processCounters,
+          drrRoundsTotal: 42,
+          drrDeficitConsumedTotal: 180,
+          drrFairnessDenialsTotal: 3,
+          deadlineAwareDispatchesTotal: 19,
+          deadlineMissesTotal: 2,
+        },
+      },
+      fairness: {
+        schedulingWeight: 4,
+        drrBaseQuantum: 10,
+        drrMaxDeficit: 200,
+        schedulingDeficit: 18.5,
+        drrVersion: 14,
+        drrLastRoundAt: '2026-11-24T00:00:00.000Z',
+      },
+      deadlines: {
+        withDeadlinePending: 7,
+        approachingDeadlineCount: 3,
+        missedInWindow: 2,
+        avgLatenessMs: 240,
+        p95LatenessMs: null,
+      },
+    };
+
+    renderWithQuery(
+      <SchedulerObservabilitySection
+        organisationId="org-1"
+        windowMinutes={60}
+        overrideState={{ data: phase84Data }}
+      />,
+    );
+
+    expect(screen.getByText(/Weighted Fair \(DRR\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/Deadline-Aware \(EDF\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/Hybrid Fair \+ Deadline/i)).toBeInTheDocument();
+    expect(screen.getByText(/Weight 4 · Deficit 18.5/i)).toBeInTheDocument();
+    expect(screen.getByText(/3 approaching · 2 missed/i)).toBeInTheDocument();
+    expect(screen.getByText(/DRR Rounds: 42/i)).toBeInTheDocument();
+    expect(screen.getByText(/Deadline Dispatches: 19/i)).toBeInTheDocument();
+  });
 });

@@ -118,6 +118,9 @@ enum SchedulingPolicy {
   FIFO
   STRICT_PRIORITY
   PRIORITY_AGING
+  WEIGHTED_FAIR
+  DEADLINE_AWARE
+  HYBRID_FAIR_DEADLINE
 }
 
 enum JobDispatchState {
@@ -186,9 +189,15 @@ model Organisation {
   maxQueuedJobs            Int?     @map("max_queued_jobs")
   maxDelayedJobs           Int?     @map("max_delayed_jobs")
   maxPayloadBytes          Int?     @map("max_payload_bytes")
-  retryBudgetMaxRetries    Int?     @map("retry_budget_max_retries")
-  retryBudgetWindowSeconds Int      @default(300) @map("retry_budget_window_seconds")
-  createdAt                DateTime @default(now()) @map("created_at")
+  retryBudgetMaxRetries    Int?      @map("retry_budget_max_retries")
+  retryBudgetWindowSeconds Int       @default(300) @map("retry_budget_window_seconds")
+  schedulingWeight         Int       @default(1) @map("scheduling_weight")
+  drrBaseQuantum           Float     @default(10.0) @map("drr_base_quantum")
+  drrMaxDeficit            Float     @default(200.0) @map("drr_max_deficit")
+  schedulingDeficit        Float     @default(0.0) @map("scheduling_deficit")
+  drrVersion               Int       @default(0) @map("drr_version")
+  drrLastRoundAt           DateTime? @map("drr_last_round_at")
+  createdAt                DateTime  @default(now()) @map("created_at")
   updatedAt                DateTime @updatedAt @map("updated_at")
 
   memberships    Membership[]
@@ -261,6 +270,8 @@ model Queue {
   agingRatePerSec          Float            @default(0.05) @map("aging_rate_per_sec")
   maxEffectivePriority     Float            @default(25.0) @map("max_effective_priority")
   starvationThresholdSec   Int?             @default(300) @map("starvation_threshold_sec")
+  schedulingWeight         Int              @default(1) @map("scheduling_weight")
+  deadlineUrgencyWindowSec Int              @default(60) @map("deadline_urgency_window_sec")
   createdById              String?          @map("created_by_id") @db.Uuid
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
@@ -309,6 +320,10 @@ model Job {
   dispatchClaimedBy       String?          @map("dispatch_claimed_by")
   readyAt                 DateTime         @default(now()) @map("ready_at")
   virtualRankAt           DateTime         @default(now()) @map("virtual_rank_at")
+  schedulingCost          Int              @default(1) @map("scheduling_cost")
+  deadlineAt              DateTime?        @map("deadline_at")
+  deadlineMissedAt        DateTime?        @map("deadline_missed_at")
+  schedulingDecision      Json?            @map("scheduling_decision") @db.JsonB
   firstStartedAt          DateTime?        @map("first_started_at")
   startedAt         DateTime? @map("started_at")
   completedAt       DateTime? @map("completed_at")

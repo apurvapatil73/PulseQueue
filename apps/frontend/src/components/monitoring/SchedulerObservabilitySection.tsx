@@ -34,6 +34,9 @@ const POLICY_LABELS: Record<SchedulingPolicy, string> = {
   FIFO: 'FIFO',
   STRICT_PRIORITY: 'Strict Priority',
   PRIORITY_AGING: 'Priority Aging',
+  WEIGHTED_FAIR: 'Weighted Fair (DRR)',
+  DEADLINE_AWARE: 'Deadline-Aware (EDF)',
+  HYBRID_FAIR_DEADLINE: 'Hybrid Fair + Deadline',
 };
 
 function fmtMs(ms: number | null | undefined): string {
@@ -347,7 +350,49 @@ export function SchedulerObservabilitySection({
               <div>
                 Cap Denials: {data.schedulerHealth.processCounters.tenantCapacityDenialsTotal}
               </div>
+              <div>DRR Rounds: {data.schedulerHealth.processCounters.drrRoundsTotal ?? 0}</div>
+              <div>
+                Deadline Dispatches:{' '}
+                {data.schedulerHealth.processCounters.deadlineAwareDispatchesTotal ?? 0}
+              </div>
+              <div>
+                Deadline Misses: {data.schedulerHealth.processCounters.deadlineMissesTotal ?? 0}
+              </div>
             </div>
+            {(data.fairness || data.deadlines) && (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {data.fairness && (
+                  <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                    <div className="text-[11px] font-medium text-slate-400">
+                      Weighted Fairness (DRR)
+                    </div>
+                    <div className="mt-1 font-mono text-sm font-semibold text-slate-100">
+                      Weight {data.fairness.schedulingWeight} · Deficit{' '}
+                      {data.fairness.schedulingDeficit.toFixed(1)}
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-slate-400">
+                      Quantum: {data.fairness.drrBaseQuantum} · Cap: {data.fairness.drrMaxDeficit} ·
+                      v{data.fairness.drrVersion}
+                    </div>
+                  </div>
+                )}
+                {data.deadlines && (
+                  <div className="rounded-lg border border-slate-800 bg-slate-900/50 p-3">
+                    <div className="text-[11px] font-medium text-slate-400">
+                      Deadline Urgency &amp; Lateness
+                    </div>
+                    <div className="mt-1 font-mono text-sm font-semibold text-slate-100">
+                      {data.deadlines.approachingDeadlineCount} approaching ·{' '}
+                      {data.deadlines.missedInWindow} missed
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-slate-400">
+                      Pending w/ deadline: {data.deadlines.withDeadlinePending} · Avg lateness:{' '}
+                      {fmtMs(data.deadlines.avgLatenessMs)}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>

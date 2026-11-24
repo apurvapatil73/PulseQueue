@@ -35,6 +35,7 @@ import {
   isCustomSchedulingPolicy,
   prioritySchedulerService,
 } from './priorityScheduler.service.js';
+import { schedulerMetricsRegistry } from './schedulerMetrics.service.js';
 
 export const DEFAULT_JOB_LEASE_MS = 30_000;
 
@@ -50,6 +51,11 @@ export interface JobView {
   maxRetries: number;
   backoffMs: number;
   delayMs: number;
+  schedulingCost: number;
+  deadlineAt: Date | null;
+  deadlineMissedAt: Date | null;
+  deadlineLatenessMs: number | null;
+  schedulingDecision: Prisma.JsonValue | null;
   idempotencyKey: string | null;
   fencingToken: number;
   leaseExpiresAt: Date | null;
@@ -154,6 +160,12 @@ function sanitizeErrorMessage(message: string): string {
 }
 
 function toJobView(j: JobWithMeta): JobView {
+  const referenceEnd = j.completedAt ?? j.deadlineMissedAt ?? null;
+  const deadlineLatenessMs =
+    j.deadlineAt && referenceEnd && referenceEnd.getTime() > j.deadlineAt.getTime()
+      ? referenceEnd.getTime() - j.deadlineAt.getTime()
+      : null;
+
   return {
     id: j.id,
     queueId: j.queueId,
@@ -166,6 +178,11 @@ function toJobView(j: JobWithMeta): JobView {
     maxRetries: j.maxRetries,
     backoffMs: j.backoffMs,
     delayMs: j.delayMs,
+    schedulingCost: j.schedulingCost,
+    deadlineAt: j.deadlineAt,
+    deadlineMissedAt: j.deadlineMissedAt,
+    deadlineLatenessMs,
+    schedulingDecision: j.schedulingDecision,
     idempotencyKey: j.idempotencyKey,
     fencingToken: j.fencingToken,
     leaseExpiresAt: j.leaseExpiresAt,
@@ -286,6 +303,8 @@ export class JobService {
               maxRetries: input.maxRetries ?? queue.maxRetries,
               backoffMs: input.backoffMs ?? queue.backoffMs,
               delayMs: input.delayMs,
+              schedulingCost: input.schedulingCost ?? 1,
+              deadlineAt: input.deadlineAt ? new Date(input.deadlineAt) : null,
               idempotencyKey: input.idempotencyKey ?? null,
               dispatchState: schedFields.dispatchState,
               readyAt: schedFields.readyAt,
@@ -938,6 +957,22 @@ export class JobService {
 
     if (!job) {
       return { outcome: 'missing' };
+    }
+
+    // Track deadline miss at completion if the job finished past its UTC deadline
+    if (
+      updatedCount.count === 1 &&
+      job.deadlineAt &&
+      !job.deadlineMissedAt &&
+      completedAt.getTime() > job.deadlineAt.getTime()
+    ) {
+      const latenessMs = completedAt.getTime() - job.deadlineAt.getTime();
+      await db.job.update({
+        where: { id: job.id },
+        data: { deadlineMissedAt: completedAt },
+      });
+      job.deadlineMissedAt = completedAt;
+      schedulerMetricsRegistry.recordDeadlineMiss(latenessMs);
     }
 
     if (updatedCount.count !== 1) {

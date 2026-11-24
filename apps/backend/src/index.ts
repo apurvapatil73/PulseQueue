@@ -25,6 +25,7 @@ export * from './services/alertEvaluator.service.js';
 export * from './services/notification.service.js';
 export * from './services/governance.service.js';
 export * from './services/priorityScheduler.service.js';
+export * from './services/fairDeadline.utils.js';
 export * from './services/schedulerMetrics.service.js';
 export * from './services/schedulerObservability.service.js';
 export * from './benchmark/benchmarkStats.js';

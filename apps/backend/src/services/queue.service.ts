@@ -26,6 +26,8 @@ export interface QueueView {
   agingRatePerSec: number;
   maxEffectivePriority: number;
   starvationThresholdSec: number | null;
+  schedulingWeight: number;
+  deadlineUrgencyWindowSec: number;
   jobCount: number;
   createdBy: {
     id: string;
@@ -84,6 +86,8 @@ function toQueueView(q: QueueWithMeta): QueueView {
     agingRatePerSec: q.agingRatePerSec,
     maxEffectivePriority: q.maxEffectivePriority,
     starvationThresholdSec: q.starvationThresholdSec,
+    schedulingWeight: q.schedulingWeight,
+    deadlineUrgencyWindowSec: q.deadlineUrgencyWindowSec,
     jobCount: q._count.jobs,
     createdBy: q.createdBy,
     createdAt: q.createdAt,
@@ -145,6 +149,12 @@ export class QueueService {
             : {}),
           ...(input.starvationThresholdSec !== undefined
             ? { starvationThresholdSec: input.starvationThresholdSec }
+            : {}),
+          ...(input.schedulingWeight !== undefined
+            ? { schedulingWeight: input.schedulingWeight }
+            : {}),
+          ...(input.deadlineUrgencyWindowSec !== undefined
+            ? { deadlineUrgencyWindowSec: input.deadlineUrgencyWindowSec }
             : {}),
           createdById: userId,
         },
@@ -277,6 +287,12 @@ export class QueueService {
             : {}),
           ...(input.starvationThresholdSec !== undefined
             ? { starvationThresholdSec: input.starvationThresholdSec }
+            : {}),
+          ...(input.schedulingWeight !== undefined
+            ? { schedulingWeight: input.schedulingWeight }
+            : {}),
+          ...(input.deadlineUrgencyWindowSec !== undefined
+            ? { deadlineUrgencyWindowSec: input.deadlineUrgencyWindowSec }
             : {}),
         },
         include: QUEUE_INCLUDE,

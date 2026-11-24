@@ -15,6 +15,16 @@ import {
   type PersistedQueueDescriptor,
 } from './bullmq.service.js';
 import { schedulerMetricsRegistry } from './schedulerMetrics.service.js';
+import {
+  DRR_DEFAULTS,
+  accumulateDrrDeficit,
+  buildSchedulingDecisionAudit,
+  consumeDrrDeficit,
+  evaluateDeadlineUrgency,
+  isDeadlinePolicy,
+  isDrrPolicy,
+  type SchedulingDecisionAudit,
+} from './fairDeadline.utils.js';
 
 /**
  * Advisory lock namespace for tenant-level active/dispatching reservation checks.
@@ -41,6 +51,7 @@ export interface SchedulingPolicyConfig {
   agingRatePerSec: number;
   maxEffectivePriority: number;
   starvationThresholdSec: number | null;
+  deadlineUrgencyWindowSec?: number;
 }
 
 export interface SchedulingCandidateInput {
@@ -49,6 +60,8 @@ export interface SchedulingCandidateInput {
   readyAt: Date;
   virtualRankAt?: Date;
   pausedDurationMs?: number;
+  deadlineAt?: Date | null;
+  schedulingCost?: number;
 }
 
 export interface EvaluatedCandidate {
@@ -81,6 +94,10 @@ export interface ClaimedScheduledJob {
   delayMs: number;
   readyAt: Date;
   virtualRankAt: Date;
+  schedulingCost: number;
+  deadlineAt: Date | null;
+  deadlineMissedAt: Date | null;
+  schedulingDecision: SchedulingDecisionAudit | null;
   dispatchState: JobDispatchState;
   dispatchClaimedAt: Date | null;
   dispatchClaimedBy: string | null;
@@ -103,6 +120,20 @@ export interface ClaimCandidatesParams {
    * active + dispatching reservations.
    */
   enforceOrgActiveLimit?: boolean;
+  /**
+   * For DRR policies (`WEIGHTED_FAIR`, `HYBRID_FAIR_DEADLINE`), controls whether this call
+   * may add one round's quantum (`baseQuantum * weight`) to the organisation's deficit before
+   * claiming. Defaults to `true`.
+   */
+  accumulateDrrRound?: boolean;
+  /**
+   * Minimum logical DRR round interval in milliseconds, enforced authoritatively in PostgreSQL
+   * via `Organisation.drrLastRoundAt` under the per-org advisory lock.
+   * When > 0, multiple independent scheduler processes ticking within the same logical round
+   * window will accumulate quantum at most ONCE per organisation per round.
+   * Defaults to `0` for direct calls; `tickAllQueues` defaults to `activeIntervalMs`.
+   */
+  drrMinRoundIntervalMs?: number;
 }
 
 export interface ClaimCandidatesResult {
@@ -117,7 +148,8 @@ export interface ClaimCandidatesResult {
     | 'legacy_policy'
     | 'zero_limit'
     | 'queue_buffer_full'
-    | 'org_active_limit_reached';
+    | 'org_active_limit_reached'
+    | 'drr_insufficient_deficit';
 }
 
 export interface JobDispatchAdapter {
@@ -458,7 +490,88 @@ export function compareCandidatesByPolicy(
     return a.id.localeCompare(b.id);
   }
 
-  // PRIORITY_AGING (3-band virtual-time comparator)
+  // DEADLINE_AWARE (3-band strict EDF: starvation -> all deadlines ordered by absolute deadlineAt ASC -> no-deadline aging)
+  if (config.schedulingPolicy === SchedulingPolicy.DEADLINE_AWARE) {
+    const evalA = evaluateCandidateScore(a, config, now);
+    const evalB = evaluateCandidateScore(b, config, now);
+    const dA = evaluateDeadlineUrgency(a.deadlineAt, now, config.deadlineUrgencyWindowSec);
+    const dB = evaluateDeadlineUrgency(b.deadlineAt, now, config.deadlineUrgencyWindowSec);
+
+    const edfBand = (ev: EvaluatedCandidate, dl: ReturnType<typeof evaluateDeadlineUrgency>) => {
+      if (ev.isStarvationPromoted) return 0;
+      if (dl.hasDeadline) return 1;
+      return 2;
+    };
+
+    const bandA = edfBand(evalA, dA);
+    const bandB = edfBand(evalB, dB);
+    if (bandA !== bandB) return bandA - bandB;
+
+    if (bandA === 1) {
+      const dlDiff = (a.deadlineAt?.getTime() ?? 0) - (b.deadlineAt?.getTime() ?? 0);
+      if (dlDiff !== 0) return dlDiff;
+      const pDiff = clampBasePriority(b.priority) - clampBasePriority(a.priority);
+      if (pDiff !== 0) return pDiff;
+      if (readyA !== readyB) return readyA - readyB;
+      return a.id.localeCompare(b.id);
+    }
+    // Band 0 (starvation) or Band 2 (no deadline -> aging)
+    if (bandA === 2) {
+      if (evalA.band !== evalB.band) return evalA.band - evalB.band;
+      if (evalA.band === 2) {
+        const vDiff = evalA.virtualRankAt.getTime() - evalB.virtualRankAt.getTime();
+        if (vDiff !== 0) return vDiff;
+      }
+    }
+    if (readyA !== readyB) return readyA - readyB;
+    return a.id.localeCompare(b.id);
+  }
+
+  // HYBRID_FAIR_DEADLINE (Band 0 starvation -> Band 1 approaching or overdue deadline -> Band 2 priority aging)
+  if (config.schedulingPolicy === SchedulingPolicy.HYBRID_FAIR_DEADLINE) {
+    const urgencySec =
+      config.deadlineUrgencyWindowSec ?? DRR_DEFAULTS.DEFAULT_DEADLINE_URGENCY_WINDOW_SEC;
+    const evalA = evaluateCandidateScore(a, config, now);
+    const evalB = evaluateCandidateScore(b, config, now);
+    const dA = evaluateDeadlineUrgency(a.deadlineAt, now, urgencySec);
+    const dB = evaluateDeadlineUrgency(b.deadlineAt, now, urgencySec);
+
+    const hybBand = (ev: EvaluatedCandidate, dl: ReturnType<typeof evaluateDeadlineUrgency>) => {
+      if (ev.isStarvationPromoted) return 0;
+      if (dl.isApproaching || dl.isExpired) return 1;
+      return 2;
+    };
+
+    const bandA = hybBand(evalA, dA);
+    const bandB = hybBand(evalB, dB);
+    if (bandA !== bandB) return bandA - bandB;
+
+    if (bandA === 1) {
+      const dlDiff = (a.deadlineAt?.getTime() ?? 0) - (b.deadlineAt?.getTime() ?? 0);
+      if (dlDiff !== 0) return dlDiff;
+      const pDiff = clampBasePriority(b.priority) - clampBasePriority(a.priority);
+      if (pDiff !== 0) return pDiff;
+      if (readyA !== readyB) return readyA - readyB;
+      return a.id.localeCompare(b.id);
+    }
+
+    if (bandA === 2) {
+      if (evalA.band !== evalB.band) return evalA.band - evalB.band;
+      if (evalA.band === 2) {
+        const vDiff = evalA.virtualRankAt.getTime() - evalB.virtualRankAt.getTime();
+        if (vDiff !== 0) return vDiff;
+      }
+      // Tie-break equal effective priority by earlier deadline (nulls last)
+      const dlA = a.deadlineAt?.getTime() ?? Number.POSITIVE_INFINITY;
+      const dlB = b.deadlineAt?.getTime() ?? Number.POSITIVE_INFINITY;
+      if (dlA !== dlB) return dlA - dlB;
+    }
+
+    if (readyA !== readyB) return readyA - readyB;
+    return a.id.localeCompare(b.id);
+  }
+
+  // PRIORITY_AGING and WEIGHTED_FAIR inner queue ordering (3-band virtual-time comparator)
   const evalA = evaluateCandidateScore(a, config, now);
   const evalB = evaluateCandidateScore(b, config, now);
 
@@ -503,6 +616,9 @@ interface RawClaimedJobRow {
   delay_ms: number;
   ready_at: Date;
   virtual_rank_at: Date;
+  scheduling_cost: number;
+  deadline_at: Date | null;
+  deadline_missed_at: Date | null;
   dispatch_state: JobDispatchState;
   dispatch_claimed_at: Date | null;
   dispatch_claimed_by: string | null;
@@ -540,6 +656,9 @@ export class PrioritySchedulerService {
     [SchedulingPolicy.FIFO]: 0,
     [SchedulingPolicy.STRICT_PRIORITY]: 0,
     [SchedulingPolicy.PRIORITY_AGING]: 0,
+    [SchedulingPolicy.WEIGHTED_FAIR]: 0,
+    [SchedulingPolicy.DEADLINE_AWARE]: 0,
+    [SchedulingPolicy.HYBRID_FAIR_DEADLINE]: 0,
   };
 
   constructor(adapter?: JobDispatchAdapter) {
@@ -603,9 +722,16 @@ export class PrioritySchedulerService {
             agingRatePerSec: true,
             maxEffectivePriority: true,
             starvationThresholdSec: true,
+            schedulingWeight: true,
+            deadlineUrgencyWindowSec: true,
             organisation: {
               select: {
                 maxActiveJobs: true,
+                schedulingWeight: true,
+                drrBaseQuantum: true,
+                drrMaxDeficit: true,
+                schedulingDeficit: true,
+                drrVersion: true,
               },
             },
           },
@@ -693,14 +819,20 @@ export class PrioritySchedulerService {
           effectiveLimit = Math.min(effectiveLimit, queueHeadroom);
         }
 
-        // Tenant-level active + in-flight dispatch reservation cap (`Organisation.maxActiveJobs`):
-        // accounts for ACTIVE jobs across all tenant queues PLUS custom-policy DISPATCHING and
-        // DISPATCHED-but-not-yet-ACTIVE jobs so concurrent schedulers cannot oversubscribe capacity
+        const usesDrr = isDrrPolicy(queue.schedulingPolicy);
         const enforceOrgLimit = params.enforceOrgActiveLimit ?? true;
-        if (enforceOrgLimit && queue.organisation.maxActiveJobs !== null) {
+        const needsOrgLock =
+          usesDrr || (enforceOrgLimit && queue.organisation.maxActiveJobs !== null);
+
+        // Acquire transaction-scoped PostgreSQL advisory lock per organisation whenever
+        // DRR deficit state or Organisation.maxActiveJobs must be updated atomically across processes.
+        if (needsOrgLock) {
           const lockKey = hashOrgLockKey(queue.organisationId);
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK_NS_DISPATCH}::int4, ${lockKey}::int4)`;
+        }
 
+        // Tenant-level active + in-flight dispatch reservation cap (`Organisation.maxActiveJobs`)
+        if (enforceOrgLimit && queue.organisation.maxActiveJobs !== null) {
           const orgReserved = await tx.job.count({
             where: {
               queue: { organisationId: queue.organisationId },
@@ -744,44 +876,244 @@ export class PrioritySchedulerService {
           agingRatePerSec: queue.agingRatePerSec,
           maxEffectivePriority: queue.maxEffectivePriority,
           starvationThresholdSec: queue.starvationThresholdSec,
+          deadlineUrgencyWindowSec: queue.deadlineUrgencyWindowSec,
         };
 
+        // Re-read authoritative DRR state under the advisory lock
+        let drrDeficit: number | null = null;
+        let drrRoundAccumulated = false;
+        if (usesDrr) {
+          const freshOrg = await tx.organisation.findUnique({
+            where: { id: queue.organisationId },
+            select: {
+              schedulingWeight: true,
+              drrBaseQuantum: true,
+              drrMaxDeficit: true,
+              schedulingDeficit: true,
+              drrLastRoundAt: true,
+            },
+          });
+          if (freshOrg) {
+            const hasEligibleInQueue = await tx.job.count({
+              where: {
+                queueId: queue.id,
+                status: JobStatus.PENDING,
+                dispatchState: JobDispatchState.QUEUED,
+                isQuarantined: false,
+                readyAt: { lte: now },
+              },
+              take: 1,
+            });
+            if (hasEligibleInQueue === 0) {
+              // If the entire organisation has 0 eligible DRR jobs, reset idle deficit to 0
+              // so idle tenants cannot hoard unbounded credit across silent periods.
+              const orgEligible = await tx.job.count({
+                where: {
+                  queue: {
+                    organisationId: queue.organisationId,
+                    isPaused: false,
+                    schedulingPolicy: {
+                      in: [SchedulingPolicy.WEIGHTED_FAIR, SchedulingPolicy.HYBRID_FAIR_DEADLINE],
+                    },
+                  },
+                  status: JobStatus.PENDING,
+                  dispatchState: JobDispatchState.QUEUED,
+                  isQuarantined: false,
+                  readyAt: { lte: now },
+                },
+                take: 1,
+              });
+              if (orgEligible === 0 && freshOrg.schedulingDeficit > 0) {
+                await tx.organisation.update({
+                  where: { id: queue.organisationId },
+                  data: {
+                    schedulingDeficit: 0,
+                    drrVersion: { increment: 1 },
+                    drrLastRoundAt: now,
+                  },
+                });
+              }
+              return {
+                queueId: queue.id,
+                organisationId: queue.organisationId,
+                policy: queue.schedulingPolicy,
+                claimed: [],
+                skippedReason: null,
+              };
+            }
+
+            const minRoundIntervalMs = Math.max(0, params.drrMinRoundIntervalMs ?? 0);
+            const elapsedSinceLastRoundMs =
+              freshOrg.drrLastRoundAt !== null
+                ? now.getTime() - freshOrg.drrLastRoundAt.getTime()
+                : Number.POSITIVE_INFINITY;
+            const canAccumulateInRound =
+              (params.accumulateDrrRound ?? true) &&
+              (minRoundIntervalMs === 0 || elapsedSinceLastRoundMs >= minRoundIntervalMs);
+
+            if (canAccumulateInRound) {
+              drrDeficit = accumulateDrrDeficit(
+                freshOrg.schedulingDeficit,
+                freshOrg.drrBaseQuantum,
+                freshOrg.schedulingWeight,
+                freshOrg.drrMaxDeficit,
+              );
+              drrRoundAccumulated = true;
+              schedulerMetricsRegistry.recordDrrRound();
+            } else {
+              drrDeficit = Math.max(0, freshOrg.schedulingDeficit);
+            }
+          }
+        }
+
         const claimStartedAt = Date.now();
-        const claimedRows = await this.claimOrderedRowsInTransaction(
+        const lockedRows = await this.selectLockedCandidatesInTransaction(
           tx,
           queue.id,
           policyConfig,
           effectiveLimit,
           now,
-          params.claimerId,
         );
-        const claimLatencyMs = Math.max(0, Date.now() - claimStartedAt);
 
-        const claimed: ClaimedScheduledJob[] = claimedRows.map((row) => ({
-          id: row.id,
-          queueId: row.queue_id,
-          name: row.name,
-          priority: row.priority,
-          payload: row.payload,
-          maxRetries: row.max_retries,
-          backoffMs: row.backoff_ms,
-          delayMs: row.delay_ms,
-          readyAt: row.ready_at,
-          virtualRankAt: row.virtual_rank_at,
-          dispatchState: row.dispatch_state,
-          dispatchClaimedAt: row.dispatch_claimed_at,
-          dispatchClaimedBy: row.dispatch_claimed_by,
-          evaluation: evaluateCandidateScore(
+        // Apply DRR head-of-line cost gating if this queue uses DRR fairness
+        const selectedEntries: Array<{
+          row: RawClaimedJobRow;
+          audit: SchedulingDecisionAudit;
+          deadlineMissedAt: Date | null;
+          evaluation: EvaluatedCandidate;
+        }> = [];
+
+        let currentDeficit = drrDeficit;
+        let totalConsumedCost = 0;
+
+        for (const row of lockedRows) {
+          const deficitBefore = currentDeficit;
+          if (usesDrr && currentDeficit !== null) {
+            const consumed = consumeDrrDeficit(currentDeficit, row.scheduling_cost);
+            if (!consumed.allowed) {
+              // Standard DRR head-of-line rule: stop this round and retain accumulated deficit
+              // so large jobs accumulate credit across rounds and never starve.
+              break;
+            }
+            currentDeficit = consumed.nextDeficit;
+            totalConsumedCost += consumed.cost;
+          }
+
+          const evaluation = evaluateCandidateScore(
             {
               id: row.id,
               priority: row.priority,
               readyAt: row.ready_at,
               virtualRankAt: row.virtual_rank_at,
+              deadlineAt: row.deadline_at,
+              schedulingCost: row.scheduling_cost,
             },
             policyConfig,
             now,
-          ),
-        }));
+          );
+          const dlEval = evaluateDeadlineUrgency(
+            row.deadline_at,
+            now,
+            queue.deadlineUrgencyWindowSec,
+          );
+          const deadlineMissedAt = dlEval.isExpired ? (row.deadline_missed_at ?? now) : null;
+
+          let reason = 'priority_aging';
+          if (queue.schedulingPolicy === SchedulingPolicy.FIFO) reason = 'fifo_order';
+          else if (queue.schedulingPolicy === SchedulingPolicy.STRICT_PRIORITY)
+            reason = 'strict_priority';
+          else if (evaluation.isStarvationPromoted) reason = 'starvation_promotion';
+          else if (isDeadlinePolicy(queue.schedulingPolicy) && dlEval.isApproaching)
+            reason = 'approaching_deadline_edf';
+          else if (isDeadlinePolicy(queue.schedulingPolicy) && dlEval.isExpired)
+            reason = 'expired_deadline_recovery';
+          else if (usesDrr) reason = 'weighted_fair_drr';
+
+          const audit = buildSchedulingDecisionAudit({
+            policy: queue.schedulingPolicy,
+            band: evaluation.band,
+            reason,
+            basePriority: row.priority,
+            effectivePriority: evaluation.effectivePriority,
+            deadlineAt: row.deadline_at,
+            now,
+            tenantWeight: queue.organisation.schedulingWeight,
+            queueWeight: queue.schedulingWeight,
+            schedulingCost: row.scheduling_cost,
+            deficitBefore,
+            deficitAfter: currentDeficit,
+          });
+
+          selectedEntries.push({ row, audit, deadlineMissedAt, evaluation });
+        }
+
+        // Persist atomic DRR state update only when deficit or round timestamp actually changed
+        // (avoids pushing drrLastRoundAt forward when a second scheduler checks mid-round)
+        if (usesDrr && currentDeficit !== null) {
+          if (drrRoundAccumulated || totalConsumedCost > 0) {
+            await tx.organisation.update({
+              where: { id: queue.organisationId },
+              data: {
+                schedulingDeficit: currentDeficit,
+                drrVersion: { increment: 1 },
+                ...(drrRoundAccumulated ? { drrLastRoundAt: now } : {}),
+              },
+            });
+          }
+          if (totalConsumedCost > 0) {
+            schedulerMetricsRegistry.recordDrrDeficitConsumed(totalConsumedCost);
+          }
+          if (lockedRows.length > 0 && selectedEntries.length === 0) {
+            schedulerMetricsRegistry.recordDrrFairnessDenial();
+            return {
+              queueId: queue.id,
+              organisationId: queue.organisationId,
+              policy: queue.schedulingPolicy,
+              claimed: [],
+              skippedReason: 'drr_insufficient_deficit' as const,
+            };
+          }
+        }
+
+        // Atomically transition only the selected locked rows from QUEUED -> DISPATCHING
+        // and persist explainability decision + deadlineMissedAt in the same transaction
+        for (const entry of selectedEntries) {
+          await tx.job.update({
+            where: { id: entry.row.id },
+            data: {
+              dispatchState: JobDispatchState.DISPATCHING,
+              dispatchClaimedAt: now,
+              dispatchClaimedBy: params.claimerId,
+              schedulingDecision: entry.audit as unknown as Prisma.InputJsonValue,
+              ...(entry.deadlineMissedAt ? { deadlineMissedAt: entry.deadlineMissedAt } : {}),
+            },
+          });
+        }
+
+        const claimLatencyMs = Math.max(0, Date.now() - claimStartedAt);
+
+        const claimed: ClaimedScheduledJob[] = selectedEntries.map(
+          ({ row, audit, deadlineMissedAt, evaluation }) => ({
+            id: row.id,
+            queueId: row.queue_id,
+            name: row.name,
+            priority: row.priority,
+            payload: row.payload,
+            maxRetries: row.max_retries,
+            backoffMs: row.backoff_ms,
+            delayMs: row.delay_ms,
+            readyAt: row.ready_at,
+            virtualRankAt: row.virtual_rank_at,
+            schedulingCost: row.scheduling_cost,
+            deadlineAt: row.deadline_at,
+            deadlineMissedAt,
+            schedulingDecision: audit,
+            dispatchState: JobDispatchState.DISPATCHING,
+            dispatchClaimedAt: now,
+            dispatchClaimedBy: params.claimerId,
+            evaluation,
+          }),
+        );
 
         schedulerMetricsRegistry.recordClaim(
           queue.schedulingPolicy,
@@ -791,6 +1123,15 @@ export class PrioritySchedulerService {
         const starvedPromotions = claimed.filter((c) => c.evaluation.isStarvationPromoted).length;
         if (starvedPromotions > 0) {
           schedulerMetricsRegistry.recordStarvationPromotions(starvedPromotions);
+        }
+        for (const c of claimed) {
+          if (c.deadlineAt) {
+            schedulerMetricsRegistry.recordDeadlineDispatch();
+            const dl = evaluateDeadlineUrgency(c.deadlineAt, now, queue.deadlineUrgencyWindowSec);
+            if (dl.isExpired && dl.latenessMs !== null) {
+              schedulerMetricsRegistry.recordDeadlineMiss(dl.latenessMs);
+            }
+          }
         }
 
         return {
@@ -806,55 +1147,43 @@ export class PrioritySchedulerService {
   }
 
   /**
-   * Executes index-backed `FOR UPDATE SKIP LOCKED` candidate selection and transitions claimed
-   * rows from `QUEUED` -> `DISPATCHING` atomically within the caller's transaction.
-   *
-   * For `PRIORITY_AGING`, uses exact 3-band index-backed selection:
-   * - Band 0 (starvation): `ready_at <= starveCutoff` ordered by `ready_at ASC, id ASC`
-   * - Band 1 (clamped at P_max): `virtual_rank_at <= clampCutoff` ordered by `ready_at ASC, id ASC`
-   * - Band 2 (unclamped linear): remaining ready jobs ordered by `virtual_rank_at ASC, ready_at ASC, id ASC`
+   * Executes index-backed `FOR UPDATE SKIP LOCKED` candidate selection within the caller's
+   * transaction without modifying rows yet, so DRR head-of-line cost gating can decide which
+   * locked candidates fit in the organisation's current deficit before transitioning only
+   * selected rows from `QUEUED` -> `DISPATCHING`.
    */
-  private async claimOrderedRowsInTransaction(
+  private async selectLockedCandidatesInTransaction(
     tx: Prisma.TransactionClient,
     queueId: string,
     config: SchedulingPolicyConfig,
     limit: number,
     now: Date,
-    claimerId: string,
   ): Promise<RawClaimedJobRow[]> {
     if (limit <= 0) {
       return [];
     }
 
+    const cols = Prisma.sql`
+      id, queue_id, name, priority, payload, max_retries,
+      backoff_ms, delay_ms, ready_at, virtual_rank_at,
+      scheduling_cost, deadline_at, deadline_missed_at,
+      dispatch_state, dispatch_claimed_at, dispatch_claimed_by
+    `;
+
     if (config.schedulingPolicy === SchedulingPolicy.FIFO) {
       return this.claimBySql(
         tx,
         Prisma.sql`
-          WITH candidates AS (
-            SELECT id
-            FROM jobs
-            WHERE queue_id = ${queueId}::uuid
-              AND status = 'PENDING'::"JobStatus"
-              AND dispatch_state = 'QUEUED'::"JobDispatchState"
-              AND is_quarantined = false
-              AND ready_at <= ${now}
-            ORDER BY ready_at ASC, id ASC
-            LIMIT ${limit}
-            FOR UPDATE SKIP LOCKED
-          ),
-          updated AS (
-            UPDATE jobs j
-            SET dispatch_state = 'DISPATCHING'::"JobDispatchState",
-                dispatch_claimed_at = ${now},
-                dispatch_claimed_by = ${claimerId}
-            FROM candidates c
-            WHERE j.id = c.id
-            RETURNING j.id, j.queue_id, j.name, j.priority, j.payload, j.max_retries,
-                      j.backoff_ms, j.delay_ms, j.ready_at, j.virtual_rank_at,
-                      j.dispatch_state, j.dispatch_claimed_at, j.dispatch_claimed_by
-          )
-          SELECT * FROM updated
+          SELECT ${cols}
+          FROM jobs
+          WHERE queue_id = ${queueId}::uuid
+            AND status = 'PENDING'::"JobStatus"
+            AND dispatch_state = 'QUEUED'::"JobDispatchState"
+            AND is_quarantined = false
+            AND ready_at <= ${now}
           ORDER BY ready_at ASC, id ASC
+          LIMIT ${limit}
+          FOR UPDATE SKIP LOCKED
         `,
       );
     }
@@ -863,151 +1192,166 @@ export class PrioritySchedulerService {
       return this.claimBySql(
         tx,
         Prisma.sql`
-          WITH candidates AS (
-            SELECT id
-            FROM jobs
-            WHERE queue_id = ${queueId}::uuid
-              AND status = 'PENDING'::"JobStatus"
-              AND dispatch_state = 'QUEUED'::"JobDispatchState"
-              AND is_quarantined = false
-              AND ready_at <= ${now}
-            ORDER BY priority DESC, ready_at ASC, id ASC
-            LIMIT ${limit}
-            FOR UPDATE SKIP LOCKED
-          ),
-          updated AS (
-            UPDATE jobs j
-            SET dispatch_state = 'DISPATCHING'::"JobDispatchState",
-                dispatch_claimed_at = ${now},
-                dispatch_claimed_by = ${claimerId}
-            FROM candidates c
-            WHERE j.id = c.id
-            RETURNING j.id, j.queue_id, j.name, j.priority, j.payload, j.max_retries,
-                      j.backoff_ms, j.delay_ms, j.ready_at, j.virtual_rank_at,
-                      j.dispatch_state, j.dispatch_claimed_at, j.dispatch_claimed_by
-          )
-          SELECT * FROM updated
+          SELECT ${cols}
+          FROM jobs
+          WHERE queue_id = ${queueId}::uuid
+            AND status = 'PENDING'::"JobStatus"
+            AND dispatch_state = 'QUEUED'::"JobDispatchState"
+            AND is_quarantined = false
+            AND ready_at <= ${now}
           ORDER BY priority DESC, ready_at ASC, id ASC
+          LIMIT ${limit}
+          FOR UPDATE SKIP LOCKED
         `,
       );
     }
 
-    // PRIORITY_AGING: exact 3-band index-backed selection inside the single transaction
     const collected: RawClaimedJobRow[] = [];
+    const collectedIds: string[] = [];
     let remaining = limit;
 
-    // Band 0: Hard starvation promotion (`ready_at <= now - starvationThresholdSec`)
+    const pushRows = (rows: RawClaimedJobRow[]) => {
+      for (const r of rows) {
+        collected.push(r);
+        collectedIds.push(r.id);
+      }
+      remaining -= rows.length;
+    };
+
+    const excludeSql = () =>
+      collectedIds.length > 0
+        ? Prisma.sql`AND NOT (id = ANY(${collectedIds}::uuid[]))`
+        : Prisma.empty;
+
+    // Band 0 (all aging / DRR / deadline / hybrid policies): Hard starvation promotion
     if (config.starvationThresholdSec !== null && remaining > 0) {
       const starveCutoff = new Date(now.getTime() - config.starvationThresholdSec * 1000);
       const band0 = await this.claimBySql(
         tx,
         Prisma.sql`
-          WITH candidates AS (
-            SELECT id
-            FROM jobs
-            WHERE queue_id = ${queueId}::uuid
-              AND status = 'PENDING'::"JobStatus"
-              AND dispatch_state = 'QUEUED'::"JobDispatchState"
-              AND is_quarantined = false
-              AND ready_at <= ${starveCutoff}
-            ORDER BY ready_at ASC, id ASC
-            LIMIT ${remaining}
-            FOR UPDATE SKIP LOCKED
-          ),
-          updated AS (
-            UPDATE jobs j
-            SET dispatch_state = 'DISPATCHING'::"JobDispatchState",
-                dispatch_claimed_at = ${now},
-                dispatch_claimed_by = ${claimerId}
-            FROM candidates c
-            WHERE j.id = c.id
-            RETURNING j.id, j.queue_id, j.name, j.priority, j.payload, j.max_retries,
-                      j.backoff_ms, j.delay_ms, j.ready_at, j.virtual_rank_at,
-                      j.dispatch_state, j.dispatch_claimed_at, j.dispatch_claimed_by
-          )
-          SELECT * FROM updated
+          SELECT ${cols}
+          FROM jobs
+          WHERE queue_id = ${queueId}::uuid
+            AND status = 'PENDING'::"JobStatus"
+            AND dispatch_state = 'QUEUED'::"JobDispatchState"
+            AND is_quarantined = false
+            AND ready_at <= ${starveCutoff}
           ORDER BY ready_at ASC, id ASC
+          LIMIT ${remaining}
+          FOR UPDATE SKIP LOCKED
         `,
       );
-      collected.push(...band0);
-      remaining -= band0.length;
+      pushRows(band0);
     }
 
-    // Band 1: Clamped at maxEffectivePriority (`virtual_rank_at <= clampCutoff`), ordered FIFO
+    // DEADLINE_AWARE: Band 1 unified strict EDF (all jobs with deadline_at IS NOT NULL ordered by deadline_at ASC)
+    // Earlier absolute deadlines — including overdue ones — always precede later deadlines.
+    if (config.schedulingPolicy === SchedulingPolicy.DEADLINE_AWARE && remaining > 0) {
+      const band1 = await this.claimBySql(
+        tx,
+        Prisma.sql`
+          SELECT ${cols}
+          FROM jobs
+          WHERE queue_id = ${queueId}::uuid
+            AND status = 'PENDING'::"JobStatus"
+            AND dispatch_state = 'QUEUED'::"JobDispatchState"
+            AND is_quarantined = false
+            AND ready_at <= ${now}
+            AND deadline_at IS NOT NULL
+            ${excludeSql()}
+          ORDER BY deadline_at ASC, priority DESC, ready_at ASC, id ASC
+          LIMIT ${remaining}
+          FOR UPDATE SKIP LOCKED
+        `,
+      );
+      pushRows(band1);
+    }
+
+    // HYBRID_FAIR_DEADLINE: Band 1 approaching or overdue deadline (deadline_at <= now + urgencyWindowSec)
+    // Uses jobs_sched_deadline_queued_idx and avoids dropping overdue jobs out of the urgent band.
+    if (config.schedulingPolicy === SchedulingPolicy.HYBRID_FAIR_DEADLINE && remaining > 0) {
+      const urgencyWindowSec = Math.max(
+        5,
+        config.deadlineUrgencyWindowSec ?? DRR_DEFAULTS.DEFAULT_DEADLINE_URGENCY_WINDOW_SEC,
+      );
+      const urgencyCutoff = new Date(now.getTime() + urgencyWindowSec * 1000);
+      const band1 = await this.claimBySql(
+        tx,
+        Prisma.sql`
+          SELECT ${cols}
+          FROM jobs
+          WHERE queue_id = ${queueId}::uuid
+            AND status = 'PENDING'::"JobStatus"
+            AND dispatch_state = 'QUEUED'::"JobDispatchState"
+            AND is_quarantined = false
+            AND ready_at <= ${now}
+            AND deadline_at IS NOT NULL
+            AND deadline_at <= ${urgencyCutoff}
+            ${excludeSql()}
+          ORDER BY deadline_at ASC, priority DESC, ready_at ASC, id ASC
+          LIMIT ${remaining}
+          FOR UPDATE SKIP LOCKED
+        `,
+      );
+      pushRows(band1);
+    }
+
+    // Clamped aging band (`virtual_rank_at <= clampCutoff`)
     if (remaining > 0) {
       const clampCutoff = computeClampCutoffAt(
         now,
         Math.max(QUEUE_LIMITS.MAX_PRIORITY, config.maxEffectivePriority),
         config.agingRatePerSec,
       );
-      const band1 = await this.claimBySql(
+      const noDeadlineFilter =
+        config.schedulingPolicy === SchedulingPolicy.DEADLINE_AWARE
+          ? Prisma.sql`AND deadline_at IS NULL`
+          : Prisma.empty;
+      const clampedBand = await this.claimBySql(
         tx,
         Prisma.sql`
-          WITH candidates AS (
-            SELECT id
-            FROM jobs
-            WHERE queue_id = ${queueId}::uuid
-              AND status = 'PENDING'::"JobStatus"
-              AND dispatch_state = 'QUEUED'::"JobDispatchState"
-              AND is_quarantined = false
-              AND ready_at <= ${now}
-              AND virtual_rank_at <= ${clampCutoff}
-            ORDER BY ready_at ASC, id ASC
-            LIMIT ${remaining}
-            FOR UPDATE SKIP LOCKED
-          ),
-          updated AS (
-            UPDATE jobs j
-            SET dispatch_state = 'DISPATCHING'::"JobDispatchState",
-                dispatch_claimed_at = ${now},
-                dispatch_claimed_by = ${claimerId}
-            FROM candidates c
-            WHERE j.id = c.id
-            RETURNING j.id, j.queue_id, j.name, j.priority, j.payload, j.max_retries,
-                      j.backoff_ms, j.delay_ms, j.ready_at, j.virtual_rank_at,
-                      j.dispatch_state, j.dispatch_claimed_at, j.dispatch_claimed_by
-          )
-          SELECT * FROM updated
+          SELECT ${cols}
+          FROM jobs
+          WHERE queue_id = ${queueId}::uuid
+            AND status = 'PENDING'::"JobStatus"
+            AND dispatch_state = 'QUEUED'::"JobDispatchState"
+            AND is_quarantined = false
+            AND ready_at <= ${now}
+            AND virtual_rank_at <= ${clampCutoff}
+            ${noDeadlineFilter}
+            ${excludeSql()}
           ORDER BY ready_at ASC, id ASC
+          LIMIT ${remaining}
+          FOR UPDATE SKIP LOCKED
         `,
       );
-      collected.push(...band1);
-      remaining -= band1.length;
+      pushRows(clampedBand);
     }
 
-    // Band 2: Unclamped linear aging (`virtual_rank_at ASC, ready_at ASC, id ASC`)
+    // Unclamped linear aging band (`virtual_rank_at ASC, ready_at ASC, id ASC`)
     if (remaining > 0) {
-      const band2 = await this.claimBySql(
+      const noDeadlineFilter =
+        config.schedulingPolicy === SchedulingPolicy.DEADLINE_AWARE
+          ? Prisma.sql`AND deadline_at IS NULL`
+          : Prisma.empty;
+      const linearBand = await this.claimBySql(
         tx,
         Prisma.sql`
-          WITH candidates AS (
-            SELECT id
-            FROM jobs
-            WHERE queue_id = ${queueId}::uuid
-              AND status = 'PENDING'::"JobStatus"
-              AND dispatch_state = 'QUEUED'::"JobDispatchState"
-              AND is_quarantined = false
-              AND ready_at <= ${now}
-            ORDER BY virtual_rank_at ASC, ready_at ASC, id ASC
-            LIMIT ${remaining}
-            FOR UPDATE SKIP LOCKED
-          ),
-          updated AS (
-            UPDATE jobs j
-            SET dispatch_state = 'DISPATCHING'::"JobDispatchState",
-                dispatch_claimed_at = ${now},
-                dispatch_claimed_by = ${claimerId}
-            FROM candidates c
-            WHERE j.id = c.id
-            RETURNING j.id, j.queue_id, j.name, j.priority, j.payload, j.max_retries,
-                      j.backoff_ms, j.delay_ms, j.ready_at, j.virtual_rank_at,
-                      j.dispatch_state, j.dispatch_claimed_at, j.dispatch_claimed_by
-          )
-          SELECT * FROM updated
+          SELECT ${cols}
+          FROM jobs
+          WHERE queue_id = ${queueId}::uuid
+            AND status = 'PENDING'::"JobStatus"
+            AND dispatch_state = 'QUEUED'::"JobDispatchState"
+            AND is_quarantined = false
+            AND ready_at <= ${now}
+            ${noDeadlineFilter}
+            ${excludeSql()}
           ORDER BY virtual_rank_at ASC, ready_at ASC, id ASC
+          LIMIT ${remaining}
+          FOR UPDATE SKIP LOCKED
         `,
       );
-      collected.push(...band2);
+      pushRows(linearBand);
     }
 
     return collected;
@@ -1219,6 +1563,7 @@ export class PrioritySchedulerService {
     maxQueuesPerTick?: number;
     organisationId?: string;
     queueId?: string;
+    drrMinRoundIntervalMs?: number;
     adapter?: JobDispatchAdapter;
   }): Promise<SchedulerTickSummary> {
     const startedAt = Date.now();
@@ -1264,8 +1609,9 @@ export class PrioritySchedulerService {
           poisonFailureThreshold: true,
           schedulingPolicy: true,
           agingRatePerSec: true,
+          schedulingWeight: true,
         },
-        orderBy: [{ organisationId: 'asc' }, { id: 'asc' }],
+        orderBy: [{ schedulingWeight: 'desc' }, { organisationId: 'asc' }, { id: 'asc' }],
       });
 
       if (queues.length === 0) {
@@ -1281,9 +1627,14 @@ export class PrioritySchedulerService {
 
       summary.queuesScanned = rotated.length;
       const promotedBefore = this.delayedPromotedTotal;
+      const accumulatedOrgIds = new Set<string>();
 
       for (const q of rotated) {
         const batchCap = Math.max(1, q.concurrency);
+        const shouldAccumulateDrr = !accumulatedOrgIds.has(q.organisationId);
+        if (isDrrPolicy(q.schedulingPolicy)) {
+          accumulatedOrgIds.add(q.organisationId);
+        }
         const batch = await this.dispatchBatchWithAdapter(
           q,
           {
@@ -1291,6 +1642,8 @@ export class PrioritySchedulerService {
             limit: batchCap,
             maxInFlightForQueue: batchCap,
             enforceOrgActiveLimit: true,
+            accumulateDrrRound: shouldAccumulateDrr,
+            drrMinRoundIntervalMs: options?.drrMinRoundIntervalMs ?? this.activeIntervalMs,
             now,
           },
           options?.adapter ?? this.defaultAdapter,

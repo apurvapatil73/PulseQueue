@@ -185,6 +185,14 @@ export interface OrganisationGovernanceView {
       failedAt: Date;
     }>;
   };
+  fairness: {
+    schedulingWeight: number;
+    drrBaseQuantum: number;
+    drrMaxDeficit: number;
+    schedulingDeficit: number;
+    drrVersion: number;
+    drrLastRoundAt: Date | null;
+  };
 }
 
 function pct(used: number, limit: number | null): number | null {
@@ -536,6 +544,11 @@ export class GovernanceService {
         ...(input.retryBudgetWindowSeconds !== undefined
           ? { retryBudgetWindowSeconds: input.retryBudgetWindowSeconds }
           : {}),
+        ...(input.schedulingWeight !== undefined
+          ? { schedulingWeight: input.schedulingWeight }
+          : {}),
+        ...(input.drrBaseQuantum !== undefined ? { drrBaseQuantum: input.drrBaseQuantum } : {}),
+        ...(input.drrMaxDeficit !== undefined ? { drrMaxDeficit: input.drrMaxDeficit } : {}),
       },
     });
 
@@ -554,6 +567,12 @@ export class GovernanceService {
         maxPayloadBytes: true,
         retryBudgetMaxRetries: true,
         retryBudgetWindowSeconds: true,
+        schedulingWeight: true,
+        drrBaseQuantum: true,
+        drrMaxDeficit: true,
+        schedulingDeficit: true,
+        drrVersion: true,
+        drrLastRoundAt: true,
       },
     });
     if (!org) {
@@ -762,6 +781,14 @@ export class GovernanceService {
           failureSignature: d.failureSignature,
           failedAt: d.failedAt,
         })),
+      },
+      fairness: {
+        schedulingWeight: org.schedulingWeight,
+        drrBaseQuantum: org.drrBaseQuantum,
+        drrMaxDeficit: org.drrMaxDeficit,
+        schedulingDeficit: org.schedulingDeficit,
+        drrVersion: org.drrVersion,
+        drrLastRoundAt: org.drrLastRoundAt,
       },
     };
   }

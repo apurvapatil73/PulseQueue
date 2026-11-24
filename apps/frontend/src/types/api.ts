@@ -202,6 +202,9 @@ export interface QueueView {
   defaultPriority: number;
   maxRetries: number;
   backoffMs: number;
+  schedulingPolicy?: SchedulingPolicy;
+  schedulingWeight?: number;
+  deadlineUrgencyWindowSec?: number;
   jobCount: number;
   createdBy: {
     id: string;
@@ -244,6 +247,11 @@ export interface JobView {
   maxRetries: number;
   backoffMs: number;
   delayMs: number;
+  schedulingCost?: number;
+  deadlineAt?: string | null;
+  deadlineMissedAt?: string | null;
+  deadlineLatenessMs?: number | null;
+  schedulingDecision?: Record<string, unknown> | null;
   attemptsMade: number;
   stalledCount: number;
   durationMs: number | null;
@@ -804,7 +812,14 @@ export interface PaginatedNotificationsView {
   pagination: PaginationMeta;
 }
 
-export type SchedulingPolicy = 'LEGACY_BULLMQ' | 'FIFO' | 'STRICT_PRIORITY' | 'PRIORITY_AGING';
+export type SchedulingPolicy =
+  | 'LEGACY_BULLMQ'
+  | 'FIFO'
+  | 'STRICT_PRIORITY'
+  | 'PRIORITY_AGING'
+  | 'WEIGHTED_FAIR'
+  | 'DEADLINE_AWARE'
+  | 'HYBRID_FAIR_DEADLINE';
 export type PriorityTier = 'critical' | 'high' | 'medium' | 'low';
 
 export interface PriorityTierWaitStats {
@@ -882,6 +897,26 @@ export interface OrganisationSchedulerMetricsView {
       priorityInversionsTotal: number;
       reservationRecoveriesTotal: number;
       tenantCapacityDenialsTotal: number;
+      drrRoundsTotal?: number;
+      drrDeficitConsumedTotal?: number;
+      drrFairnessDenialsTotal?: number;
+      deadlineAwareDispatchesTotal?: number;
+      deadlineMissesTotal?: number;
     };
+  };
+  fairness?: {
+    schedulingWeight: number;
+    drrBaseQuantum: number;
+    drrMaxDeficit: number;
+    schedulingDeficit: number;
+    drrVersion: number;
+    drrLastRoundAt: string | null;
+  };
+  deadlines?: {
+    withDeadlinePending: number;
+    approachingDeadlineCount: number;
+    missedInWindow: number;
+    avgLatenessMs: number | null;
+    p95LatenessMs: number | null;
   };
 }

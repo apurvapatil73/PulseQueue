@@ -86,7 +86,27 @@ export interface OrganisationSchedulerMetricsView {
       priorityInversionsTotal: number;
       reservationRecoveriesTotal: number;
       tenantCapacityDenialsTotal: number;
+      drrRoundsTotal: number;
+      drrDeficitConsumedTotal: number;
+      drrFairnessDenialsTotal: number;
+      deadlineAwareDispatchesTotal: number;
+      deadlineMissesTotal: number;
     };
+  };
+  fairness: {
+    schedulingWeight: number;
+    drrBaseQuantum: number;
+    drrMaxDeficit: number;
+    schedulingDeficit: number;
+    drrVersion: number;
+    drrLastRoundAt: string | null;
+  };
+  deadlines: {
+    withDeadlinePending: number;
+    approachingDeadlineCount: number;
+    missedInWindow: number;
+    avgLatenessMs: number | null;
+    p95LatenessMs: number | null;
   };
 }
 
@@ -106,7 +126,16 @@ export class SchedulerObservabilityService {
   ): Promise<OrganisationSchedulerMetricsView> {
     const org = await db.organisation.findUnique({
       where: { id: orgId },
-      select: { id: true, maxActiveJobs: true },
+      select: {
+        id: true,
+        maxActiveJobs: true,
+        schedulingWeight: true,
+        drrBaseQuantum: true,
+        drrMaxDeficit: true,
+        schedulingDeficit: true,
+        drrVersion: true,
+        drrLastRoundAt: true,
+      },
     });
 
     if (!org) {
@@ -124,6 +153,7 @@ export class SchedulerObservabilityService {
       waitTierRows,
       dispatchLatencyRows,
       throughputRows,
+      deadlineRows,
       workers,
     ] = await Promise.all([
       db.queue.findMany({
@@ -283,6 +313,49 @@ export class SchedulerObservabilityService {
             (j.status = 'COMPLETED'::"JobStatus" AND j.completed_at >= ${windowStart})
             OR (j.status = 'FAILED'::"JobStatus" AND j.failed_at >= ${windowStart})
           )
+      `,
+      db.$queryRaw<
+        Array<{
+          with_deadline_pending: bigint;
+          approaching_deadline: bigint;
+          missed_in_window: bigint;
+          avg_lateness_ms: number | null;
+          p95_lateness_ms: number | null;
+        }>
+      >`
+        SELECT
+          COUNT(*) FILTER (
+            WHERE j.status IN ('PENDING'::"JobStatus", 'DELAYED'::"JobStatus")
+              AND j.is_quarantined = false
+              AND j.deadline_at IS NOT NULL
+          ) AS with_deadline_pending,
+          COUNT(*) FILTER (
+            WHERE j.status = 'PENDING'::"JobStatus"
+              AND j.is_quarantined = false
+              AND j.deadline_at IS NOT NULL
+              AND j.deadline_at >= ${now}
+              AND j.deadline_at <= (${now}::timestamp + (q.deadline_urgency_window_sec * INTERVAL '1 second'))
+          ) AS approaching_deadline,
+          COUNT(*) FILTER (
+            WHERE j.deadline_missed_at IS NOT NULL
+              AND j.deadline_missed_at >= ${windowStart}
+          ) AS missed_in_window,
+          AVG(GREATEST(0, EXTRACT(EPOCH FROM (j.deadline_missed_at - j.deadline_at)) * 1000)) FILTER (
+            WHERE j.deadline_missed_at IS NOT NULL
+              AND j.deadline_at IS NOT NULL
+              AND j.deadline_missed_at >= ${windowStart}
+          ) AS avg_lateness_ms,
+          PERCENTILE_CONT(0.95) WITHIN GROUP (
+            ORDER BY GREATEST(0, EXTRACT(EPOCH FROM (j.deadline_missed_at - j.deadline_at)) * 1000)
+          ) FILTER (
+            WHERE j.deadline_missed_at IS NOT NULL
+              AND j.deadline_at IS NOT NULL
+              AND j.deadline_missed_at >= ${windowStart}
+          ) AS p95_lateness_ms
+        FROM jobs j
+        INNER JOIN queues q ON q.id = j.queue_id
+        WHERE q.organisation_id = ${orgId}::uuid
+          AND j.deadline_at IS NOT NULL
       `,
       workerHealthService.listWorkersForOrganisation(orgId),
     ]);
@@ -494,7 +567,30 @@ export class SchedulerObservabilityService {
           priorityInversionsTotal: globalSnap.counters.priorityInversionsTotal,
           reservationRecoveriesTotal: globalSnap.counters.reservationRecoveriesTotal,
           tenantCapacityDenialsTotal: globalSnap.counters.tenantCapacityDenialsTotal,
+          drrRoundsTotal: globalSnap.counters.drrRoundsTotal,
+          drrDeficitConsumedTotal: globalSnap.counters.drrDeficitConsumedTotal,
+          drrFairnessDenialsTotal: globalSnap.counters.drrFairnessDenialsTotal,
+          deadlineAwareDispatchesTotal: globalSnap.counters.deadlineAwareDispatchesTotal,
+          deadlineMissesTotal: globalSnap.counters.deadlineMissesTotal,
         },
+      },
+      fairness: {
+        schedulingWeight: org.schedulingWeight,
+        drrBaseQuantum: org.drrBaseQuantum,
+        drrMaxDeficit: org.drrMaxDeficit,
+        schedulingDeficit: Math.round(org.schedulingDeficit * 1000) / 1000,
+        drrVersion: org.drrVersion,
+        drrLastRoundAt: org.drrLastRoundAt ? org.drrLastRoundAt.toISOString() : null,
+      },
+      deadlines: {
+        withDeadlinePending: Number(deadlineRows[0]?.with_deadline_pending ?? 0n),
+        approachingDeadlineCount: Number(deadlineRows[0]?.approaching_deadline ?? 0n),
+        missedInWindow: Number(deadlineRows[0]?.missed_in_window ?? 0n),
+        avgLatenessMs: roundMs(deadlineRows[0]?.avg_lateness_ms),
+        p95LatenessMs:
+          Number(deadlineRows[0]?.missed_in_window ?? 0n) >= MIN_PERCENTILE_SAMPLES
+            ? roundMs(deadlineRows[0]?.p95_lateness_ms)
+            : null,
       },
     };
   }
