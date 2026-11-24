@@ -69,6 +69,12 @@ enum PlatformEventType {
   ALERT_FIRED
   ALERT_ACKNOWLEDGED
   ALERT_RESOLVED
+  API_KEY_CREATED
+  API_KEY_REVOKED
+  API_KEY_ROTATED
+  SECURITY_RATE_LIMIT_EXCEEDED
+  SECURITY_AUTH_FAILURE_BURST
+  SECURITY_CONFIG_UPDATED
 }
 
 enum AlertType {
@@ -160,6 +166,7 @@ model User {
   createdQueues    Queue[]         @relation("CreatedQueues")
   createdJobs      Job[]           @relation("CreatedJobs")
   createdSchedules Schedule[]      @relation("CreatedSchedules")
+  createdApiKeys   ApiKey[]        @relation("CreatedApiKeys")
   notifications    Notification[]
 
   @@map("users")
@@ -208,8 +215,33 @@ model Organisation {
   alertRules     AlertRule[]
   alerts         Alert[]
   notifications  Notification[]
+  apiKeys        ApiKey[]
 
   @@map("organisations")
+}
+
+model ApiKey {
+  id             String    @id @default(uuid()) @db.Uuid
+  organisationId String    @map("organisation_id") @db.Uuid
+  name           String
+  keyPrefix      String    @map("key_prefix")
+  keyHash        String    @unique @map("key_hash")
+  scopes         String[]
+  expiresAt      DateTime? @map("expires_at")
+  revokedAt      DateTime? @map("revoked_at")
+  lastUsedAt     DateTime? @map("last_used_at")
+  metadata       Json      @default("{}") @db.JsonB
+  createdById    String?   @map("created_by_id") @db.Uuid
+  rotatedFromId  String?   @map("rotated_from_id") @db.Uuid
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  organisation Organisation @relation(fields: [organisationId], references: [id], onDelete: Cascade)
+  createdBy    User?        @relation("CreatedApiKeys", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([organisationId, revokedAt])
+  @@index([organisationId, createdAt])
+  @@map("api_keys")
 }
 
 model Membership {

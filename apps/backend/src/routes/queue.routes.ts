@@ -17,17 +17,32 @@ import {
 const router = Router({ mergeParams: true });
 
 // ─── Queue CRUD ───────────────────────────────────────────────────────────────
-router.post('/', authenticate, requireOrgRole(Role.ADMIN), createQueue);
-router.get('/', authenticate, requireOrgRole(Role.MEMBER), listQueues);
-router.get('/:queueId', authenticate, requireOrgRole(Role.MEMBER), getQueue);
-router.patch('/:queueId', authenticate, requireOrgRole(Role.ADMIN), updateQueue);
+router.post('/', authenticate, requireOrgRole(Role.ADMIN, 'queues:write'), createQueue);
+router.get('/', authenticate, requireOrgRole(Role.MEMBER, 'queues:read'), listQueues);
+router.get('/:queueId', authenticate, requireOrgRole(Role.MEMBER, 'queues:read'), getQueue);
+router.patch('/:queueId', authenticate, requireOrgRole(Role.ADMIN, 'queues:write'), updateQueue);
 router.delete('/:queueId', authenticate, requireOrgRole(Role.OWNER), deleteQueue);
 
 // ─── Queue Controls ───────────────────────────────────────────────────────────
-router.post('/:queueId/pause', authenticate, requireOrgRole(Role.ADMIN), pauseQueue);
-router.post('/:queueId/resume', authenticate, requireOrgRole(Role.ADMIN), resumeQueue);
+router.post(
+  '/:queueId/pause',
+  authenticate,
+  requireOrgRole(Role.ADMIN, 'queues:write'),
+  pauseQueue,
+);
+router.post(
+  '/:queueId/resume',
+  authenticate,
+  requireOrgRole(Role.ADMIN, 'queues:write'),
+  resumeQueue,
+);
 
 // ─── Queue Statistics ─────────────────────────────────────────────────────────
-router.get('/:queueId/stats', authenticate, requireOrgRole(Role.MEMBER), getQueueStats);
+router.get(
+  '/:queueId/stats',
+  authenticate,
+  requireOrgRole(Role.MEMBER, 'queues:read'),
+  getQueueStats,
+);
 
 export default router;

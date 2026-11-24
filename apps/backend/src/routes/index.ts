@@ -9,6 +9,7 @@ import { dlqRoutes, monitoringRoutes } from './monitoring.routes.js';
 import scheduleRoutes from './schedule.routes.js';
 import { alertRuleRoutes, alertRoutes, notificationRoutes } from './alert.routes.js';
 import { governanceRoutes } from './governance.routes.js';
+import { apiKeyRoutes } from './apiKey.routes.js';
 
 const router = Router();
 
@@ -43,6 +44,9 @@ router.use('/api/v1/organisations/:organisationId/notifications', notificationRo
 
 // Organisation-scoped Governance (Quotas, Backpressure, Retry Budgets & Quarantine) endpoints
 router.use('/api/v1/organisations/:organisationId/governance', governanceRoutes);
+
+// Organisation-scoped API Key management endpoints (JWT ADMIN/OWNER only)
+router.use('/api/v1/organisations/:organisationId/api-keys', apiKeyRoutes);
 
 // Organisation management endpoints
 router.use('/api/v1/organisations', orgRoutes);

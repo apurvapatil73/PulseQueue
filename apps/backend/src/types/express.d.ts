@@ -1,4 +1,5 @@
 import { Role } from '@prisma/client';
+import type { AuthenticatedApiKey } from '../services/apiKey.service.js';
 
 export interface AuthUser {
   id: string;
@@ -18,6 +19,7 @@ declare global {
   namespace Express {
     interface Request {
       user?: AuthUser;
+      apiKey?: AuthenticatedApiKey;
       membership?: RequestMembership;
     }
   }

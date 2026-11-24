@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { Role } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { uuidSchema } from '../validators/organisation.validator.js';
+import type { ApiKeyScope } from '../validators/apiKey.validator.js';
 import { ForbiddenError, NotFoundError, UnauthorizedError } from '../utils/errors.js';
 
 /**
@@ -34,10 +35,10 @@ export function hasMinimumRole(actual: Role, minimum: Role): boolean {
  * - Returns 404 if user is not a member (avoids confirming org existence to outsiders).
  * - Returns 403 if user is a member but lacks the required role.
  */
-export function requireOrgRole(minRole: Role) {
+export function requireOrgRole(minRole: Role, requiredScope?: ApiKeyScope) {
   return async function (req: Request, _res: Response, next: NextFunction): Promise<void> {
     try {
-      if (!req.user) {
+      if (!req.user && !req.apiKey) {
         throw new UnauthorizedError('Authentication required');
       }
 
@@ -48,10 +49,31 @@ export function requireOrgRole(minRole: Role) {
         throw new NotFoundError('Organisation not found');
       }
 
+      // Tenant-scoped API key authorization path
+      if (req.apiKey) {
+        // Strict tenant boundary: never allow an API key to access another organisation
+        if (req.apiKey.organisationId !== organisationId) {
+          throw new NotFoundError('Organisation not found');
+        }
+        // Endpoints without an explicit API key scope (e.g. OWNER/ADMIN org & key management)
+        // are never accessible to API keys
+        if (!requiredScope || !req.apiKey.scopes.includes(requiredScope)) {
+          throw new ForbiddenError('API key lacks required scope for this operation');
+        }
+        req.membership = {
+          id: `apikey:${req.apiKey.id}`,
+          userId: '',
+          organisationId: req.apiKey.organisationId,
+          role: Role.MEMBER,
+        };
+        next();
+        return;
+      }
+
       const membership = await db.membership.findUnique({
         where: {
           userId_organisationId: {
-            userId: req.user.id,
+            userId: req.user!.id,
             organisationId,
           },
         },

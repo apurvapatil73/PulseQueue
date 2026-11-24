@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { Role } from '@prisma/client';
 import { authenticate } from '../middleware/auth.middleware.js';
 import { requireOrgRole } from '../middleware/rbac.middleware.js';
-import { writeRateLimiter } from '../middleware/rateLimit.middleware.js';
+import { dlqReplayRateLimiter } from '../middleware/rateLimit.middleware.js';
 import {
   listDlqJobs,
   getDlqJob,
@@ -22,13 +22,13 @@ import { streamOrganisationEvents } from '../controllers/stream.controller.js';
  */
 export const dlqRoutes = Router({ mergeParams: true });
 
-dlqRoutes.get('/', authenticate, requireOrgRole(Role.MEMBER), listDlqJobs);
-dlqRoutes.get('/:dlqId', authenticate, requireOrgRole(Role.MEMBER), getDlqJob);
+dlqRoutes.get('/', authenticate, requireOrgRole(Role.MEMBER, 'dlq:read'), listDlqJobs);
+dlqRoutes.get('/:dlqId', authenticate, requireOrgRole(Role.MEMBER, 'dlq:read'), getDlqJob);
 dlqRoutes.post(
   '/:dlqId/replay',
   authenticate,
-  requireOrgRole(Role.ADMIN),
-  writeRateLimiter,
+  requireOrgRole(Role.ADMIN, 'dlq:replay'),
+  dlqReplayRateLimiter,
   replayDlqJob,
 );
 
@@ -38,26 +38,36 @@ dlqRoutes.post(
  */
 export const monitoringRoutes = Router({ mergeParams: true });
 
-monitoringRoutes.get('/metrics', authenticate, requireOrgRole(Role.MEMBER), getOrganisationMetrics);
+monitoringRoutes.get(
+  '/metrics',
+  authenticate,
+  requireOrgRole(Role.MEMBER, 'monitoring:read'),
+  getOrganisationMetrics,
+);
 monitoringRoutes.get(
   '/metrics/timeseries',
   authenticate,
-  requireOrgRole(Role.MEMBER),
+  requireOrgRole(Role.MEMBER, 'monitoring:read'),
   getOrganisationMetricsTimeseries,
 );
 monitoringRoutes.get(
   '/scheduler',
   authenticate,
-  requireOrgRole(Role.MEMBER),
+  requireOrgRole(Role.MEMBER, 'monitoring:read'),
   getOrganisationSchedulerMetrics,
 );
 monitoringRoutes.get(
   '/workers',
   authenticate,
-  requireOrgRole(Role.MEMBER),
+  requireOrgRole(Role.MEMBER, 'monitoring:read'),
   listOrganisationWorkers,
 );
-monitoringRoutes.get('/events', authenticate, requireOrgRole(Role.MEMBER), listOrganisationEvents);
+monitoringRoutes.get(
+  '/events',
+  authenticate,
+  requireOrgRole(Role.MEMBER, 'monitoring:read'),
+  listOrganisationEvents,
+);
 monitoringRoutes.get(
   '/stream',
   authenticate,

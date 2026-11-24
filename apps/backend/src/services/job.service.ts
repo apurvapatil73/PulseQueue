@@ -217,7 +217,7 @@ export class JobService {
   async create(
     orgId: string,
     queueId: string,
-    userId: string,
+    userId: string | null,
     input: CreateJobInput,
   ): Promise<JobSubmissionResult> {
     if (!uuidSchema.safeParse(queueId).success) {

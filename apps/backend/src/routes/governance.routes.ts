@@ -13,7 +13,12 @@ import {
  */
 export const governanceRoutes = Router({ mergeParams: true });
 
-governanceRoutes.get('/', authenticate, requireOrgRole(Role.MEMBER), getOrganisationGovernance);
+governanceRoutes.get(
+  '/',
+  authenticate,
+  requireOrgRole(Role.MEMBER, 'governance:read'),
+  getOrganisationGovernance,
+);
 governanceRoutes.patch(
   '/quotas',
   authenticate,

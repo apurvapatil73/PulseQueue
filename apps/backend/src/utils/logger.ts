@@ -24,7 +24,11 @@ const SENSITIVE_KEYS = new Set([
   'cookie',
   'set-cookie',
   'apikey',
+  'api_key',
+  'api_key_secret',
   'x-api-key',
+  'plaintextkey',
+  'keyhash',
   'database_url',
   'redis_url',
 ]);

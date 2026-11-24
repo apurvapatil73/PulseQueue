@@ -13,45 +13,77 @@
   - Delivered via `HttpOnly`, `SameSite=Lax`, `Path=/api/v1/auth` cookie (`Secure` enabled in `production`) and supported in request body for non-browser clients.
   - **Atomic Single-Use Rotation:** `AuthService.refreshToken` atomically revokes the presented token via conditional `updateMany({ where: { id, isRevoked: false }, data: { isRevoked: true } })` inside a PostgreSQL transaction. Presenting an already-revoked or concurrently raced token immediately revokes **all** active refresh tokens for that user.
 
-## 2. RBAC Permission Matrix
+## 2. Tenant-Scoped API Keys & Scope Model
 
-All organisation-scoped routes require `authenticate` followed by `requireOrgRole(minRole)`, which resolves membership directly from PostgreSQL (never trusting client-supplied roles):
+- **Key Format & Storage:** Generated as `pq_live_<8hex_prefix>_<48hex_secret>` (192 bits of entropy via `crypto.randomBytes`). Only `HMAC-SHA256(API_KEY_SECRET, plaintextKey)` is stored in PostgreSQL (`api_keys.key_hash`). Plaintext keys are returned **strictly once** on creation or rotation and verified with `crypto.timingSafeEqual`.
+- **Headers Supported:** `X-API-Key: pq_live_...` or `Authorization: ApiKey pq_live_...`.
+- **Least-Privilege Scopes:**
+  - `queues:read`, `queues:write`
+  - `jobs:read`, `jobs:write`, `jobs:cancel`
+  - `dlq:read`, `dlq:replay`
+  - `schedules:read`, `schedules:write`
+  - `monitoring:read`, `governance:read`
+- **Hard Privilege Ceiling:** API keys **never** grant `OWNER` or unrestricted `ADMIN` privileges. They cannot delete organisations, transfer ownership, delete queues/schedules, modify governance quotas, manage members/invitations, or manage API keys.
+- **Lifecycle & Audit Endpoints (JWT `ADMIN`/`OWNER` only):**
+  - `POST /api/v1/organisations/:organisationId/api-keys` (`API_KEY_CREATED`)
+  - `GET /api/v1/organisations/:organisationId/api-keys` (redacted; never returns plaintext or hash)
+  - `POST /api/v1/organisations/:organisationId/api-keys/:apiKeyId/revoke` (`API_KEY_REVOKED`)
+  - `POST /api/v1/organisations/:organisationId/api-keys/:apiKeyId/rotate` (atomic revoke + issue replacement; `API_KEY_ROTATED`)
 
-| Operation Category                                                                                                                                                                         | `MEMBER` | `ADMIN` | `OWNER` | Non-Member |
-| :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------: | :-----: | :-----: | :--------: |
-| Read org, members, queues, jobs, schedules, DLQ, alerts, governance, metrics, SSE stream                                                                                                   |  Allow   |  Allow  |  Allow  |   `404`    |
-| Submit jobs, acknowledge alerts, manage own notifications                                                                                                                                  |  Allow   |  Allow  |  Allow  |   `404`    |
-| Create/update/pause/resume queues, cancel jobs, replay DLQ, create/update/pause/cancel schedules, manage alert rules, update governance quotas & DRR weights, manage invitations & members |  `403`   |  Allow  |  Allow  |   `404`    |
-| Delete organisation, transfer ownership, delete queues, delete schedules                                                                                                                   |  `403`   |  `403`  |  Allow  |   `404`    |
+## 3. Distributed Rate Limiting & Redis Failure Policy
 
-Non-members receive `404 Not Found` rather than `403 Forbidden` to prevent cross-tenant organisation enumeration.
+- **Architecture:** All API instances share rate-limit state in Redis via an atomic single-roundtrip Lua script (`INCR` + `PEXPIRE` + `PTTL`), eliminating GET/INCR/EXPIRE race conditions across horizontally scaled replicas.
+- **Key Privacy & Bounded Growth:** Redis keys use `pq:rl:<policy>:<sha256_prefix_24(identity)>` (never storing raw IPs, emails, or tokens) and always attach a `PEXPIRE` TTL.
+- **Response Headers:** `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` on `429 Too Many Requests`. Tenant-scoped `SECURITY_RATE_LIMIT_EXCEEDED` audit events are recorded asynchronously.
+- **Explicit Redis Failure Policy:**
 
-## 3. Tenant Isolation Strategy
+| Endpoint Category                                       | Policy Name  | Default Limit / Window |   Redis Outage Behavior   | Rationale                                                                 |
+| :------------------------------------------------------ | :----------- | :--------------------: | :-----------------------: | :------------------------------------------------------------------------ |
+| Authentication (`/auth/login`, `/register`, `/refresh`) | `auth`       |      `20` / `60s`      | **`fail-closed` (`503`)** | Prevents credential stuffing / brute-force during Redis outage.           |
+| DLQ Replay (`POST /dlq/:dlqId/replay`)                  | `dlq_replay` |      `60` / `60s`      | **`fail-closed` (`503`)** | Prevents unthrottled replay storms during Redis outage.                   |
+| Job Submission (`POST /queues/:queueId/jobs`)           | `job_submit` |     `300` / `60s`      |      **`fail-open`**      | Preserves durable PostgreSQL transactional outbox ingestion.              |
+| General API (`/api/v1/*`)                               | `general`    |     `600` / `60s`      |      **`fail-open`**      | Keeps read/monitoring endpoints available during transient Redis hiccups. |
 
-- **PostgreSQL Authoritative Scoping:** Every tenant-scoped read, update, and delete filters by `req.membership.organisationId` (resolved server-side). Nested resources (e.g., `/organisations/:orgId/queues/:queueId/jobs/:jobId`) verify both organisation and queue ownership.
-- **BullMQ Transport Isolation:** Physical Redis/BullMQ queue names are prefixed with `org_<organisationId>__<queueName>`, isolating transport keys across tenants.
-- **Realtime SSE & Monitoring Isolation:** `GET /monitoring/stream` binds each SSE client to `req.membership.organisationId` and only subscribes to and replays events for that organisation. Global process-level metrics never include `organisationId`, `jobId`, or arbitrary queue names as labels.
-- **Strict Input Validation & Mass-Assignment Prevention:** Authentication, organisation, membership/invitation, and governance mutation schemas enforce Zod `.strict()` mode (rejecting unexpected fields with `400 Bad Request`). Queue and job schemas use Zod's safe strip mode so unknown/protected fields (`organisationId`, `isPaused`, `status`, `fencingToken`) are stripped before reaching services while preserving backward compatibility.
+Redis connection strings, passwords, and internal hostnames are never exposed in `503` responses or structured logs.
 
-## 4. Environment Variables & Secret Requirements
+## 4. RBAC Permission Matrix & Tenant Isolation
 
-| Variable               | Required | Default             | Security Notes                                                                                                             |
-| :--------------------- | :------: | :------------------ | :------------------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`             |    No    | `development`       | Set to `production` in deployed environments (`Secure` cookies, error stack redaction, 32-char JWT secret enforcement).    |
-| `DATABASE_URL`         |   Yes    | —                   | PostgreSQL connection string; redacted from logs.                                                                          |
-| `REDIS_URL`            |   Yes    | —                   | Redis connection string; redacted from logs.                                                                               |
-| `JWT_SECRET`           |   Yes    | —                   | Minimum 16 chars in dev/test; **minimum 32 chars enforced in `production`**. Rotate via environment secrets manager.       |
-| `JWT_ISSUER`           |    No    | `pulsequeue-api`    | Enforced on JWT sign and verify.                                                                                           |
-| `JWT_AUDIENCE`         |    No    | `pulsequeue-client` | Enforced on JWT sign and verify.                                                                                           |
-| `CORS_ALLOWED_ORIGINS` |    No    | Local dev origins   | Comma-separated origin allowlist (e.g. `https://app.example.com`). Arbitrary origins are never reflected with credentials. |
-| `RATE_LIMIT_WINDOW_MS` |    No    | `60000`             | Fixed window duration in milliseconds (`1000..3600000`).                                                                   |
-| `RATE_LIMIT_AUTH_MAX`  |    No    | `20`                | Max requests per window on `/auth/register`, `/auth/login`, `/auth/refresh`.                                               |
-| `RATE_LIMIT_WRITE_MAX` |    No    | `300`               | Max requests per window on `POST /queues/:queueId/jobs` and `POST /dlq/:dlqId/replay`.                                     |
+All organisation-scoped routes require `authenticate` followed by `requireOrgRole(minRole, requiredScope?)`:
 
-Never commit real `.env` files, JWT secrets, or database credentials to source control.
+| Operation Category                                               | `MEMBER` | `ADMIN` | `OWNER` | Scoped API Key | Non-Member / Cross-Org Key |
+| :--------------------------------------------------------------- | :------: | :-----: | :-----: | :------------: | :------------------------: |
+| Read org, queues, jobs, schedules, DLQ, metrics, governance      |  Allow   |  Allow  |  Allow  |   If scoped    |           `404`            |
+| Submit jobs (`jobs:write`)                                       |  Allow   |  Allow  |  Allow  |   If scoped    |           `404`            |
+| Manage queues, cancel jobs, replay DLQ, manage schedules         |  `403`   |  Allow  |  Allow  |   If scoped    |           `404`            |
+| Manage members, invitations, governance quotas, API keys         |  `403`   |  Allow  |  Allow  |   **`403`**    |           `404`            |
+| Delete organisation, transfer ownership, delete queues/schedules |  `403`   |  `403`  |  Allow  |   **`403`**    |           `404`            |
 
-## 5. Known Limitations & Operational Recommendations
+- **Strict Input Validation & Mass-Assignment Prevention:** Auth, organisation, membership/invitation, governance, and API key schemas enforce Zod `.strict()` (`400` on unexpected fields). Queue and job schemas safely strip unknown fields (`organisationId`, `isPaused`, `status`, `fencingToken`) for backward compatibility.
+- **Route Body Limits:** `/api/v1/auth` enforces a tight `16kb` JSON body cap; general API routes enforce `1mb`.
 
-- **In-Process Rate Limiter:** The built-in rate limiter uses per-instance memory buckets. In multi-replica deployments behind a load balancer, pair with Redis-backed or ingress/API-gateway rate limiting for strict cluster-wide caps.
-- **Worker Runtime Trust Boundary:** The worker runtime (`apps/worker`) connects directly to PostgreSQL and Redis inside the private network; isolate worker and backend network segments and enforce TLS/ACL authentication on PostgreSQL and Redis in production.
-- **Reverse Proxy `trust proxy`:** When deploying behind a reverse proxy (Nginx, ALB, Cloudflare), configure Express `trust proxy` appropriately so `req.ip` reflects the client IP for rate limiting and audit logs.
+## 5. Trusted Proxy, Secrets Management & Production Deployment
+
+| Variable                                            | Required  | Default                                | Security Notes                                                                                                                                                                                   |
+| :-------------------------------------------------- | :-------: | :------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                                          |    No     | `development`                          | Set to `production` in deployed environments (`Secure` cookies, error stack redaction, strict secret checks).                                                                                    |
+| `DATABASE_URL`                                      |    Yes    | —                                      | PostgreSQL connection string; redacted from logs.                                                                                                                                                |
+| `REDIS_URL`                                         |    Yes    | —                                      | Redis connection string (`rediss://` for TLS in production); credentials masked via `sanitizeRedisUrl`.                                                                                          |
+| `JWT_SECRET`                                        |    Yes    | —                                      | Min 16 chars in dev/test; **min 32 chars in `production`**.                                                                                                                                      |
+| `API_KEY_SECRET`                                    | Prod only | Dev default                            | Dedicated HMAC pepper for API key hashing; **must be explicitly set (>= 32 chars) and distinct from `JWT_SECRET` in `production`**.                                                              |
+| `JWT_ISSUER` / `JWT_AUDIENCE`                       |    No     | `pulsequeue-api` / `pulsequeue-client` | Enforced on JWT sign and verify.                                                                                                                                                                 |
+| `CORS_ALLOWED_ORIGINS`                              | Prod rec. | Local dev origins                      | Comma-separated allowlist; arbitrary origins are never reflected with credentials.                                                                                                               |
+| `TRUST_PROXY`                                       |    No     | `false`                                | Allowed values: `false`, `loopback`, `linklocal`, `uniquelocal`, or hop count `1..5`. Unrestricted `true` is rejected at startup so spoofed `X-Forwarded-For` headers cannot bypass rate limits. |
+| `RATE_LIMIT_WINDOW_MS`                              |    No     | `60000`                                | Window duration in ms (`1000..3600000`).                                                                                                                                                         |
+| `RATE_LIMIT_AUTH_MAX` / `RATE_LIMIT_DLQ_REPLAY_MAX` |    No     | `20` / `60`                            | Fail-closed limits per window.                                                                                                                                                                   |
+| `RATE_LIMIT_WRITE_MAX` / `RATE_LIMIT_GENERAL_MAX`   |    No     | `300` / `600`                          | Fail-open limits per window.                                                                                                                                                                     |
+
+### Credential Rotation & Secret Injection Guidance
+
+- Inject secrets exclusively via your deployment platform's secret manager (Kubernetes Secrets / External Secrets Operator, AWS Secrets Manager, GCP Secret Manager, Vault) as environment variables — never commit `.env` files.
+- **API Key Rotation:** Use `POST /api/v1/organisations/:orgId/api-keys/:apiKeyId/rotate` to atomically revoke the old key and issue a replacement without downtime across other keys.
+- **JWT Secret Rotation:** Rolling `JWT_SECRET` invalidates existing 15-minute access tokens immediately; clients automatically refresh via their HttpOnly refresh token cookie.
+
+## 6. Known Limitations
+
+- **Pepper Rotation (`API_KEY_SECRET`):** Rotating `API_KEY_SECRET` invalidates existing HMAC-hashed API keys; plan coordinated tenant key rotation when rotating the global pepper.
+- **Worker Runtime Trust Boundary:** The worker runtime (`apps/worker`) connects directly to PostgreSQL and Redis inside the private network; enforce TLS and network segmentation in production.

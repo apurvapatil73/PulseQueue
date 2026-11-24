@@ -29,7 +29,7 @@ function optionalParam(req: Request, key: string): string | undefined {
 
 export async function createJob(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    if (!req.user || !req.membership) throw new UnauthorizedError();
+    if ((!req.user && !req.apiKey) || !req.membership) throw new UnauthorizedError();
     const headerIdempotencyKey = req.header('idempotency-key')?.trim();
     const rawBody =
       req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
@@ -41,7 +41,7 @@ export async function createJob(req: Request, res: Response, next: NextFunction)
     const { job, dispatch, deduplicated } = await jobService.create(
       req.membership.organisationId,
       param(req, 'queueId'),
-      req.user.id,
+      req.user?.id ?? null,
       input,
     );
     sendSuccess(
@@ -89,11 +89,11 @@ export async function getJob(req: Request, res: Response, next: NextFunction): P
 
 export async function cancelJob(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    if (!req.user || !req.membership) throw new UnauthorizedError();
+    if ((!req.user && !req.apiKey) || !req.membership) throw new UnauthorizedError();
     const result = await jobService.cancel(
       req.membership.organisationId,
       param(req, 'jobId'),
-      req.user.id,
+      req.user?.id ?? `apikey:${req.apiKey!.id}`,
       optionalParam(req, 'queueId'),
     );
     sendSuccess(res, {
