@@ -1,7 +1,19 @@
-import { JobDispatchState, JobStatus, Prisma, SchedulingPolicy } from '@prisma/client';
+import {
+  JobDispatchState,
+  JobStatus,
+  OutboxStatus,
+  Prisma,
+  SchedulingPolicy,
+} from '@prisma/client';
 import { prisma as db } from '../config/database.js';
+import { logger } from '../utils/logger.js';
 import { QUEUE_LIMITS } from '../validators/queue.validator.js';
-import type { EnqueueResult, PersistedQueueDescriptor } from './bullmq.service.js';
+import {
+  bullMQService,
+  type BullMQService,
+  type EnqueueResult,
+  type PersistedQueueDescriptor,
+} from './bullmq.service.js';
 
 /**
  * Advisory lock namespace for tenant-level active/dispatching reservation checks.
@@ -120,6 +132,91 @@ export interface DispatchBatchSummary {
   dispatched: number;
   released: number;
   skippedReason: ClaimCandidatesResult['skippedReason'];
+}
+
+export interface SchedulerTickSummary {
+  queuesScanned: number;
+  delayedPromoted: number;
+  staleRecovered: number;
+  claimed: number;
+  dispatched: number;
+  released: number;
+  orgCapacityDenials: number;
+  durationMs: number;
+}
+
+export interface SchedulerObservabilitySnapshot {
+  claimsTotal: number;
+  dispatchesTotal: number;
+  dispatchFailuresTotal: number;
+  staleRecoveriesTotal: number;
+  orgCapacityDenialsTotal: number;
+  delayedPromotedTotal: number;
+  byPolicyDispatched: Record<SchedulingPolicy, number>;
+  avgDispatchLatencyMs: number | null;
+  lastTickDurationMs: number | null;
+}
+
+/**
+ * Returns true when a queue is governed by PulseQueue's custom PostgreSQL scheduler
+ * (`FIFO`, `STRICT_PRIORITY`, or `PRIORITY_AGING`) rather than direct `LEGACY_BULLMQ` enqueueing.
+ */
+export function isCustomSchedulingPolicy(policy: SchedulingPolicy | undefined): boolean {
+  return policy !== undefined && policy !== SchedulingPolicy.LEGACY_BULLMQ;
+}
+
+/**
+ * Computes canonical initial scheduling fields (`dispatchState`, `readyAt`, `virtualRankAt`)
+ * for a newly created job based on its queue's scheduling policy and aging rate.
+ */
+export function buildInitialSchedulingFields(
+  queue: { schedulingPolicy: SchedulingPolicy; agingRatePerSec: number },
+  priority: number,
+  delayMs: number,
+  now: Date = new Date(),
+): {
+  dispatchState: JobDispatchState;
+  readyAt: Date;
+  virtualRankAt: Date;
+} {
+  const readyAt = computeReadyAt(now, delayMs);
+  const virtualRankAt = computeVirtualRankAt(readyAt, priority, queue.agingRatePerSec);
+  const dispatchState = isCustomSchedulingPolicy(queue.schedulingPolicy)
+    ? JobDispatchState.QUEUED
+    : JobDispatchState.DISPATCHED;
+  return { dispatchState, readyAt, virtualRankAt };
+}
+
+/**
+ * Production BullMQ transport adapter for `PrioritySchedulerService`.
+ *
+ * Uses stable `jobId = job.id`, maps effective priority into BullMQ's priority scale,
+ * cleans up any stale completed/failed Redis transport entry from a prior retry attempt,
+ * and sets BullMQ `maxRetries: 0` (1 transport attempt) so retries on custom-policy queues
+ * re-enter PostgreSQL `DELAYED + QUEUED` and respect the queue's scheduling policy.
+ */
+export function createBullMQDispatchAdapter(
+  bullMQ: BullMQService = bullMQService,
+): JobDispatchAdapter {
+  return {
+    async dispatchClaimedJob(queue, job, effectivePriority): Promise<EnqueueResult> {
+      const existingState = await bullMQ.getBullJobState(queue, job.id);
+      if (existingState === 'completed' || existingState === 'failed') {
+        await bullMQ.removeJobFromBullMQ(queue, job.id);
+      }
+
+      return bullMQ.enqueueJob(queue, {
+        id: job.id,
+        queueId: job.queueId,
+        name: job.name,
+        priority: clampBasePriority(effectivePriority),
+        payload: job.payload,
+        maxRetries: 0,
+        backoffMs: 0,
+        delayMs: 0,
+      });
+    },
+  };
 }
 
 function hashOrgLockKey(orgId: string): number {
@@ -418,6 +515,53 @@ interface RawClaimedJobRow {
  * stale-reservation cleanup. Kept decoupled from BullMQ via `JobDispatchAdapter`.
  */
 export class PrioritySchedulerService {
+  private readonly defaultAdapter: JobDispatchAdapter;
+  private timer: NodeJS.Timeout | null = null;
+  private tickInFlight = false;
+  private roundRobinOffset = 0;
+  private activeClaimerId = 'scheduler-default';
+  private activeIntervalMs = 250;
+  private activeStaleAfterMs: number = SCHEDULING_DEFAULTS.DEFAULT_RESERVATION_STALE_MS;
+  private readonly nudgeTimers = new Map<string, NodeJS.Timeout>();
+
+  // Aggregate observability counters (no high-cardinality tenant labels)
+  private claimsTotal = 0;
+  private dispatchesTotal = 0;
+  private dispatchFailuresTotal = 0;
+  private staleRecoveriesTotal = 0;
+  private orgCapacityDenialsTotal = 0;
+  private delayedPromotedTotal = 0;
+  private dispatchLatencySumMs = 0;
+  private dispatchLatencyCount = 0;
+  private lastTickDurationMs: number | null = null;
+  private readonly byPolicyDispatched: Record<SchedulingPolicy, number> = {
+    [SchedulingPolicy.LEGACY_BULLMQ]: 0,
+    [SchedulingPolicy.FIFO]: 0,
+    [SchedulingPolicy.STRICT_PRIORITY]: 0,
+    [SchedulingPolicy.PRIORITY_AGING]: 0,
+  };
+
+  constructor(adapter?: JobDispatchAdapter) {
+    this.defaultAdapter = adapter ?? createBullMQDispatchAdapter(bullMQService);
+  }
+
+  getObservabilitySnapshot(): SchedulerObservabilitySnapshot {
+    return {
+      claimsTotal: this.claimsTotal,
+      dispatchesTotal: this.dispatchesTotal,
+      dispatchFailuresTotal: this.dispatchFailuresTotal,
+      staleRecoveriesTotal: this.staleRecoveriesTotal,
+      orgCapacityDenialsTotal: this.orgCapacityDenialsTotal,
+      delayedPromotedTotal: this.delayedPromotedTotal,
+      byPolicyDispatched: { ...this.byPolicyDispatched },
+      avgDispatchLatencyMs:
+        this.dispatchLatencyCount > 0
+          ? Math.round((this.dispatchLatencySumMs / this.dispatchLatencyCount) * 100) / 100
+          : null,
+      lastTickDurationMs: this.lastTickDurationMs,
+    };
+  }
+
   /**
    * Atomically selects and reserves up to `params.limit` eligible `PENDING` + `QUEUED` jobs
    * for a single non-paused, non-legacy queue using PostgreSQL `FOR UPDATE SKIP LOCKED`.
@@ -496,16 +640,41 @@ export class PrioritySchedulerService {
           };
         }
 
+        // Promote eligible DELAYED custom-policy jobs whose readyAt <= now into PENDING
+        // so delayed jobs are never dispatched early and seamlessly enter policy ordering once due
+        const promoted = await tx.job.updateMany({
+          where: {
+            queueId: queue.id,
+            status: JobStatus.DELAYED,
+            dispatchState: JobDispatchState.QUEUED,
+            isQuarantined: false,
+            readyAt: { lte: now },
+          },
+          data: {
+            status: JobStatus.PENDING,
+          },
+        });
+        if (promoted.count > 0) {
+          this.delayedPromotedTotal += promoted.count;
+        }
+
         let effectiveLimit = requestedLimit;
 
-        // Optional queue-level bounded buffer ceiling (ACTIVE + DISPATCHING)
+        // Optional queue-level bounded buffer ceiling:
+        // counts ACTIVE + DISPATCHING + DISPATCHED (still PENDING in BullMQ) so we never
+        // preload the backlog into Redis ahead of PostgreSQL scheduling decisions
         if (params.maxInFlightForQueue !== undefined) {
           const inFlightCount = await tx.job.count({
             where: {
               queueId: queue.id,
               OR: [
                 { status: JobStatus.ACTIVE },
-                { status: JobStatus.PENDING, dispatchState: JobDispatchState.DISPATCHING },
+                {
+                  status: JobStatus.PENDING,
+                  dispatchState: {
+                    in: [JobDispatchState.DISPATCHING, JobDispatchState.DISPATCHED],
+                  },
+                },
               ],
             },
           });
@@ -522,7 +691,9 @@ export class PrioritySchedulerService {
           effectiveLimit = Math.min(effectiveLimit, queueHeadroom);
         }
 
-        // Tenant-level active + dispatching reservation cap (`Organisation.maxActiveJobs`)
+        // Tenant-level active + in-flight dispatch reservation cap (`Organisation.maxActiveJobs`):
+        // accounts for ACTIVE jobs across all tenant queues PLUS custom-policy DISPATCHING and
+        // DISPATCHED-but-not-yet-ACTIVE jobs so concurrent schedulers cannot oversubscribe capacity
         const enforceOrgLimit = params.enforceOrgActiveLimit ?? true;
         if (enforceOrgLimit && queue.organisation.maxActiveJobs !== null) {
           const lockKey = hashOrgLockKey(queue.organisationId);
@@ -533,13 +704,27 @@ export class PrioritySchedulerService {
               queue: { organisationId: queue.organisationId },
               OR: [
                 { status: JobStatus.ACTIVE },
-                { status: JobStatus.PENDING, dispatchState: JobDispatchState.DISPATCHING },
+                {
+                  status: JobStatus.PENDING,
+                  dispatchState: {
+                    in: [JobDispatchState.DISPATCHING, JobDispatchState.DISPATCHED],
+                  },
+                  queue: {
+                    schedulingPolicy: { not: SchedulingPolicy.LEGACY_BULLMQ },
+                  },
+                },
               ],
             },
           });
 
           const orgHeadroom = Math.max(0, queue.organisation.maxActiveJobs - orgReserved);
           if (orgHeadroom === 0) {
+            this.orgCapacityDenialsTotal += 1;
+            logger.debug('Scheduler deferred claim: organisation maxActiveJobs reached', {
+              policy: queue.schedulingPolicy,
+              maxActiveJobs: queue.organisation.maxActiveJobs,
+              orgReserved,
+            });
             return {
               queueId: queue.id,
               organisationId: queue.organisationId,
@@ -821,23 +1006,54 @@ export class PrioritySchedulerService {
   }
 
   /**
-   * Marks successfully dispatched jobs as `DISPATCHED` only if still held by `claimerId`.
+   * Atomically marks successfully enqueued jobs as `DISPATCHED` (only if still held by `claimerId`)
+   * and synchronizes their `JobDispatchOutbox` and `ScheduleExecution.dispatchedAt` records.
    */
   async markDispatched(jobIds: string[], claimerId: string): Promise<number> {
     if (jobIds.length === 0) return 0;
-    const res = await db.job.updateMany({
-      where: {
-        id: { in: jobIds },
-        dispatchState: JobDispatchState.DISPATCHING,
-        dispatchClaimedBy: claimerId,
+    const dispatchedAt = new Date();
+    return db.$transaction(
+      async (tx) => {
+        const res = await tx.job.updateMany({
+          where: {
+            id: { in: jobIds },
+            dispatchState: JobDispatchState.DISPATCHING,
+            dispatchClaimedBy: claimerId,
+          },
+          data: {
+            dispatchState: JobDispatchState.DISPATCHED,
+            dispatchClaimedAt: null,
+            dispatchClaimedBy: null,
+          },
+        });
+
+        await tx.jobDispatchOutbox.updateMany({
+          where: {
+            jobId: { in: jobIds },
+            status: OutboxStatus.PENDING,
+          },
+          data: {
+            status: OutboxStatus.DISPATCHED,
+            dispatchedAt,
+            attempts: { increment: 1 },
+            lastError: null,
+          },
+        });
+
+        await tx.scheduleExecution.updateMany({
+          where: {
+            jobId: { in: jobIds },
+            dispatchedAt: null,
+          },
+          data: {
+            dispatchedAt,
+          },
+        });
+
+        return res.count;
       },
-      data: {
-        dispatchState: JobDispatchState.DISPATCHED,
-        dispatchClaimedAt: null,
-        dispatchClaimedBy: null,
-      },
-    });
-    return res.count;
+      { maxWait: 10_000, timeout: 10_000 },
+    );
   }
 
   /**
@@ -863,6 +1079,11 @@ export class PrioritySchedulerService {
   /**
    * Recovers stale `DISPATCHING` reservations left behind by crashed scheduler instances so
    * stale reservations can never permanently consume queue buffer or tenant `maxActiveJobs` capacity.
+   *
+   * Only touches `status = PENDING` + `dispatchState = DISPATCHING` rows older than `staleAfterMs`:
+   * - Never steals live claims (`dispatchClaimedAt > now - staleAfterMs`).
+   * - Never reverts jobs that already transitioned to `ACTIVE`, `COMPLETED`, or `FAILED` after a
+   *   crash between BullMQ enqueue and DB state update.
    */
   async recoverStaleReservations(
     staleAfterMs: number = SCHEDULING_DEFAULTS.DEFAULT_RESERVATION_STALE_MS,
@@ -873,6 +1094,7 @@ export class PrioritySchedulerService {
     const res = await db.job.updateMany({
       where: {
         ...(queueId ? { queueId } : {}),
+        status: JobStatus.PENDING,
         dispatchState: JobDispatchState.DISPATCHING,
         dispatchClaimedAt: { lte: cutoff },
       },
@@ -882,17 +1104,24 @@ export class PrioritySchedulerService {
         dispatchClaimedBy: null,
       },
     });
+    if (res.count > 0) {
+      this.staleRecoveriesTotal += res.count;
+      logger.warn('Recovered stale scheduler DISPATCHING reservations', {
+        recoveredCount: res.count,
+        staleAfterMs,
+      });
+    }
     return res.count;
   }
 
   /**
    * Decoupled orchestration helper: claims candidates from PostgreSQL and dispatches them via
-   * an injected `JobDispatchAdapter` (e.g., BullMQ in Milestone 8.3.2 or a mock adapter in tests).
+   * an injected `JobDispatchAdapter` (defaulting to the production BullMQ transport adapter).
    */
   async dispatchBatchWithAdapter(
     queue: PersistedQueueDescriptor,
     params: Omit<ClaimCandidatesParams, 'queueId'>,
-    adapter: JobDispatchAdapter,
+    adapter: JobDispatchAdapter = this.defaultAdapter,
   ): Promise<DispatchBatchSummary> {
     const claimResult = await this.claimCandidatesForQueue({
       ...params,
@@ -908,19 +1137,32 @@ export class PrioritySchedulerService {
       };
     }
 
+    this.claimsTotal += claimResult.claimed.length;
+
     const dispatchedIds: string[] = [];
     const failedIds: string[] = [];
+    const nowMs = Date.now();
 
     for (const job of claimResult.claimed) {
       try {
         const res = await adapter.dispatchClaimedJob(queue, job, job.evaluation.effectivePriority);
         if (res.enqueued) {
           dispatchedIds.push(job.id);
+          const latencyMs = Math.max(0, nowMs - job.readyAt.getTime());
+          this.dispatchLatencySumMs += latencyMs;
+          this.dispatchLatencyCount += 1;
         } else {
           failedIds.push(job.id);
+          this.dispatchFailuresTotal += 1;
         }
-      } catch {
+      } catch (err) {
         failedIds.push(job.id);
+        this.dispatchFailuresTotal += 1;
+        logger.warn('Custom scheduler failed to dispatch claimed job to transport', {
+          policy: claimResult.policy,
+          jobId: job.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 
@@ -929,12 +1171,217 @@ export class PrioritySchedulerService {
       this.releaseReservations(failedIds, params.claimerId),
     ]);
 
+    if (dispatched > 0) {
+      this.dispatchesTotal += dispatched;
+      this.byPolicyDispatched[claimResult.policy] += dispatched;
+    }
+
     return {
       claimed: claimResult.claimed.length,
       dispatched,
       released,
       skippedReason: null,
     };
+  }
+
+  /**
+   * Runs one bounded, multi-tenant fair round-robin scheduling sweep across all active
+   * non-legacy queues (`FIFO`, `STRICT_PRIORITY`, `PRIORITY_AGING`).
+   *
+   * - Rotates queue order on each tick so no single tenant can monopolize scheduler work.
+   * - Bounds in-flight BullMQ dispatch per queue to `max(1, queue.concurrency)`.
+   * - Respects `Organisation.maxActiveJobs` atomically across all queues & scheduler processes.
+   * - Recovers stale `DISPATCHING` reservations before claiming.
+   */
+  async tickAllQueues(options?: {
+    claimerId?: string;
+    now?: Date;
+    staleAfterMs?: number;
+    maxQueuesPerTick?: number;
+    organisationId?: string;
+    queueId?: string;
+    adapter?: JobDispatchAdapter;
+  }): Promise<SchedulerTickSummary> {
+    const startedAt = Date.now();
+    const now = options?.now ?? new Date();
+    const claimerId = options?.claimerId ?? this.activeClaimerId;
+    const staleAfterMs = options?.staleAfterMs ?? this.activeStaleAfterMs;
+    const maxQueues = Math.max(1, options?.maxQueuesPerTick ?? 50);
+
+    const summary: SchedulerTickSummary = {
+      queuesScanned: 0,
+      delayedPromoted: 0,
+      staleRecovered: 0,
+      claimed: 0,
+      dispatched: 0,
+      released: 0,
+      orgCapacityDenials: 0,
+      durationMs: 0,
+    };
+
+    try {
+      summary.staleRecovered = await this.recoverStaleReservations(
+        staleAfterMs,
+        now,
+        options?.queueId,
+      );
+
+      const queues = await db.queue.findMany({
+        where: {
+          ...(options?.queueId ? { id: options.queueId } : {}),
+          ...(options?.organisationId ? { organisationId: options.organisationId } : {}),
+          isPaused: false,
+          schedulingPolicy: { not: SchedulingPolicy.LEGACY_BULLMQ },
+        },
+        select: {
+          id: true,
+          organisationId: true,
+          name: true,
+          isPaused: true,
+          concurrency: true,
+          defaultPriority: true,
+          maxRetries: true,
+          backoffMs: true,
+          poisonFailureThreshold: true,
+          schedulingPolicy: true,
+          agingRatePerSec: true,
+        },
+        orderBy: [{ organisationId: 'asc' }, { id: 'asc' }],
+      });
+
+      if (queues.length === 0) {
+        summary.durationMs = Date.now() - startedAt;
+        this.lastTickDurationMs = summary.durationMs;
+        return summary;
+      }
+
+      // Fair round-robin rotation across queues/organisations so no single tenant monopolizes ticks
+      const offset = this.roundRobinOffset % queues.length;
+      const rotated = [...queues.slice(offset), ...queues.slice(0, offset)].slice(0, maxQueues);
+      this.roundRobinOffset = (this.roundRobinOffset + 1) % queues.length;
+
+      summary.queuesScanned = rotated.length;
+      const promotedBefore = this.delayedPromotedTotal;
+
+      for (const q of rotated) {
+        const batchCap = Math.max(1, q.concurrency);
+        const batch = await this.dispatchBatchWithAdapter(
+          q,
+          {
+            claimerId,
+            limit: batchCap,
+            maxInFlightForQueue: batchCap,
+            enforceOrgActiveLimit: true,
+            now,
+          },
+          options?.adapter ?? this.defaultAdapter,
+        );
+        summary.claimed += batch.claimed;
+        summary.dispatched += batch.dispatched;
+        summary.released += batch.released;
+        if (batch.skippedReason === 'org_active_limit_reached') {
+          summary.orgCapacityDenials += 1;
+        }
+      }
+
+      summary.delayedPromoted = this.delayedPromotedTotal - promotedBefore;
+      summary.durationMs = Date.now() - startedAt;
+      this.lastTickDurationMs = summary.durationMs;
+
+      if (summary.dispatched > 0 || summary.released > 0 || summary.staleRecovered > 0) {
+        logger.debug('Priority scheduler tick completed', {
+          queuesScanned: summary.queuesScanned,
+          claimed: summary.claimed,
+          dispatched: summary.dispatched,
+          released: summary.released,
+          staleRecovered: summary.staleRecovered,
+          orgCapacityDenials: summary.orgCapacityDenials,
+          durationMs: summary.durationMs,
+        });
+      }
+
+      return summary;
+    } catch (err) {
+      summary.durationMs = Date.now() - startedAt;
+      this.lastTickDurationMs = summary.durationMs;
+      logger.error('Priority scheduler tick failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return summary;
+    }
+  }
+
+  /**
+   * Non-blocking debounced nudge for a single custom-policy queue (e.g. immediately after
+   * a worker finishes a job so the next eligible job starts with minimal latency).
+   * Only fires when the scheduler loop is running.
+   */
+  nudgeQueue(queueId: string, delayMs: number = 10): void {
+    if (!this.timer || this.nudgeTimers.has(queueId)) {
+      return;
+    }
+    const handle = setTimeout(
+      () => {
+        this.nudgeTimers.delete(queueId);
+        if (!this.timer) return;
+        void this.tickAllQueues({ queueId, claimerId: this.activeClaimerId });
+      },
+      Math.max(0, delayMs),
+    );
+    handle.unref();
+    this.nudgeTimers.set(queueId, handle);
+  }
+
+  /**
+   * Starts the overlap-guarded periodic custom scheduler loop (idempotent).
+   */
+  start(options?: { intervalMs?: number; claimerId?: string; staleAfterMs?: number }): void {
+    if (this.timer) {
+      return;
+    }
+    this.activeIntervalMs = Math.max(50, options?.intervalMs ?? 250);
+    this.activeClaimerId = options?.claimerId ?? `scheduler-${process.pid}`;
+    this.activeStaleAfterMs =
+      options?.staleAfterMs ?? SCHEDULING_DEFAULTS.DEFAULT_RESERVATION_STALE_MS;
+
+    this.timer = setInterval(() => {
+      if (this.tickInFlight) return;
+      this.tickInFlight = true;
+      void this.tickAllQueues({
+        claimerId: this.activeClaimerId,
+        staleAfterMs: this.activeStaleAfterMs,
+      }).finally(() => {
+        this.tickInFlight = false;
+      });
+    }, this.activeIntervalMs);
+    this.timer.unref();
+
+    logger.info('Priority scheduler loop started', {
+      claimerId: this.activeClaimerId,
+      intervalMs: this.activeIntervalMs,
+      staleAfterMs: this.activeStaleAfterMs,
+    });
+  }
+
+  /**
+   * Stops the periodic scheduler loop and clears all pending per-queue nudges.
+   */
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+      logger.info('Priority scheduler loop stopped', {
+        claimerId: this.activeClaimerId,
+      });
+    }
+    for (const handle of this.nudgeTimers.values()) {
+      clearTimeout(handle);
+    }
+    this.nudgeTimers.clear();
+  }
+
+  isRunning(): boolean {
+    return this.timer !== null;
   }
 }
 

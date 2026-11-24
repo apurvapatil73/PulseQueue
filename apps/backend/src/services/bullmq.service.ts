@@ -1,6 +1,6 @@
 import { Queue as BullMQQueue, type JobsOptions, type DefaultJobOptions } from 'bullmq';
 import type { Redis } from 'ioredis';
-import type { Prisma } from '@prisma/client';
+import type { Prisma, SchedulingPolicy } from '@prisma/client';
 import {
   getBullMQConnection,
   ensureBullMQConnectionReady,
@@ -19,6 +19,8 @@ export interface PersistedQueueDescriptor {
   maxRetries: number;
   backoffMs: number;
   poisonFailureThreshold?: number;
+  schedulingPolicy?: SchedulingPolicy;
+  agingRatePerSec?: number;
 }
 
 export interface PersistedJobDescriptor {

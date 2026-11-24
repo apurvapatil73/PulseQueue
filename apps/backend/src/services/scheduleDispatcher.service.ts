@@ -7,6 +7,7 @@ import {
   ScheduleExecutionStatus,
   ScheduleStatus,
   ScheduleType,
+  SchedulingPolicy,
 } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { TooManyRequestsError } from '../utils/errors.js';
@@ -20,6 +21,11 @@ import {
 import { bullMQService, type BullMQService } from './bullmq.service.js';
 import { eventService } from './event.service.js';
 import { governanceService, type AdmissionRejectionDetails } from './governance.service.js';
+import {
+  buildInitialSchedulingFields,
+  isCustomSchedulingPolicy,
+  prioritySchedulerService,
+} from './priorityScheduler.service.js';
 
 const MAX_SKIP_AUDIT_RECORDS = 10;
 
@@ -273,16 +279,27 @@ export class ScheduleDispatcherService {
                   initialStatus,
                 });
 
+                const effectivePriority = sched.priority ?? sched.queue.defaultPriority;
+                const schedFields = buildInitialSchedulingFields(
+                  sched.queue,
+                  effectivePriority,
+                  0,
+                  delayMs > 0 ? targetRunAt : now,
+                );
+
                 const job = await tx.job.create({
                   data: {
                     queueId: sched.queue.id,
                     name: sched.jobName,
                     status: initialStatus,
-                    priority: sched.priority ?? sched.queue.defaultPriority,
+                    priority: effectivePriority,
                     payload: sched.payload as Prisma.InputJsonValue,
                     maxRetries: sched.maxRetries ?? sched.queue.maxRetries,
                     backoffMs: sched.backoffMs ?? sched.queue.backoffMs,
                     delayMs,
+                    dispatchState: schedFields.dispatchState,
+                    readyAt: schedFields.readyAt,
+                    virtualRankAt: schedFields.virtualRankAt,
                     createdById: sched.createdById,
                   },
                 });
@@ -757,16 +774,27 @@ export class ScheduleDispatcherService {
             }
 
             // 5. Commit Job + ScheduleExecution + Outbox atomically
+            const effectivePriority = fresh.priority ?? schedule.queue.defaultPriority;
+            const schedFields = buildInitialSchedulingFields(
+              schedule.queue,
+              effectivePriority,
+              0,
+              now,
+            );
+
             const job = await tx.job.create({
               data: {
                 queueId: schedule.queue.id,
                 name: fresh.jobName,
                 status: initialJobStatus,
-                priority: fresh.priority ?? schedule.queue.defaultPriority,
+                priority: effectivePriority,
                 payload: fresh.payload as Prisma.InputJsonValue,
                 maxRetries: fresh.maxRetries ?? schedule.queue.maxRetries,
                 backoffMs: fresh.backoffMs ?? schedule.queue.backoffMs,
                 delayMs: 0,
+                dispatchState: schedFields.dispatchState,
+                readyAt: schedFields.readyAt,
+                virtualRankAt: schedFields.virtualRankAt,
                 createdById: fresh.createdById,
               },
             });
@@ -940,39 +968,52 @@ export class ScheduleDispatcherService {
     record: DispatchedJobRecord,
     summary: ScheduleTickSummary,
   ): Promise<void> {
-    const dispatch = await this.bullMQ.enqueueJob(queue, record.job);
+    const isCustomPolicy = isCustomSchedulingPolicy(queue.schedulingPolicy);
+    let enqueued = false;
 
-    if (dispatch.enqueued) {
-      const dispatchedAt = new Date();
-      await Promise.all([
-        db.jobDispatchOutbox.updateMany({
-          where: { id: record.outboxId, status: OutboxStatus.PENDING },
-          data: {
-            status: OutboxStatus.DISPATCHED,
-            dispatchedAt,
-            attempts: { increment: 1 },
-            lastError: null,
-          },
-        }),
-        db.scheduleExecution.updateMany({
-          where: { id: record.executionId, dispatchedAt: null },
-          data: { dispatchedAt },
-        }),
-      ]);
-      summary.dispatched += 1;
-      if (record.isCatchUp) {
-        summary.catchUpDispatched += 1;
+    if (isCustomPolicy) {
+      // Custom-policy scheduled jobs stay QUEUED in PostgreSQL until PrioritySchedulerService
+      // dispatches them once readyAt <= now (never bypassing custom scheduling).
+      summary.outboxDeferred += 1;
+      if (!queue.isPaused && record.job.delayMs === 0) {
+        prioritySchedulerService.nudgeQueue(queue.id);
       }
     } else {
-      await db.jobDispatchOutbox.updateMany({
-        where: { id: record.outboxId, status: OutboxStatus.PENDING },
-        data: {
-          attempts: { increment: 1 },
-          lastError: (dispatch.error ?? 'Redis unavailable').slice(0, 1000),
-          nextAttemptAt: new Date(Date.now() + 2000),
-        },
-      });
-      summary.outboxDeferred += 1;
+      const dispatch = await this.bullMQ.enqueueJob(queue, record.job);
+      enqueued = dispatch.enqueued;
+
+      if (dispatch.enqueued) {
+        const dispatchedAt = new Date();
+        await Promise.all([
+          db.jobDispatchOutbox.updateMany({
+            where: { id: record.outboxId, status: OutboxStatus.PENDING },
+            data: {
+              status: OutboxStatus.DISPATCHED,
+              dispatchedAt,
+              attempts: { increment: 1 },
+              lastError: null,
+            },
+          }),
+          db.scheduleExecution.updateMany({
+            where: { id: record.executionId, dispatchedAt: null },
+            data: { dispatchedAt },
+          }),
+        ]);
+        summary.dispatched += 1;
+        if (record.isCatchUp) {
+          summary.catchUpDispatched += 1;
+        }
+      } else {
+        await db.jobDispatchOutbox.updateMany({
+          where: { id: record.outboxId, status: OutboxStatus.PENDING },
+          data: {
+            attempts: { increment: 1 },
+            lastError: (dispatch.error ?? 'Redis unavailable').slice(0, 1000),
+            nextAttemptAt: new Date(Date.now() + 2000),
+          },
+        });
+        summary.outboxDeferred += 1;
+      }
     }
 
     await eventService.record({
@@ -989,7 +1030,7 @@ export class ScheduleDispatcherService {
         nextRunAt: followingRunAt?.toISOString() ?? null,
         isCatchUp: record.isCatchUp,
         misfirePolicy,
-        enqueued: dispatch.enqueued,
+        enqueued,
       },
     });
   }
@@ -1026,6 +1067,9 @@ export class ScheduleDispatcherService {
           },
           job: {
             status: { in: [JobStatus.PENDING, JobStatus.DELAYED] },
+            queue: {
+              schedulingPolicy: SchedulingPolicy.LEGACY_BULLMQ,
+            },
             dispatchOutbox: {
               status: OutboxStatus.DISPATCHED,
             },

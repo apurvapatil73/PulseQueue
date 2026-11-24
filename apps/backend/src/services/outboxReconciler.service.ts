@@ -1,7 +1,8 @@
-import { OutboxStatus } from '@prisma/client';
+import { OutboxStatus, SchedulingPolicy } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { logger } from '../utils/logger.js';
 import { bullMQService, type BullMQService } from './bullmq.service.js';
+import { prioritySchedulerService } from './priorityScheduler.service.js';
 
 export interface ReconciliationSummary {
   scanned: number;
@@ -68,10 +69,23 @@ export class OutboxReconciler {
 
     try {
       const now = new Date();
+
+      // Recover stale DISPATCHING reservations on custom-scheduled queues without bypassing
+      // PrioritySchedulerService selection or stealing live claims
+      await prioritySchedulerService.recoverStaleReservations(undefined, now);
+
+      // Direct legacy outbox reconciliation applies ONLY to LEGACY_BULLMQ queues;
+      // custom-policy queues (FIFO, STRICT_PRIORITY, PRIORITY_AGING) are exclusively
+      // selected and dispatched by PrioritySchedulerService.
       const pendingRecords = await db.jobDispatchOutbox.findMany({
         where: {
           status: OutboxStatus.PENDING,
           nextAttemptAt: { lte: now },
+          job: {
+            queue: {
+              schedulingPolicy: SchedulingPolicy.LEGACY_BULLMQ,
+            },
+          },
         },
         include: {
           job: {

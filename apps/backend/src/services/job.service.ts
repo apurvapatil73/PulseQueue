@@ -1,4 +1,10 @@
-import { JobStatus, OutboxStatus, PlatformEventType, Prisma } from '@prisma/client';
+import {
+  JobDispatchState,
+  JobStatus,
+  OutboxStatus,
+  PlatformEventType,
+  Prisma,
+} from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { ConflictError, NotFoundError, TooManyRequestsError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
@@ -23,6 +29,12 @@ import {
   type AdmissionRejectionDetails,
   type RetryBudgetCheckResult,
 } from './governance.service.js';
+import {
+  buildInitialSchedulingFields,
+  computeVirtualRankAt,
+  isCustomSchedulingPolicy,
+  prioritySchedulerService,
+} from './priorityScheduler.service.js';
 
 export const DEFAULT_JOB_LEASE_MS = 30_000;
 
@@ -224,6 +236,8 @@ export class JobService {
               backoffMs: true,
               maxQueueDepth: true,
               backpressureMaxAgeMs: true,
+              schedulingPolicy: true,
+              agingRatePerSec: true,
             },
           });
 
@@ -259,17 +273,23 @@ export class JobService {
             initialStatus,
           });
 
+          const effectivePriority = input.priority ?? queue.defaultPriority;
+          const schedFields = buildInitialSchedulingFields(queue, effectivePriority, input.delayMs);
+
           const job = await tx.job.create({
             data: {
               queueId: queue.id,
               name: input.name,
               status: initialStatus,
-              priority: input.priority ?? queue.defaultPriority,
+              priority: effectivePriority,
               payload: input.payload as Prisma.InputJsonValue,
               maxRetries: input.maxRetries ?? queue.maxRetries,
               backoffMs: input.backoffMs ?? queue.backoffMs,
               delayMs: input.delayMs,
               idempotencyKey: input.idempotencyKey ?? null,
+              dispatchState: schedFields.dispatchState,
+              readyAt: schedFields.readyAt,
+              virtualRankAt: schedFields.virtualRankAt,
               createdById: userId,
             },
             include: JOB_INCLUDE,
@@ -370,38 +390,56 @@ export class JobService {
       createdById: userId,
     });
 
-    // Dispatch to BullMQ after durable PostgreSQL commit.
-    // Partial failure leaves the outbox PENDING so OutboxReconciler redispatches idempotently.
-    const dispatch = await bullMQService.enqueueJob(persistedQueue, createdJob);
+    const isCustomPolicy = isCustomSchedulingPolicy(persistedQueue.schedulingPolicy);
+    let dispatch: EnqueueResult;
 
-    try {
-      if (dispatch.enqueued) {
-        await db.jobDispatchOutbox.updateMany({
-          where: { id: outboxId, status: OutboxStatus.PENDING },
-          data: {
-            status: OutboxStatus.DISPATCHED,
-            dispatchedAt: new Date(),
-            attempts: { increment: 1 },
-            lastError: null,
-          },
-        });
-      } else {
-        await db.jobDispatchOutbox.updateMany({
-          where: { id: outboxId, status: OutboxStatus.PENDING },
-          data: {
-            attempts: { increment: 1 },
-            lastError: sanitizeErrorMessage(dispatch.error ?? 'Redis unavailable'),
-            nextAttemptAt: new Date(Date.now() + 2000),
-          },
+    if (isCustomPolicy) {
+      // Custom-scheduled queues stay QUEUED in PostgreSQL (outbox PENDING) until
+      // PrioritySchedulerService selects and dispatches them within queue/tenant limits.
+      dispatch = {
+        broker: 'bullmq',
+        enqueued: false,
+        deduplicated: false,
+        bullmqQueueName: buildBullMQQueueName(orgId, persistedQueue.name),
+        bullmqJobId: null,
+      };
+      if (!persistedQueue.isPaused && createdJob.delayMs === 0) {
+        prioritySchedulerService.nudgeQueue(persistedQueue.id);
+      }
+    } else {
+      // LEGACY_BULLMQ: preserve direct BullMQ enqueue after durable PostgreSQL commit.
+      // Partial failure leaves the outbox PENDING so OutboxReconciler redispatches idempotently.
+      dispatch = await bullMQService.enqueueJob(persistedQueue, createdJob);
+
+      try {
+        if (dispatch.enqueued) {
+          await db.jobDispatchOutbox.updateMany({
+            where: { id: outboxId, status: OutboxStatus.PENDING },
+            data: {
+              status: OutboxStatus.DISPATCHED,
+              dispatchedAt: new Date(),
+              attempts: { increment: 1 },
+              lastError: null,
+            },
+          });
+        } else {
+          await db.jobDispatchOutbox.updateMany({
+            where: { id: outboxId, status: OutboxStatus.PENDING },
+            data: {
+              attempts: { increment: 1 },
+              lastError: sanitizeErrorMessage(dispatch.error ?? 'Redis unavailable'),
+              nextAttemptAt: new Date(Date.now() + 2000),
+            },
+          });
+        }
+      } catch (err) {
+        // Non-fatal: outbox remains PENDING and BullMQ deduplicates on stable jobId if retried
+        logger.warn('Failed to update outbox status after BullMQ dispatch', {
+          outboxId,
+          jobId: createdJob.id,
+          error: err instanceof Error ? err.message : String(err),
         });
       }
-    } catch (err) {
-      // Non-fatal: outbox remains PENDING and BullMQ deduplicates on stable jobId if retried
-      logger.warn('Failed to update outbox status after BullMQ dispatch', {
-        outboxId,
-        jobId: createdJob.id,
-        error: err instanceof Error ? err.message : String(err),
-      });
     }
 
     await eventService.record({
@@ -695,7 +733,7 @@ export class JobService {
             id: jobId,
             queue: { organisationId: orgId },
           },
-          select: { id: true, status: true, firstStartedAt: true },
+          select: { id: true, status: true, firstStartedAt: true, attemptsMade: true },
         });
 
         if (!existing) {
@@ -721,6 +759,7 @@ export class JobService {
 
         const now = new Date();
         const leaseExpiresAt = new Date(now.getTime() + leaseDurationMs);
+        const effectiveAttemptsMade = Math.max(1, attemptNumber, existing.attemptsMade + 1);
         const claimed = await tx.job.updateMany({
           where: {
             id: existing.id,
@@ -729,11 +768,14 @@ export class JobService {
           },
           data: {
             status: JobStatus.ACTIVE,
+            dispatchState: JobDispatchState.DISPATCHED,
+            dispatchClaimedAt: null,
+            dispatchClaimedBy: null,
             ...(existing.firstStartedAt ? {} : { firstStartedAt: now }),
             startedAt: now,
             leaseExpiresAt,
             fencingToken: { increment: 1 },
-            attemptsMade: Math.max(1, attemptNumber),
+            attemptsMade: effectiveAttemptsMade,
             ...(workerId ? { lastWorkerId: workerId } : {}),
           },
         });
@@ -776,10 +818,16 @@ export class JobService {
                 ? {}
                 : { startedAt: updated.startedAt ?? new Date() }),
               finalJobStatus: JobStatus.ACTIVE,
-              retryCount: Math.max(0, attemptNumber - 1),
+              retryCount: Math.max(0, effectiveAttemptsMade - 1),
             },
           });
         }
+
+        // Synchronize outbox if a scheduler crashed after BullMQ enqueue but before markDispatched
+        await tx.jobDispatchOutbox.updateMany({
+          where: { jobId: existing.id, status: OutboxStatus.PENDING },
+          data: { status: OutboxStatus.DISPATCHED, dispatchedAt: now, lastError: null },
+        });
 
         return {
           outcome: 'activated' as const,
@@ -964,6 +1012,12 @@ export class JobService {
       failureSignature?: string;
       consecutiveSameFailures?: number;
       enforceRetryBudget?: boolean;
+      /**
+       * When provided (for custom-scheduled queues), re-queues the retried job into PostgreSQL
+       * (`dispatchState = QUEUED`, `readyAt = now + customRetryDelayMs`) and resets its outbox to
+       * `PENDING` so the retry re-enters `PrioritySchedulerService` instead of BullMQ's internal retry.
+       */
+      customRetryDelayMs?: number;
     },
   ): Promise<WorkerSyncOutcome> {
     if (!uuidSchema.safeParse(jobId).success) {
@@ -981,9 +1035,10 @@ export class JobService {
             id: true,
             queueId: true,
             name: true,
+            priority: true,
             status: true,
             fencingToken: true,
-            queue: { select: { name: true } },
+            queue: { select: { name: true, agingRatePerSec: true } },
           },
         });
 
@@ -1017,6 +1072,15 @@ export class JobService {
           }
         }
 
+        const isCustomRetry = options?.customRetryDelayMs !== undefined;
+        const retryReadyAt = isCustomRetry
+          ? new Date(Date.now() + Math.max(0, options.customRetryDelayMs!))
+          : undefined;
+        const retryVirtualRankAt =
+          isCustomRetry && retryReadyAt
+            ? computeVirtualRankAt(retryReadyAt, existing.priority, existing.queue.agingRatePerSec)
+            : undefined;
+
         const updatedCount = await tx.job.updateMany({
           where: {
             id: jobId,
@@ -1029,6 +1093,15 @@ export class JobService {
             errorMessage: sanitizedError,
             leaseExpiresAt: null,
             attemptsMade: Math.max(1, attemptNumber),
+            ...(isCustomRetry
+              ? {
+                  dispatchState: JobDispatchState.QUEUED,
+                  dispatchClaimedAt: null,
+                  dispatchClaimedBy: null,
+                  readyAt: retryReadyAt,
+                  virtualRankAt: retryVirtualRankAt,
+                }
+              : {}),
             ...(options?.workerId ? { lastWorkerId: options.workerId } : {}),
             ...(options?.failureSignature !== undefined
               ? { failureSignature: options.failureSignature }
@@ -1069,6 +1142,24 @@ export class JobService {
             retryCount: Math.max(1, attemptNumber),
           },
         });
+
+        if (isCustomRetry && retryReadyAt) {
+          await tx.jobDispatchOutbox.upsert({
+            where: { jobId: job.id },
+            create: {
+              jobId: job.id,
+              queueId: job.queueId,
+              organisationId: orgId,
+              status: OutboxStatus.PENDING,
+              nextAttemptAt: retryReadyAt,
+            },
+            update: {
+              status: OutboxStatus.PENDING,
+              nextAttemptAt: retryReadyAt,
+              lastError: null,
+            },
+          });
+        }
 
         // Persist JOB_RETRIED inside the same transaction so concurrent retry-budget checks
         // serialized on the advisory lock immediately observe this consumed retry.

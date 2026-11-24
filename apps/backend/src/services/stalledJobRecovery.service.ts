@@ -1,9 +1,10 @@
-import { JobStatus, OutboxStatus, PlatformEventType } from '@prisma/client';
+import { JobDispatchState, JobStatus, OutboxStatus, PlatformEventType } from '@prisma/client';
 import { prisma as db } from '../config/database.js';
 import { logger } from '../utils/logger.js';
 import { bullMQService, type BullMQService } from './bullmq.service.js';
 import { deadLetterService } from './dlq.service.js';
 import { eventService } from './event.service.js';
+import { isCustomSchedulingPolicy, prioritySchedulerService } from './priorityScheduler.service.js';
 
 export interface StalledRecoveryOptions {
   bullMQ?: BullMQService;
@@ -193,6 +194,7 @@ export class StalledJobRecoveryService {
         // Atomic recovery claim: fails cleanly (count=0) if another sweeper already
         // recovered it or if the job transitioned to COMPLETED/FAILED in the meantime.
         const nextStatus = job.queue.isPaused ? JobStatus.PAUSED : JobStatus.PENDING;
+        const isCustomPolicy = isCustomSchedulingPolicy(job.queue.schedulingPolicy);
         const recovered = await db.$transaction(
           async (tx) => {
             const claim = await tx.job.updateMany({
@@ -205,6 +207,13 @@ export class StalledJobRecoveryService {
               },
               data: {
                 status: nextStatus,
+                ...(isCustomPolicy
+                  ? {
+                      dispatchState: JobDispatchState.QUEUED,
+                      dispatchClaimedAt: null,
+                      dispatchClaimedBy: null,
+                    }
+                  : {}),
                 stalledCount: { increment: 1 },
                 fencingToken: { increment: 1 },
                 leaseExpiresAt: null,
@@ -247,21 +256,30 @@ export class StalledJobRecoveryService {
         }
 
         // If BullMQ still has a stale/failed entry for this jobId, remove it before re-enqueueing
-        if (bullState === 'failed' || bullState === 'active') {
+        if (bullState === 'failed' || bullState === 'active' || bullState === 'completed') {
           await this.bullMQ.removeJobFromBullMQ(job.queue, job.id);
         }
 
-        const dispatch = await this.bullMQ.enqueueJob(job.queue, job);
-        if (dispatch.enqueued) {
-          await db.jobDispatchOutbox.updateMany({
-            where: { jobId: job.id, status: OutboxStatus.PENDING },
-            data: {
-              status: OutboxStatus.DISPATCHED,
-              dispatchedAt: new Date(),
-              attempts: { increment: 1 },
-              lastError: null,
-            },
-          });
+        let reEnqueued = false;
+        if (isCustomPolicy) {
+          // Custom-policy jobs re-enter PrioritySchedulerService (readyAt preserved)
+          if (!job.queue.isPaused) {
+            prioritySchedulerService.nudgeQueue(job.queueId);
+          }
+        } else {
+          const dispatch = await this.bullMQ.enqueueJob(job.queue, job);
+          reEnqueued = dispatch.enqueued;
+          if (dispatch.enqueued) {
+            await db.jobDispatchOutbox.updateMany({
+              where: { jobId: job.id, status: OutboxStatus.PENDING },
+              data: {
+                status: OutboxStatus.DISPATCHED,
+                dispatchedAt: new Date(),
+                attempts: { increment: 1 },
+                lastError: null,
+              },
+            });
+          }
         }
 
         logger.warn('Stalled job detected and recovered', {
@@ -273,7 +291,7 @@ export class StalledJobRecoveryService {
           newFencingToken: job.fencingToken + 1,
           isLeaseExpired,
           previousBullState: bullState,
-          reEnqueued: dispatch.enqueued,
+          reEnqueued,
         });
 
         if (isLeaseExpired) {
@@ -316,7 +334,7 @@ export class StalledJobRecoveryService {
           metadata: {
             stalledCount: job.stalledCount + 1,
             nextStatus,
-            reEnqueued: dispatch.enqueued,
+            reEnqueued,
           },
         });
 

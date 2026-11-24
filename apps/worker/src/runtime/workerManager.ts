@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import os from 'node:os';
 import { Worker, UnrecoverableError, type ConnectionOptions, type Job as BullJob } from 'bullmq';
-import { PlatformEventType } from '@prisma/client';
+import { PlatformEventType, type SchedulingPolicy } from '@prisma/client';
 import {
   buildBullMQQueueName,
   buildBullMQRedisOptions,
@@ -9,8 +9,10 @@ import {
   DEFAULT_JOB_LEASE_MS,
   env,
   eventService,
+  isCustomSchedulingPolicy,
   jobService,
   logger,
+  prioritySchedulerService,
   sanitizeRedisUrl,
   workerHealthService,
   type BullMQJobPayload,
@@ -32,6 +34,7 @@ export interface RegisteredWorkerEntry {
   logicalName: string;
   concurrency: number;
   poisonFailureThreshold: number;
+  schedulingPolicy?: SchedulingPolicy;
   worker: Worker<BullMQJobPayload, ProcessorResult | null>;
 }
 
@@ -142,6 +145,12 @@ export class WorkerManager {
       ) {
         existing.poisonFailureThreshold = persistedQueue.poisonFailureThreshold;
       }
+      if (
+        persistedQueue.schedulingPolicy !== undefined &&
+        existing.schedulingPolicy !== persistedQueue.schedulingPolicy
+      ) {
+        existing.schedulingPolicy = persistedQueue.schedulingPolicy;
+      }
       return existing;
     }
 
@@ -206,6 +215,7 @@ export class WorkerManager {
       logicalName: persistedQueue.name,
       concurrency: persistedQueue.concurrency,
       poisonFailureThreshold: persistedQueue.poisonFailureThreshold ?? 3,
+      schedulingPolicy: persistedQueue.schedulingPolicy,
       worker,
     };
 
@@ -233,8 +243,14 @@ export class WorkerManager {
     const jobData = bullJob.data;
     const jobId = jobData?.jobId ?? bullJob.id;
     const organisationId = jobData?.organisationId ?? persistedQueue.organisationId;
-    const attemptNumber = bullJob.attemptsMade + 1;
-    const maxAttempts = bullJob.opts?.attempts ?? 1;
+    const bullmqQueueName = buildBullMQQueueName(
+      persistedQueue.organisationId,
+      persistedQueue.name,
+    );
+    const activePolicy =
+      this.workers.get(bullmqQueueName)?.schedulingPolicy ?? persistedQueue.schedulingPolicy;
+    const isCustomPolicy = isCustomSchedulingPolicy(activePolicy);
+    const initialAttemptHint = bullJob.attemptsMade + 1;
 
     if (!jobId) {
       logger.warn('Received BullMQ job without stable jobId; skipping', {
@@ -259,7 +275,7 @@ export class WorkerManager {
     const activation = await this.jobs.markJobActive(
       organisationId,
       jobId,
-      attemptNumber,
+      initialAttemptHint,
       this.workerInstanceId,
       { leaseDurationMs: this.leaseDurationMs },
     );
@@ -293,6 +309,10 @@ export class WorkerManager {
       return null;
     }
 
+    const attemptNumber = isCustomPolicy ? activation.job.attemptsMade : initialAttemptHint;
+    const maxAttempts = isCustomPolicy
+      ? Math.max(1, activation.job.maxRetries + 1)
+      : (bullJob.opts?.attempts ?? 1);
     const fencingToken = activation.fencingToken;
 
     logger.info('Job processing started', {
@@ -442,6 +462,12 @@ export class WorkerManager {
       });
 
       if (hasRemainingAttempts && !poison.isPoison) {
+        const customRetryDelayMs = isCustomPolicy
+          ? activation.job.backoffMs > 0
+            ? activation.job.backoffMs * Math.pow(2, Math.max(0, attemptNumber - 1))
+            : 0
+          : undefined;
+
         // Atomic rolling-window retry-budget evaluation + ACTIVE -> DELAYED + JOB_RETRIED commit
         const retrySync = await this.jobs.markJobRetryScheduled(
           organisationId,
@@ -454,6 +480,7 @@ export class WorkerManager {
             failureSignature: poison.failureSignature,
             consecutiveSameFailures: poison.consecutiveSameFailures,
             enforceRetryBudget: true,
+            ...(customRetryDelayMs !== undefined ? { customRetryDelayMs } : {}),
           },
         );
 
@@ -508,17 +535,28 @@ export class WorkerManager {
           throw new UnrecoverableError(budgetFailMessage);
         }
 
-        logger.warn('Job attempt failed; BullMQ retry scheduled', {
-          workerInstanceId: this.workerInstanceId,
-          jobId,
-          organisationId,
-          queueId: persistedQueue.id,
-          jobName: activation.job.name,
-          attemptNumber,
-          maxAttempts,
-          fencingToken,
-          error: errorMessage,
-        });
+        logger.warn(
+          isCustomPolicy
+            ? 'Job attempt failed; custom-scheduler retry queued in PostgreSQL'
+            : 'Job attempt failed; BullMQ retry scheduled',
+          {
+            workerInstanceId: this.workerInstanceId,
+            jobId,
+            organisationId,
+            queueId: persistedQueue.id,
+            jobName: activation.job.name,
+            attemptNumber,
+            maxAttempts,
+            fencingToken,
+            error: errorMessage,
+          },
+        );
+
+        // For custom-policy queues, PostgreSQL holds DELAYED + QUEUED for PrioritySchedulerService;
+        // return null so BullMQ does not bypass the scheduler with its own internal retry timer.
+        if (isCustomPolicy) {
+          return null;
+        }
 
         throw err;
       }
@@ -577,6 +615,9 @@ export class WorkerManager {
       throw err;
     } finally {
       clearInterval(leaseTimer);
+      if (isCustomPolicy) {
+        prioritySchedulerService.nudgeQueue(persistedQueue.id);
+      }
     }
   }
 

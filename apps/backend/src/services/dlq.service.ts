@@ -4,9 +4,14 @@ import { ConflictError, NotFoundError, TooManyRequestsError } from '../utils/err
 import { logger } from '../utils/logger.js';
 import { resolveInitialJobStatus } from '../utils/jobLifecycle.js';
 import { uuidSchema } from '../validators/organisation.validator.js';
-import { bullMQService, type EnqueueResult } from './bullmq.service.js';
+import { buildBullMQQueueName, bullMQService, type EnqueueResult } from './bullmq.service.js';
 import { eventService } from './event.service.js';
 import { governanceService, type AdmissionRejectionDetails } from './governance.service.js';
+import {
+  buildInitialSchedulingFields,
+  isCustomSchedulingPolicy,
+  prioritySchedulerService,
+} from './priorityScheduler.service.js';
 
 export interface DeadLetterJobView {
   id: string;
@@ -322,17 +327,23 @@ export class DeadLetterService {
             initialStatus,
           });
 
+          const effectivePriority = overrides?.priority ?? dlq.originalJob.priority;
+          const schedFields = buildInitialSchedulingFields(dlq.queue, effectivePriority, 0);
+
           // Create a fresh Job preserving link to the DLQ record and original failure history
           const createdJob = await tx.job.create({
             data: {
               queueId: dlq.queue.id,
               name: dlq.originalJob.name,
               status: initialStatus,
-              priority: overrides?.priority ?? dlq.originalJob.priority,
+              priority: effectivePriority,
               payload: replayPayload,
               maxRetries: overrides?.maxRetries ?? dlq.originalJob.maxRetries,
               backoffMs: overrides?.backoffMs ?? dlq.originalJob.backoffMs,
               delayMs: 0,
+              dispatchState: schedFields.dispatchState,
+              readyAt: schedFields.readyAt,
+              virtualRankAt: schedFields.virtualRankAt,
               replayedFromDlqId: dlq.id,
               createdById: actorUserId,
             },
@@ -403,36 +414,53 @@ export class DeadLetterService {
 
     const { updatedDlq, newJob, persistedQueue, outboxId } = txRes;
 
-    // Dispatch replayed job to BullMQ with stable jobId = newJob.id
-    const dispatch = await bullMQService.enqueueJob(persistedQueue, newJob);
+    const isCustomPolicy = isCustomSchedulingPolicy(persistedQueue.schedulingPolicy);
+    let dispatch: EnqueueResult;
 
-    try {
-      if (dispatch.enqueued) {
-        await db.jobDispatchOutbox.updateMany({
-          where: { id: outboxId, status: OutboxStatus.PENDING },
-          data: {
-            status: OutboxStatus.DISPATCHED,
-            dispatchedAt: new Date(),
-            attempts: { increment: 1 },
-            lastError: null,
-          },
-        });
-      } else {
-        await db.jobDispatchOutbox.updateMany({
-          where: { id: outboxId, status: OutboxStatus.PENDING },
-          data: {
-            attempts: { increment: 1 },
-            lastError: (dispatch.error ?? 'Redis unavailable').slice(0, 1000),
-            nextAttemptAt: new Date(Date.now() + 2000),
-          },
+    if (isCustomPolicy) {
+      // Custom-policy queues enter PostgreSQL QUEUED backlog for PrioritySchedulerService
+      dispatch = {
+        broker: 'bullmq',
+        enqueued: false,
+        deduplicated: false,
+        bullmqQueueName: buildBullMQQueueName(orgId, persistedQueue.name),
+        bullmqJobId: null,
+      };
+      if (!persistedQueue.isPaused) {
+        prioritySchedulerService.nudgeQueue(persistedQueue.id);
+      }
+    } else {
+      // LEGACY_BULLMQ: dispatch replayed job to BullMQ with stable jobId = newJob.id
+      dispatch = await bullMQService.enqueueJob(persistedQueue, newJob);
+
+      try {
+        if (dispatch.enqueued) {
+          await db.jobDispatchOutbox.updateMany({
+            where: { id: outboxId, status: OutboxStatus.PENDING },
+            data: {
+              status: OutboxStatus.DISPATCHED,
+              dispatchedAt: new Date(),
+              attempts: { increment: 1 },
+              lastError: null,
+            },
+          });
+        } else {
+          await db.jobDispatchOutbox.updateMany({
+            where: { id: outboxId, status: OutboxStatus.PENDING },
+            data: {
+              attempts: { increment: 1 },
+              lastError: (dispatch.error ?? 'Redis unavailable').slice(0, 1000),
+              nextAttemptAt: new Date(Date.now() + 2000),
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn('Failed to update outbox status after DLQ replay dispatch', {
+          dlqId,
+          replayedJobId: newJob.id,
+          error: err instanceof Error ? err.message : String(err),
         });
       }
-    } catch (err) {
-      logger.warn('Failed to update outbox status after DLQ replay dispatch', {
-        dlqId,
-        replayedJobId: newJob.id,
-        error: err instanceof Error ? err.message : String(err),
-      });
     }
 
     logger.info('Dead-letter job replayed', {

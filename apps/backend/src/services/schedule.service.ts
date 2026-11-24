@@ -36,9 +36,13 @@ import {
   type ListSchedulesQuery,
   type UpdateScheduleInput,
 } from '../validators/schedule.validator.js';
-import { bullMQService, type EnqueueResult } from './bullmq.service.js';
+import { buildBullMQQueueName, bullMQService, type EnqueueResult } from './bullmq.service.js';
 import { eventService } from './event.service.js';
 import { governanceService, type AdmissionRejectionDetails } from './governance.service.js';
+import {
+  buildInitialSchedulingFields,
+  isCustomSchedulingPolicy,
+} from './priorityScheduler.service.js';
 import {
   scheduleDispatcherService,
   type ScheduleBullMQReconcileSummary,
@@ -398,16 +402,22 @@ export class ScheduleService {
               include: SCHEDULE_INCLUDE,
             });
 
+            const effectivePriority = input.priority ?? queue.defaultPriority;
+            const schedFields = buildInitialSchedulingFields(queue, effectivePriority, 0, runAtUtc);
+
             const job = await tx.job.create({
               data: {
                 queueId: queue.id,
                 name: input.jobName,
                 status: initialJobStatus,
-                priority: input.priority ?? queue.defaultPriority,
+                priority: effectivePriority,
                 payload: payload as Prisma.InputJsonValue,
                 maxRetries: input.maxRetries ?? queue.maxRetries,
                 backoffMs: input.backoffMs ?? queue.backoffMs,
                 delayMs,
+                dispatchState: schedFields.dispatchState,
+                readyAt: schedFields.readyAt,
+                virtualRankAt: schedFields.virtualRankAt,
                 createdById: userId,
               },
             });
@@ -443,34 +453,46 @@ export class ScheduleService {
           { maxWait: 10_000, timeout: 10_000 },
         );
 
-        const dispatch = await bullMQService.enqueueJob(queue, createdJob);
+        let dispatch: EnqueueResult;
+        if (isCustomSchedulingPolicy(queue.schedulingPolicy)) {
+          // Custom-policy scheduled jobs remain DELAYED + QUEUED until readyAt <= now
+          dispatch = {
+            broker: 'bullmq',
+            enqueued: false,
+            deduplicated: false,
+            bullmqQueueName: buildBullMQQueueName(orgId, queue.name),
+            bullmqJobId: null,
+          };
+        } else {
+          dispatch = await bullMQService.enqueueJob(queue, createdJob);
 
-        if (dispatch.enqueued) {
-          const dispatchedAt = new Date();
-          await Promise.all([
-            db.jobDispatchOutbox.updateMany({
+          if (dispatch.enqueued) {
+            const dispatchedAt = new Date();
+            await Promise.all([
+              db.jobDispatchOutbox.updateMany({
+                where: { id: outboxId, status: OutboxStatus.PENDING },
+                data: {
+                  status: OutboxStatus.DISPATCHED,
+                  dispatchedAt,
+                  attempts: { increment: 1 },
+                  lastError: null,
+                },
+              }),
+              db.scheduleExecution.updateMany({
+                where: { id: executionId, dispatchedAt: null },
+                data: { dispatchedAt },
+              }),
+            ]);
+          } else {
+            await db.jobDispatchOutbox.updateMany({
               where: { id: outboxId, status: OutboxStatus.PENDING },
               data: {
-                status: OutboxStatus.DISPATCHED,
-                dispatchedAt,
                 attempts: { increment: 1 },
-                lastError: null,
+                lastError: (dispatch.error ?? 'Redis unavailable').slice(0, 1000),
+                nextAttemptAt: new Date(Date.now() + 2000),
               },
-            }),
-            db.scheduleExecution.updateMany({
-              where: { id: executionId, dispatchedAt: null },
-              data: { dispatchedAt },
-            }),
-          ]);
-        } else {
-          await db.jobDispatchOutbox.updateMany({
-            where: { id: outboxId, status: OutboxStatus.PENDING },
-            data: {
-              attempts: { increment: 1 },
-              lastError: (dispatch.error ?? 'Redis unavailable').slice(0, 1000),
-              nextAttemptAt: new Date(Date.now() + 2000),
-            },
-          });
+            });
+          }
         }
 
         await eventService.record({

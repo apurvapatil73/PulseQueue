@@ -9,6 +9,7 @@ import {
   eventRetentionService,
   logger,
   outboxReconciler,
+  prioritySchedulerService,
   prisma,
   realtimeEventBus,
   scheduleDispatcherService,
@@ -24,6 +25,7 @@ export interface WorkerRuntimeOptions {
   heartbeatIntervalMs?: number;
   stalledRecoveryIntervalMs?: number;
   alertEvalIntervalMs?: number;
+  schedulerIntervalMs?: number;
   workerManager?: WorkerManager;
 }
 
@@ -40,6 +42,7 @@ export class WorkerRuntime {
   private readonly heartbeatIntervalMs: number;
   private readonly stalledRecoveryIntervalMs: number;
   private readonly alertEvalIntervalMs: number;
+  private readonly schedulerIntervalMs: number;
   private syncTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private syncInFlight = false;
@@ -55,6 +58,7 @@ export class WorkerRuntime {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 5_000;
     this.stalledRecoveryIntervalMs = options.stalledRecoveryIntervalMs ?? 15_000;
     this.alertEvalIntervalMs = options.alertEvalIntervalMs ?? 30_000;
+    this.schedulerIntervalMs = options.schedulerIntervalMs ?? 250;
   }
 
   getWorkerManager(): WorkerManager {
@@ -161,6 +165,8 @@ export class WorkerRuntime {
           maxRetries: true,
           backoffMs: true,
           poisonFailureThreshold: true,
+          schedulingPolicy: true,
+          agingRatePerSec: true,
         },
       });
 
@@ -208,11 +214,16 @@ export class WorkerRuntime {
       organisationIds: this.manager.listRegisteredOrganisationIds(),
     });
 
-    // Run one immediate outbox + BullMQ schedule reconcile + schedule tick and start intervals
+    // Run one immediate outbox + BullMQ schedule reconcile + schedule tick + custom scheduler tick
     await outboxReconciler.reconcileOnce();
     await scheduleDispatcherService.reconcileWithBullMQ();
     await scheduleDispatcherService.tick();
+    await prioritySchedulerService.tickAllQueues({ claimerId: identity.workerInstanceId });
     outboxReconciler.start(this.outboxIntervalMs);
+    prioritySchedulerService.start({
+      intervalMs: this.schedulerIntervalMs,
+      claimerId: identity.workerInstanceId,
+    });
     stalledJobRecoveryService.start(this.stalledRecoveryIntervalMs);
     scheduleDispatcherService.start(1000, 30_000);
     workerHealthService.startStaleSweep(15_000);
@@ -260,6 +271,7 @@ export class WorkerRuntime {
       this.heartbeatTimer = null;
     }
 
+    prioritySchedulerService.stop();
     outboxReconciler.stop();
     stalledJobRecoveryService.stop();
     scheduleDispatcherService.stop();
