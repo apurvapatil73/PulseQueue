@@ -1,6 +1,7 @@
 import express, { Express } from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
+import { env } from './config/env.js';
 import { requestLogger } from './middleware/requestLogger.middleware.js';
 import { notFoundHandler } from './middleware/notFound.middleware.js';
 import { errorHandler } from './middleware/error.middleware.js';
@@ -10,13 +11,32 @@ export function createApp(): Express {
   const app = express();
 
   // Security headers
-  app.use(helmet());
+  app.use(
+    helmet({
+      referrerPolicy: { policy: 'no-referrer' },
+      crossOriginResourcePolicy: { policy: 'same-site' },
+    }),
+  );
 
-  // Cross-Origin Resource Sharing (reflect origin + allow credentials for HttpOnly refresh cookie)
+  // Strict CORS allowlist with credentials (never reflects arbitrary third-party origins)
+  const allowedOrigins = new Set(env.CORS_ALLOWED_ORIGINS);
   app.use(
     cors({
-      origin: true,
+      origin: (origin, callback) => {
+        // Allow same-origin / non-browser requests without an Origin header
+        if (!origin) {
+          callback(null, true);
+          return;
+        }
+        if (allowedOrigins.has(origin)) {
+          callback(null, true);
+          return;
+        }
+        callback(null, false);
+      },
       credentials: true,
+      methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Authorization', 'Content-Type', 'Idempotency-Key', 'Last-Event-ID'],
     }),
   );
 

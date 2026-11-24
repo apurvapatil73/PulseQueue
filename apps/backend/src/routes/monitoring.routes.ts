@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { Role } from '@prisma/client';
 import { authenticate } from '../middleware/auth.middleware.js';
 import { requireOrgRole } from '../middleware/rbac.middleware.js';
+import { writeRateLimiter } from '../middleware/rateLimit.middleware.js';
 import {
   listDlqJobs,
   getDlqJob,
@@ -23,7 +24,13 @@ export const dlqRoutes = Router({ mergeParams: true });
 
 dlqRoutes.get('/', authenticate, requireOrgRole(Role.MEMBER), listDlqJobs);
 dlqRoutes.get('/:dlqId', authenticate, requireOrgRole(Role.MEMBER), getDlqJob);
-dlqRoutes.post('/:dlqId/replay', authenticate, requireOrgRole(Role.ADMIN), replayDlqJob);
+dlqRoutes.post(
+  '/:dlqId/replay',
+  authenticate,
+  requireOrgRole(Role.ADMIN),
+  writeRateLimiter,
+  replayDlqJob,
+);
 
 /**
  * Organisation-scoped Monitoring, Worker Health, Metrics & Events routes:

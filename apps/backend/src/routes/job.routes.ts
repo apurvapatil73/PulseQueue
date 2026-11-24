@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { Role } from '@prisma/client';
 import { authenticate } from '../middleware/auth.middleware.js';
 import { requireOrgRole } from '../middleware/rbac.middleware.js';
+import { writeRateLimiter } from '../middleware/rateLimit.middleware.js';
 import { createJob, listQueueJobs, getJob, cancelJob } from '../controllers/job.controller.js';
 
 /**
@@ -10,7 +11,7 @@ import { createJob, listQueueJobs, getJob, cancelJob } from '../controllers/job.
  */
 export const queueJobRoutes = Router({ mergeParams: true });
 
-queueJobRoutes.post('/', authenticate, requireOrgRole(Role.MEMBER), createJob);
+queueJobRoutes.post('/', authenticate, requireOrgRole(Role.MEMBER), writeRateLimiter, createJob);
 queueJobRoutes.get('/', authenticate, requireOrgRole(Role.MEMBER), listQueueJobs);
 queueJobRoutes.get('/:jobId', authenticate, requireOrgRole(Role.MEMBER), getJob);
 queueJobRoutes.post('/:jobId/cancel', authenticate, requireOrgRole(Role.ADMIN), cancelJob);

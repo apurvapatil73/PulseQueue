@@ -15,17 +15,30 @@ const SENSITIVE_KEYS = new Set([
   'password',
   'passwordhash',
   'token',
+  'accesstoken',
+  'refreshtoken',
   'jwt',
+  'jwt_secret',
   'secret',
   'authorization',
   'cookie',
+  'set-cookie',
   'apikey',
+  'x-api-key',
   'database_url',
+  'redis_url',
 ]);
+
+const SENSITIVE_QUERY_PATTERN =
+  /([?&](?:token|access_token|refresh_token|secret|password|apikey|api_key)=)[^&\s]*/gi;
+
+function sanitizeString(value: string): string {
+  return value.replace(SENSITIVE_QUERY_PATTERN, '$1[REDACTED]');
+}
 
 function sanitize(obj: unknown): unknown {
   if (obj === null || obj === undefined) return obj;
-  if (typeof obj === 'string') return obj;
+  if (typeof obj === 'string') return sanitizeString(obj);
   if (typeof obj !== 'object') return obj;
 
   if (Array.isArray(obj)) {

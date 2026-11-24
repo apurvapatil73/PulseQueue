@@ -28,6 +28,9 @@ export interface LoginResult extends AuthTokens {
   user: SafeUser;
 }
 
+// Precomputed bcrypt(12) hash used to equalize login response time when an email does not exist
+const DUMMY_PASSWORD_HASH = '$2a$12$C6UzMDM.H6dfI/f/IKcEeO7H4iA4xG4uV7q2bS1tT8k8pE0n3L6eW';
+
 export class AuthService {
   /**
    * Registers a new user account with hashed credentials.
@@ -76,13 +79,10 @@ export class AuthService {
       where: { email: normalizedEmail },
     });
 
-    // Constant-time comparison prevention of user enumeration
-    if (!user) {
-      throw new UnauthorizedError('Invalid email or password');
-    }
-
-    const isPasswordValid = await comparePassword(input.password, user.passwordHash);
-    if (!isPasswordValid) {
+    // Constant-time password check even when user does not exist to prevent timing enumeration
+    const hashToCompare = user ? user.passwordHash : DUMMY_PASSWORD_HASH;
+    const isPasswordValid = await comparePassword(input.password, hashToCompare);
+    if (!user || !isPasswordValid) {
       throw new UnauthorizedError('Invalid email or password');
     }
 
@@ -120,7 +120,7 @@ export class AuthService {
 
   /**
    * Rotates refresh token and issues new access token.
-   * Enforces single-use token rotation and detects reuse attacks.
+   * Enforces atomic single-use token rotation in PostgreSQL and detects concurrent/replayed reuse attacks.
    */
   async refreshToken(rawRefreshToken: string): Promise<AuthTokens> {
     const tokenHash = hashToken(rawRefreshToken);
@@ -134,7 +134,7 @@ export class AuthService {
       throw new UnauthorizedError('Invalid or expired refresh token');
     }
 
-    // Token reuse detection: if a revoked token is presented, invalidate all tokens for the user
+    // Token reuse detection: if an already-revoked token is presented, invalidate all sessions
     if (storedToken.isRevoked) {
       logger.warn('Revoked refresh token reuse attempted. Revoking all sessions for user.', {
         userId: storedToken.userId,
@@ -153,28 +153,45 @@ export class AuthService {
       throw new UnauthorizedError('Invalid or expired refresh token');
     }
 
-    // Revoke the old token (one-time use)
-    await prisma.refreshToken.update({
-      where: { id: storedToken.id },
-      data: { isRevoked: true },
-    });
-
-    // Generate new access token
+    // Generate replacement tokens before atomic DB swap
     const newAccessToken = signAccessToken(storedToken.user.id, storedToken.user.email);
-
-    // Generate and store new refresh token (token rotation)
     const newRawRefreshToken = generateSecureToken(32);
     const newTokenHash = hashToken(newRawRefreshToken);
     const newExpiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
 
-    await prisma.refreshToken.create({
-      data: {
-        tokenHash: newTokenHash,
-        userId: storedToken.user.id,
-        expiresAt: newExpiresAt,
-        isRevoked: false,
-      },
+    // Atomically revoke the old token only if still unrevoked (eliminates concurrent rotation race)
+    const rotated = await prisma.$transaction(async (tx) => {
+      const revoked = await tx.refreshToken.updateMany({
+        where: { id: storedToken.id, isRevoked: false },
+        data: { isRevoked: true },
+      });
+
+      if (revoked.count !== 1) {
+        // Concurrent reuse race detected: revoke all sessions for this user
+        await tx.refreshToken.updateMany({
+          where: { userId: storedToken.userId },
+          data: { isRevoked: true },
+        });
+        return false;
+      }
+
+      await tx.refreshToken.create({
+        data: {
+          tokenHash: newTokenHash,
+          userId: storedToken.user.id,
+          expiresAt: newExpiresAt,
+          isRevoked: false,
+        },
+      });
+      return true;
     });
+
+    if (!rotated) {
+      logger.warn('Concurrent refresh token reuse detected. Revoking all sessions for user.', {
+        userId: storedToken.userId,
+      });
+      throw new UnauthorizedError('Revoked refresh token reuse detected. Please log in again.');
+    }
 
     return {
       accessToken: newAccessToken,

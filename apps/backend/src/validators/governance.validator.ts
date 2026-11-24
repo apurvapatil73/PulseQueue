@@ -20,6 +20,7 @@ export const updateOrgQuotasSchema = z
     drrBaseQuantum: z.number().min(1).max(1_000).optional(),
     drrMaxDeficit: z.number().min(100).max(10_000).optional(),
   })
+  .strict()
   .refine((obj) => Object.keys(obj).length > 0, {
     message: 'At least one quota, retry-budget, or fairness field must be provided',
   });

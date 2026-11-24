@@ -36,6 +36,7 @@ export * from './validators/alert.validator.js';
 export * from './validators/governance.validator.js';
 export * from './middleware/auth.middleware.js';
 export * from './middleware/rbac.middleware.js';
+export * from './middleware/rateLimit.middleware.js';
 export * from './utils/logger.js';
 export * from './utils/errors.js';
 export * from './utils/response.js';
