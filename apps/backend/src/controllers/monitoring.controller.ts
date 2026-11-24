@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { ZodError } from 'zod';
 import { deadLetterService } from '../services/dlq.service.js';
 import { metricsService } from '../services/metrics.service.js';
+import { schedulerObservabilityService } from '../services/schedulerObservability.service.js';
 import { workerHealthService } from '../services/workerHealth.service.js';
 import { eventService } from '../services/event.service.js';
 import { stalledJobRecoveryService } from '../services/stalledJobRecovery.service.js';
@@ -110,6 +111,24 @@ export async function getOrganisationMetricsTimeseries(
       query,
     );
     sendSuccess(res, { timeseries });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getOrganisationSchedulerMetrics(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    if (!req.membership) throw new UnauthorizedError();
+    const { windowMinutes } = parseInput(metricsQuerySchema, req.query);
+    const scheduler = await schedulerObservabilityService.getOrganisationSchedulerMetrics(
+      req.membership.organisationId,
+      windowMinutes,
+    );
+    sendSuccess(res, { scheduler });
   } catch (err) {
     next(err);
   }

@@ -8,6 +8,7 @@ import {
   replayDlqJob,
   getOrganisationMetrics,
   getOrganisationMetricsTimeseries,
+  getOrganisationSchedulerMetrics,
   listOrganisationWorkers,
   listOrganisationEvents,
   triggerStalledRecovery,
@@ -36,6 +37,12 @@ monitoringRoutes.get(
   authenticate,
   requireOrgRole(Role.MEMBER),
   getOrganisationMetricsTimeseries,
+);
+monitoringRoutes.get(
+  '/scheduler',
+  authenticate,
+  requireOrgRole(Role.MEMBER),
+  getOrganisationSchedulerMetrics,
 );
 monitoringRoutes.get(
   '/workers',

@@ -803,3 +803,85 @@ export interface PaginatedNotificationsView {
   unreadCount: number;
   pagination: PaginationMeta;
 }
+
+export type SchedulingPolicy = 'LEGACY_BULLMQ' | 'FIFO' | 'STRICT_PRIORITY' | 'PRIORITY_AGING';
+export type PriorityTier = 'critical' | 'high' | 'medium' | 'low';
+
+export interface PriorityTierWaitStats {
+  tier: PriorityTier;
+  sampleCount: number;
+  avgMs: number | null;
+  p50Ms: number | null;
+  p95Ms: number | null;
+  p99Ms: number | null;
+  maxMs: number | null;
+}
+
+export interface OrganisationSchedulerMetricsView {
+  organisationId: string;
+  windowMinutes: number;
+  generatedAt: string;
+  policyDistribution: Array<{
+    policy: SchedulingPolicy;
+    queueCount: number;
+    eligibleQueuedJobs: number;
+    delayedJobs: number;
+  }>;
+  backlog: {
+    eligibleQueued: number;
+    dispatching: number;
+    dispatchedPending: number;
+    delayed: number;
+    paused: number;
+    oldestEligibleAgeMs: number | null;
+    maxWaitingMs: number | null;
+    starvedEligibleCount: number;
+    staleReservationsActive: number;
+  };
+  backlogByPriority: {
+    byTier: Record<PriorityTier, number>;
+    byPriority: Array<{ priority: number; count: number }>;
+  };
+  waitTimeByPriorityTier: PriorityTierWaitStats[];
+  dispatchLatency: {
+    sampleCount: number;
+    avgMs: number | null;
+    p50Ms: number | null;
+    p95Ms: number | null;
+    p99Ms: number | null;
+  };
+  tenantCapacity: {
+    maxActiveJobs: number | null;
+    activeJobs: number;
+    dispatchedPendingJobs: number;
+    dispatchingJobs: number;
+    reservedTotal: number;
+    availableCapacity: number | null;
+    utilizationPercent: number | null;
+  };
+  workerCapacity: {
+    onlineWorkers: number;
+    configuredConcurrency: number;
+    activeJobs: number;
+    availableWorkerCapacity: number;
+    workerUtilizationPercent: number | null;
+    jobsPerSecond: number;
+    avgExecutionDurationMs: number | null;
+  };
+  schedulerHealth: {
+    status: 'healthy' | 'degraded' | 'idle';
+    isLoopRunning: boolean;
+    lastTickDurationMs: number | null;
+    staleReservationsActive: number;
+    processCounters: {
+      claimsTotal: number;
+      dispatchesTotal: number;
+      dispatchFailuresTotal: number;
+      dispatchRetriesTotal: number;
+      starvationPromotionsTotal: number;
+      priorityInversionsTotal: number;
+      reservationRecoveriesTotal: number;
+      tenantCapacityDenialsTotal: number;
+    };
+  };
+}

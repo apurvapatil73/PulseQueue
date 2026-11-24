@@ -52,6 +52,20 @@ export function useOrganisationTimeseries(
   });
 }
 
+export function useOrganisationSchedulerMetrics(
+  organisationId: string | null,
+  windowMinutes: number = 60,
+  options?: { refetchInterval?: number | false },
+) {
+  return useQuery({
+    queryKey: ['org-scheduler-metrics', organisationId, windowMinutes],
+    queryFn: () => monitoringApi.getSchedulerMetrics(organisationId!, windowMinutes),
+    enabled: Boolean(organisationId),
+    staleTime: 10_000,
+    refetchInterval: options?.refetchInterval ?? false,
+  });
+}
+
 export function useOrganisationWorkers(
   organisationId: string | null,
   options?: { refetchInterval?: number | false },

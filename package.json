@@ -23,6 +23,7 @@
     "dev:worker": "npm run --workspace=@pulsequeue/worker dev",
     "dev:frontend": "npm run --workspace=@pulsequeue/frontend dev",
     "build:frontend": "npm run --workspace=@pulsequeue/frontend build",
+    "benchmark:scheduler": "npx tsx apps/backend/scripts/runSchedulerBenchmark.ts",
     "prisma:generate": "npm run --workspace=@pulsequeue/backend prisma:generate",
     "prisma:migrate": "npm run --workspace=@pulsequeue/backend prisma:migrate",
     "prisma:studio": "npm run --workspace=@pulsequeue/backend prisma:studio",

@@ -1,6 +1,7 @@
 import type {
   ApiEnvelope,
   OrganisationMetricsView,
+  OrganisationSchedulerMetricsView,
   OrganisationTimeseriesView,
   OrgSafeWorkerView,
   PaginationMeta,
@@ -34,6 +35,18 @@ export const monitoringApi = {
       { params },
     );
     return unwrapApiData(data).timeseries;
+  },
+
+  async getSchedulerMetrics(
+    organisationId: string,
+    windowMinutes: number = 60,
+  ): Promise<OrganisationSchedulerMetricsView> {
+    const { data } = await apiClient.get<
+      ApiEnvelope<{ scheduler: OrganisationSchedulerMetricsView }>
+    >(`/api/v1/organisations/${organisationId}/monitoring/scheduler`, {
+      params: { windowMinutes },
+    });
+    return unwrapApiData(data).scheduler;
   },
 
   async listWorkers(organisationId: string): Promise<OrgSafeWorkerView[]> {

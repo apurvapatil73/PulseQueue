@@ -14,6 +14,7 @@ import {
   type EnqueueResult,
   type PersistedQueueDescriptor,
 } from './bullmq.service.js';
+import { schedulerMetricsRegistry } from './schedulerMetrics.service.js';
 
 /**
  * Advisory lock namespace for tenant-level active/dispatching reservation checks.
@@ -656,6 +657,7 @@ export class PrioritySchedulerService {
         });
         if (promoted.count > 0) {
           this.delayedPromotedTotal += promoted.count;
+          schedulerMetricsRegistry.recordDelayedPromoted(promoted.count);
         }
 
         let effectiveLimit = requestedLimit;
@@ -720,6 +722,7 @@ export class PrioritySchedulerService {
           const orgHeadroom = Math.max(0, queue.organisation.maxActiveJobs - orgReserved);
           if (orgHeadroom === 0) {
             this.orgCapacityDenialsTotal += 1;
+            schedulerMetricsRegistry.recordTenantCapacityDenial();
             logger.debug('Scheduler deferred claim: organisation maxActiveJobs reached', {
               policy: queue.schedulingPolicy,
               maxActiveJobs: queue.organisation.maxActiveJobs,
@@ -743,6 +746,7 @@ export class PrioritySchedulerService {
           starvationThresholdSec: queue.starvationThresholdSec,
         };
 
+        const claimStartedAt = Date.now();
         const claimedRows = await this.claimOrderedRowsInTransaction(
           tx,
           queue.id,
@@ -751,6 +755,7 @@ export class PrioritySchedulerService {
           now,
           params.claimerId,
         );
+        const claimLatencyMs = Math.max(0, Date.now() - claimStartedAt);
 
         const claimed: ClaimedScheduledJob[] = claimedRows.map((row) => ({
           id: row.id,
@@ -777,6 +782,16 @@ export class PrioritySchedulerService {
             now,
           ),
         }));
+
+        schedulerMetricsRegistry.recordClaim(
+          queue.schedulingPolicy,
+          claimed.length,
+          claimLatencyMs,
+        );
+        const starvedPromotions = claimed.filter((c) => c.evaluation.isStarvationPromoted).length;
+        if (starvedPromotions > 0) {
+          schedulerMetricsRegistry.recordStarvationPromotions(starvedPromotions);
+        }
 
         return {
           queueId: queue.id,
@@ -1106,6 +1121,7 @@ export class PrioritySchedulerService {
     });
     if (res.count > 0) {
       this.staleRecoveriesTotal += res.count;
+      schedulerMetricsRegistry.recordReservationRecovery(res.count);
       logger.warn('Recovered stale scheduler DISPATCHING reservations', {
         recoveredCount: res.count,
         staleAfterMs,
@@ -1151,13 +1167,16 @@ export class PrioritySchedulerService {
           const latencyMs = Math.max(0, nowMs - job.readyAt.getTime());
           this.dispatchLatencySumMs += latencyMs;
           this.dispatchLatencyCount += 1;
+          schedulerMetricsRegistry.recordDispatchSuccess(claimResult.policy, latencyMs);
         } else {
           failedIds.push(job.id);
           this.dispatchFailuresTotal += 1;
+          schedulerMetricsRegistry.recordDispatchFailure(claimResult.policy);
         }
       } catch (err) {
         failedIds.push(job.id);
         this.dispatchFailuresTotal += 1;
+        schedulerMetricsRegistry.recordDispatchFailure(claimResult.policy);
         logger.warn('Custom scheduler failed to dispatch claimed job to transport', {
           policy: claimResult.policy,
           jobId: job.id,
@@ -1287,6 +1306,7 @@ export class PrioritySchedulerService {
       summary.delayedPromoted = this.delayedPromotedTotal - promotedBefore;
       summary.durationMs = Date.now() - startedAt;
       this.lastTickDurationMs = summary.durationMs;
+      schedulerMetricsRegistry.recordTickDuration(summary.durationMs);
 
       if (summary.dispatched > 0 || summary.released > 0 || summary.staleRecovered > 0) {
         logger.debug('Priority scheduler tick completed', {
@@ -1355,6 +1375,7 @@ export class PrioritySchedulerService {
       });
     }, this.activeIntervalMs);
     this.timer.unref();
+    schedulerMetricsRegistry.setLoopRunning(true);
 
     logger.info('Priority scheduler loop started', {
       claimerId: this.activeClaimerId,
@@ -1370,6 +1391,7 @@ export class PrioritySchedulerService {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
+      schedulerMetricsRegistry.setLoopRunning(false);
       logger.info('Priority scheduler loop stopped', {
         claimerId: this.activeClaimerId,
       });

@@ -33,6 +33,7 @@ import type {
 } from '../../types/api';
 import { LatencyPercentilesChart } from '../../components/charts/LatencyPercentilesChart';
 import { ThroughputChart } from '../../components/charts/ThroughputChart';
+import { SchedulerObservabilitySection } from '../../components/monitoring/SchedulerObservabilitySection';
 import { PageContainer } from '../../components/layout/PageContainer';
 import { Button } from '../../components/ui/Button';
 import { Card, CardContent, CardHeader } from '../../components/ui/Card';
@@ -1098,6 +1099,11 @@ export function MonitoringPage({ streamOptions }: MonitoringPageProps) {
           )}
         </Card>
       </section>
+
+      <SchedulerObservabilitySection
+        organisationId={activeOrganisationId}
+        windowMinutes={windowMinutes}
+      />
 
       <ConfirmDialog
         isOpen={confirmRecoverOpen}
