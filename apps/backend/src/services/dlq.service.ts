@@ -276,7 +276,7 @@ export class DeadLetterService {
   async replay(
     orgId: string,
     dlqId: string,
-    actorUserId: string,
+    actorUserId: string | null,
     overrides?: {
       payload?: Record<string, unknown>;
       priority?: number;

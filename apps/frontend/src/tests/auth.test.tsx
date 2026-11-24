@@ -7,6 +7,7 @@ import { createQueryClient } from '../config/queryClient';
 import { AuthProvider } from '../contexts/AuthContext';
 import { OrganisationProvider } from '../contexts/OrganisationContext';
 import { AppRoutes } from '../App';
+import { sanitizeRedirectPath } from '../pages/auth/LoginPage';
 import { authApi } from '../api/auth.api';
 import { organisationApi } from '../api/organisation.api';
 import { monitoringApi } from '../api/monitoring.api';
@@ -108,6 +109,15 @@ describe('Frontend Authentication, Protected Routes & Session Security', () => {
     renderApp(['/dashboard']);
 
     expect(await screen.findByText('Sign in to PulseQueue')).toBeInTheDocument();
+  });
+
+  it('sanitizes post-login redirect paths against backslash and protocol-relative open redirects', () => {
+    expect(sanitizeRedirectPath('/queues')).toBe('/queues');
+    expect(sanitizeRedirectPath('/jobs/123')).toBe('/jobs/123');
+    expect(sanitizeRedirectPath('/\\evil.example.com')).toBe('/dashboard');
+    expect(sanitizeRedirectPath('//evil.example.com')).toBe('/dashboard');
+    expect(sanitizeRedirectPath('https://evil.example.com')).toBe('/dashboard');
+    expect(sanitizeRedirectPath(undefined)).toBe('/dashboard');
   });
 
   it('validates login inputs and renders safe API error banner on invalid credentials', async () => {

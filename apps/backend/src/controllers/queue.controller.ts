@@ -27,9 +27,13 @@ function param(req: Request, key: string): string {
 
 export async function createQueue(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    if (!req.user || !req.membership) throw new UnauthorizedError();
+    if ((!req.user && !req.apiKey) || !req.membership) throw new UnauthorizedError();
     const input = parseInput(createQueueSchema, req.body);
-    const queue = await queueService.create(req.membership.organisationId, req.user.id, input);
+    const queue = await queueService.create(
+      req.membership.organisationId,
+      req.user?.id ?? null,
+      input,
+    );
     sendSuccess(res, { queue }, 201);
   } catch (err) {
     next(err);
@@ -59,13 +63,13 @@ export async function getQueue(req: Request, res: Response, next: NextFunction):
 
 export async function updateQueue(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    if (!req.user || !req.membership) throw new UnauthorizedError();
+    if ((!req.user && !req.apiKey) || !req.membership) throw new UnauthorizedError();
     const input = parseInput(updateQueueSchema, req.body);
     const queue = await queueService.update(
       req.membership.organisationId,
       param(req, 'queueId'),
       input,
-      req.user.id,
+      req.user?.id ?? `apikey:${req.apiKey!.id}`,
     );
     sendSuccess(res, { queue });
   } catch (err) {

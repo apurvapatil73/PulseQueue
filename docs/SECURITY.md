@@ -83,7 +83,43 @@ All organisation-scoped routes require `authenticate` followed by `requireOrgRol
 - **API Key Rotation:** Use `POST /api/v1/organisations/:orgId/api-keys/:apiKeyId/rotate` to atomically revoke the old key and issue a replacement without downtime across other keys.
 - **JWT Secret Rotation:** Rolling `JWT_SECRET` invalidates existing 15-minute access tokens immediately; clients automatically refresh via their HttpOnly refresh token cookie.
 
-## 6. Known Limitations
+## 6. Security Test Coverage & Dependency Audit
+
+### Automated Security Suites
+
+- `apps/backend/tests/securityHardening.test.ts` (Phase 9.1): JWT claim/algorithm enforcement, production secret floor, RBAC boundaries, cross-org IDOR, mass assignment, strict CORS allowlist, atomic refresh rotation, and rate-limit headers.
+- `apps/backend/tests/distributedSecurity.test.ts` (Phase 9.2): Multi-instance Redis Lua rate limiting, concurrent burst atomicity, window reset, fail-closed/fail-open outage policies, trusted-proxy anti-spoofing, API key lifecycle/scopes/rotation, and tenant-scoped audit events.
+- `apps/backend/tests/securityPenetrationAndFaults.test.ts` (Phase 9.3): Revoked-session reuse chains, 16 KiB auth payload cap, global `/health` privacy, `schedules:read` & `dlq:replay` API-key scope enforcement, query-param IDOR probes, concurrent API-key rotation races, Redis timeout/script fault injection & recovery, bounded Redis PTTL checks, concurrent idempotency & DLQ replay races, and audit-write outage resilience.
+
+### Production Dependency Audit (`npm audit --omit=dev`)
+
+Inspected via `npm audit --omit=dev` and `npm ls` against 216 production dependencies (`0 critical`, `5 high`, `2 moderate`, `0 low`). `npm audit fix --dry-run --omit=dev` confirmed that **zero** non-breaking patch/minor fixes exist for these 7 advisories; all require breaking semver-major migrations:
+
+| Package (Installed)                                                                 | Advisory                                                                   | Severity | Direct / Transitive                                                       | Fixed In                                                            | Reachability & Classification                                                                                                                                                                                                                                                                                                                                                     |
+| :---------------------------------------------------------------------------------- | :------------------------------------------------------------------------- | :------: | :------------------------------------------------------------------------ | :------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `zod@3.25.76`                                                                       | `GHSA-mrhx-c7xc-m3w5` (CWE-770, CVSS 7.5)                                  |   High   | Direct (`backend`, `frontend`, `worker`)                                  | `zod@4.6.6+` (major)                                                | **Reachable on API validators; mitigated + major upgrade deferred.** Mitigated by `16kb`/`1mb` Express JSON body limits, `64 KiB` job payload cap, bounded collection sizes (`scopes <= 11`, `metadata <= 16 keys`), and Redis distributed rate limiting. Upgrading to `zod@4` requires a dedicated migration across `.flatten()`, `errorMap`, and `@hookform/resolvers`.         |
+| `prisma@6.19.3` -> `@prisma/config@6.19.3` -> `deepmerge-ts@7.1.5`, `effect@3.21.0` | `GHSA-ggr8-5vv4-36mx` (CWE-674), `GHSA-7589-6fvf-x4pw` (CWE-1333)          |   High   | Transitive (`devDependencies` + optional peer of `@prisma/client@6.19.3`) | `prisma@7.11+` / `8.x` (major), `deepmerge-ts@8+`, `effect@3.22.1+` | **Not reachable in deployed runtime + major upgrade deferred.** Zero imports of `@prisma/config`, `deepmerge-ts`, or `effect` exist in `apps/backend/src` or `apps/worker/src`; `@prisma/client` does not load `@prisma/config` at runtime. Remains present in CLI toolchain (`prisma generate`/`migrate`) until dedicated Prisma 7/8 migration.                                  |
+| `react-router-dom@6.30.6` -> `react-router@6.30.6`                                  | `GHSA-wrjc-x8rr-h8h6` (CWE-601), `GHSA-337j-9hxr-rhxg` (CWE-470, CVSS 6.1) | Moderate | Direct (`frontend`) / Transitive                                          | `react-router-dom@7.18.6` (`react-router@7.18.0+`, major)           | **`GHSA-337j-9hxr-rhxg` not reachable** (pure client-side Vite SPA with zero SSR hydration). **`GHSA-wrjc-x8rr-h8h6` mitigated in code + major upgrade deferred:** `LoginPage.tsx` sanitizes `location.state.from.pathname` via `sanitizeRedirectPath()` rejecting `\\`, `//`, and non-leading-`/` targets; all other `<Link>`/`useNavigate` calls use hardcoded internal routes. |
+
+## 7. Failure Behavior, Recovery & Production Security Checklist
+
+### Failure & Recovery Procedures
+
+- **Redis Outage:** `auth` and `dlq_replay` fail closed (`503`); `job_submit` and `general` fail open while PostgreSQL transactional outbox preserves all submitted jobs. Once Redis recovers, `OutboxReconcilerService` and `PrioritySchedulerService` resume dispatch automatically and rate-limit Lua scripts self-heal TTLs.
+- **PostgreSQL / Audit Write Outage:** Security controls (`401`/`403`/`429`) never fall open on audit-event write errors; failed audit writes are caught and logged without exposing credentials.
+- **Worker Crash / Lost Heartbeat:** Execution leases (`leaseExpiresAt`) and monotonic `fencingToken` values ensure stale workers cannot overwrite newer state; `StalledJobRecoveryService` and `PrioritySchedulerService.recoverStaleReservations` recover orphaned work safely.
+
+### Production Security Checklist
+
+- [ ] `NODE_ENV=production`
+- [ ] `JWT_SECRET` set via secret manager (>= 32 random chars)
+- [ ] `API_KEY_SECRET` set via secret manager (>= 32 random chars, distinct from `JWT_SECRET`)
+- [ ] `CORS_ALLOWED_ORIGINS` restricted to exact production frontend origin(s)
+- [ ] `TRUST_PROXY` set to exact hop count (`1`..`5`) or `loopback`/`uniquelocal` (never `true`)
+- [ ] PostgreSQL (`sslmode=require`) and Redis (`rediss://`) TLS + authentication enabled
+- [ ] Worker runtime isolated on private network segment
+
+## 8. Known Limitations
 
 - **Pepper Rotation (`API_KEY_SECRET`):** Rotating `API_KEY_SECRET` invalidates existing HMAC-hashed API keys; plan coordinated tenant key rotation when rotating the global pepper.
 - **Worker Runtime Trust Boundary:** The worker runtime (`apps/worker`) connects directly to PostgreSQL and Redis inside the private network; enforce TLS and network segmentation in production.

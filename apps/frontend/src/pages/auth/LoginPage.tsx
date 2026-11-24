@@ -18,14 +18,27 @@ const loginFormSchema = z.object({
 
 type LoginFormValues = z.infer<typeof loginFormSchema>;
 
+/**
+ * Sanitizes post-login redirect targets to strict internal relative paths,
+ * mitigating backslash and protocol-relative open redirects (GHSA-wrjc-x8rr-h8h6).
+ */
+export function sanitizeRedirectPath(candidate: string | undefined): string {
+  if (!candidate || typeof candidate !== 'string') return '/dashboard';
+  if (!candidate.startsWith('/') || candidate.startsWith('//') || candidate.includes('\\')) {
+    return '/dashboard';
+  }
+  return candidate;
+}
+
 export function LoginPage() {
   const { login } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const [serverError, setServerError] = useState<string | null>(null);
 
-  const from =
-    (location.state as { from?: { pathname?: string } } | null)?.from?.pathname ?? '/dashboard';
+  const from = sanitizeRedirectPath(
+    (location.state as { from?: { pathname?: string } } | null)?.from?.pathname,
+  );
 
   const {
     register,

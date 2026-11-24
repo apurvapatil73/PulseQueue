@@ -64,12 +64,12 @@ export async function getDlqJob(req: Request, res: Response, next: NextFunction)
 
 export async function replayDlqJob(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    if (!req.user || !req.membership) throw new UnauthorizedError();
+    if ((!req.user && !req.apiKey) || !req.membership) throw new UnauthorizedError();
     const overrides = parseInput(replayDlqBodySchema, req.body ?? {});
     const result = await deadLetterService.replay(
       req.membership.organisationId,
       param(req, 'dlqId'),
-      req.user.id,
+      req.user?.id ?? null,
       overrides,
     );
     sendSuccess(res, result, 201);

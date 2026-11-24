@@ -100,7 +100,7 @@ function isUniqueConstraintError(err: unknown): boolean {
 }
 
 export class QueueService {
-  async create(orgId: string, userId: string, input: CreateQueueInput): Promise<QueueView> {
+  async create(orgId: string, userId: string | null, input: CreateQueueInput): Promise<QueueView> {
     const existing = await db.queue.findUnique({
       where: {
         organisationId_name: {
